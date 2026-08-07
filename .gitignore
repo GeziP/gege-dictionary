@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+src-tauri/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+
+# Generated assets (can be regenerated)
+gen_icon.py
+gen_nsis.py
+
+# Tauri dev artifacts
+src-tauri/WixTools/
+src-tauri/gen/
+
+# Logs
+*.log
+npm-debug.log*

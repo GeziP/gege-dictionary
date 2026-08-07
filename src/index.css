@@ -1,0 +1,90 @@
+/* @import url() FONT IMPORTS MUST ALWAYS BE AT THE VERY TOP OF THIS FILE, ABOVE THE TAILWIND IMPORTS — DO NOT DELETE THIS COMMENT */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Gentium+Book+Plus:ital,wght@0,400;0,700;1,400&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --canvas: #f2f0eb;
+  --surface: #ffffff;
+  --raised: #faf9f7;
+  --sunken: #edebe5;
+  --line: #e2dfd8;
+  --line-strong: #cfcabf;
+  --ink: #1b1a17;
+  --ink-muted: #5c5850;
+  --ink-subtle: #8b857a;
+  --accent: #0f6e63;
+  --accent-hover: #0b5b52;
+  --accent-soft: #e2efec;
+  --accent-line: #9cc9c1;
+  --accent-ink: #ffffff;
+  --positive: #2f7a4d;
+  --warn: #a4620d;
+  --danger: #b03636;
+  --highlight: #fdefc7;
+}
+.dark {
+  --canvas: #131311;
+  --surface: #1e1d1a;
+  --raised: #26241f;
+  --sunken: #181714;
+  --line: #34322c;
+  --line-strong: #494639;
+  --ink: #f3f1ec;
+  --ink-muted: #a9a396;
+  --ink-subtle: #7e7768;
+  --accent: #4fc0ae;
+  --accent-hover: #63d0be;
+  --accent-soft: #17322e;
+  --accent-line: #2f5d55;
+  --accent-ink: #0a1f1c;
+  --positive: #64bd88;
+  --warn: #d99a3f;
+  --danger: #e2716b;
+  --highlight: #4a3f18;
+}
+html,
+body,
+#root {
+  height: 100%;
+}
+body {
+  background-color: var(--canvas);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+}
+.skeleton-line {
+  background-image: linear-gradient(90deg, var(--sunken) 25%, var(--line) 37%, var(--sunken) 63%);
+  background-size: 200% 100%;
+}
+.selection-demo::selection,
+.selection-demo *::selection {
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+.thin-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.thin-scroll::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: 999px;
+}
+.thin-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+@keyframes slide-in-right {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+.animate-slide-in-right {
+  animation: slide-in-right 0.2s ease-out;
+}
