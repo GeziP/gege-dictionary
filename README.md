@@ -19,6 +19,27 @@
 
 ---
 
+## 界面预览
+
+<table>
+  <tr>
+    <td align="center"><b>首次配置向导</b></td>
+    <td align="center"><b>单词深度解析</b></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/onboarding.png" width="480" alt="Onboarding"></td>
+    <td><img src="docs/screenshots/word-detail.png" width="320" alt="Word Detail"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>生词库 + 段落详情面板</b></td>
+    <td align="center"><b>段落逐句对照翻译</b></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/library-main.png" width="480" alt="Library"></td>
+    <td><img src="docs/screenshots/paragraph-interleave.png" width="480" alt="Paragraph Interleave"></td>
+  </tr>
+</table>
+
 ## 简介
 
 鸽鸽词典是一款 Windows 桌面英语词典应用，在任意应用中 **Ctrl+C 复制英文** 即可弹出查词窗口，由你自己配置的大语言模型（LLM）实时解析，结果保存在本机 SQLite 数据库中。
