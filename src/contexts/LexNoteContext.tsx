@@ -293,14 +293,15 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
 
       if (!isTauri) return;
 
-      const useStreaming = settings.streamingEnabled !== false;
+      const useStreaming = settings.streamingEnabled === true;
       if (useStreaming) {
         const rid = `req-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         requestIdRef.current = rid;
         try {
           await bridge.lookupWordStream(selection, context, kind, rid);
         } catch (e) {
-          // Fallback to blocking if streaming command fails
+          console.warn('[triggerLookup] streaming failed, falling back to blocking:', e);
+          requestIdRef.current = '';
           try {
             const entry = await bridge.lookupWord(selection, context, kind);
             setLookupStatus('done');

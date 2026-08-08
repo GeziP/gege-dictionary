@@ -63,7 +63,17 @@ export function ProviderSection() {
         <div className="grid gap-3 sm:grid-cols-2">
           <label className="block">
             <span className="mb-1 block text-[11px] text-ink-muted">Base URL</span>
-            <TextInput value={provider.baseUrl} onChange={(event) => patch({ baseUrl: event.target.value })} />
+            <TextInput value={provider.baseUrl} onChange={(event) => {
+              const url = event.target.value;
+              const matchedPreset = PROVIDER_PRESETS.find((p) => p.baseUrl === url);
+              if (matchedPreset) {
+                patch({ baseUrl: url, protocol: matchedPreset.protocol });
+              } else {
+                const inferredProtocol = (url.includes('/anthropic') || url.includes('anthropic.com'))
+                  ? 'anthropic' as const : 'openai' as const;
+                patch({ baseUrl: url, protocol: inferredProtocol });
+              }
+            }} />
           </label>
           <label className="block">
             <span className="mb-1 block text-[11px] text-ink-muted">Model</span>

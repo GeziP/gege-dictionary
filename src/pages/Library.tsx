@@ -34,7 +34,16 @@ export function Library() {
   useEffect(() => {
     const onFocus = () => refreshWords();
     window.addEventListener('focus', onFocus);
-    return () => window.removeEventListener('focus', onFocus);
+
+    let unlisten: (() => void) | null = null;
+    import('../lib/tauri-bridge').then((b) =>
+      b.listenWordSaved(() => refreshWords())
+    ).then((u) => { unlisten = u; }).catch(() => {});
+
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      unlisten?.();
+    };
   }, [refreshWords]);
 
   useEffect(() => {

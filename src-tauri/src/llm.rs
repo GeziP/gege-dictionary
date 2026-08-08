@@ -5,6 +5,17 @@ use std::time::Duration;
 
 const SYSTEM_PROMPT: &str = "You are a precise English-Chinese lexicography assistant. CRITICAL RULES: 1) Respond with a single valid JSON object ONLY. 2) No markdown fences, no extra text before or after the JSON. 3) All string values must use \\n for newlines and \\\" for quotes. 4) Do NOT embed markdown code blocks (```) inside JSON strings. Use plain text or pseudocode instead. 5) No trailing commas.";
 
+/// Infer the effective protocol from the explicit value and the base_url pattern.
+fn effective_protocol<'a>(protocol: &'a str, base_url: &str) -> &'a str {
+    if protocol == "anthropic" {
+        return "anthropic";
+    }
+    if base_url.contains("/anthropic") || base_url.contains("anthropic.com") {
+        return "anthropic";
+    }
+    protocol
+}
+
 /// Blocking (non-streaming) lookup — used as fallback or when streaming is disabled.
 pub async fn stream_lookup(
     base_url: &str,
@@ -24,7 +35,9 @@ pub async fn stream_lookup(
         .replace("{{context}}", context)
         .replace("{{native_lang}}", "中文");
 
-    match protocol {
+    let proto = effective_protocol(protocol, base_url);
+    eprintln!("[stream_lookup] protocol={protocol}, effective={proto}, url={base_url}");
+    match proto {
         "anthropic" => call_anthropic_blocking(base_url, api_key, model, temperature, max_tokens, timeout_secs, &prompt).await,
         _ => call_openai_blocking(base_url, api_key, model, temperature, max_tokens, timeout_secs, &prompt).await,
     }
@@ -53,7 +66,8 @@ where
         .replace("{{context}}", context)
         .replace("{{native_lang}}", "中文");
 
-    match protocol {
+    let proto = effective_protocol(protocol, base_url);
+    match proto {
         "anthropic" => call_anthropic_streaming(base_url, api_key, model, temperature, max_tokens, timeout_secs, &prompt, &mut on_delta).await,
         _ => call_openai_streaming(base_url, api_key, model, temperature, max_tokens, timeout_secs, &prompt, &mut on_delta).await,
     }
@@ -69,6 +83,7 @@ async fn call_openai_blocking(
     prompt: &str,
 ) -> Result<String, String> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    eprintln!("[call_openai_blocking] POST {url}, model={model}, key_len={}, prompt_len={}", api_key.len(), prompt.len());
 
     let body = serde_json::json!({
         "model": model,
@@ -92,18 +107,71 @@ async fn call_openai_blocking(
         .map_err(|e| format_request_error(&e))?;
 
     let response = check_response(response).await?;
-    let resp_json: Value = response.json().await.map_err(|e| format!("响应解析失败: {e}"))?;
-    let content = resp_json
+    let resp_text = response.text().await.map_err(|e| format!("响应读取失败: {e}"))?;
+    eprintln!("[call_openai_blocking] raw response (first 500 chars): {}", &resp_text[..resp_text.len().min(500)]);
+
+    let resp_json: Value = serde_json::from_str(&resp_text)
+        .map_err(|e| format!("响应JSON解析失败: {e}. 原始响应: {}", &resp_text[..resp_text.len().min(300)]))?;
+
+    // Check for error-in-200 pattern (some Chinese API proxies do this)
+    if let Some(err_obj) = resp_json.get("error") {
+        let err_msg = err_obj.get("message").and_then(|m| m.as_str())
+            .unwrap_or_else(|| err_obj.as_str().unwrap_or("unknown error"));
+        return Err(format!("API 错误: {err_msg} (url={url})"));
+    }
+    if resp_json.get("success") == Some(&Value::Bool(false)) {
+        let msg = resp_json.get("msg").and_then(|m| m.as_str()).unwrap_or("unknown");
+        let code = resp_json.get("code").and_then(|c| c.as_u64()).unwrap_or(0);
+        return Err(format!("API 网关错误: {msg} (code={code}, url={url})"));
+    }
+
+    let message = resp_json
         .get("choices")
         .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .to_string();
+        .and_then(|c| c.get("message"));
+
+    let content = message
+        .and_then(|m| {
+            // Standard: content as string
+            if let Some(s) = m.get("content").and_then(|c| c.as_str()) {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+            // DeepSeek reasoning models: content might be null, real output in reasoning_content
+            if let Some(s) = m.get("reasoning_content").and_then(|c| c.as_str()) {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+            // Array content format (newer API versions)
+            if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
+                let text: String = arr.iter()
+                    .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("");
+                if !text.is_empty() {
+                    return Some(text);
+                }
+            }
+            None
+        })
+        .unwrap_or_default();
 
     if content.is_empty() {
-        return Err("模型返回了空内容".to_string());
+        let finish_reason = resp_json
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(|f| f.as_str())
+            .unwrap_or("unknown");
+        let resp_snippet = if resp_text.len() > 300 {
+            format!("{}...", &resp_text[..300])
+        } else {
+            resp_text.clone()
+        };
+        eprintln!("[call_openai_blocking] empty content! full_resp={resp_snippet}");
+        return Err(format!("模型返回空内容 (finish_reason={finish_reason}). 原始响应: {resp_snippet}"));
     }
     Ok(content)
 }
@@ -177,8 +245,9 @@ async fn call_openai_streaming<F: FnMut(&str)>(
 }
 
 fn parse_openai_sse_line(line: &str) -> Option<String> {
+    let line = line.trim_end_matches('\r');
     let data = line.strip_prefix("data: ")?;
-    if data == "[DONE]" {
+    if data == "[DONE]" || data.is_empty() {
         return None;
     }
     let json: Value = serde_json::from_str(data).ok()?;
@@ -313,7 +382,11 @@ async fn call_anthropic_streaming<F: FnMut(&str)>(
 }
 
 fn parse_anthropic_sse_line(line: &str) -> Option<String> {
+    let line = line.trim_end_matches('\r');
     let data = line.strip_prefix("data: ")?;
+    if data.is_empty() {
+        return None;
+    }
     let json: Value = serde_json::from_str(data).ok()?;
     let event_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match event_type {
@@ -334,8 +407,9 @@ pub async fn test_connection(
     protocol: &str,
 ) -> Result<Value, String> {
     let start = std::time::Instant::now();
+    let proto = effective_protocol(protocol, base_url);
 
-    match protocol {
+    match proto {
         "anthropic" => test_anthropic(base_url, api_key, model, start).await,
         _ => test_openai(base_url, api_key, model, start).await,
     }
@@ -602,4 +676,135 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
         500..=599 => format!("服务端错误（{}）：请稍后重试", status_code),
         _ => format!("HTTP {}: {}", status_code, body_text),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_url_construction_openai() {
+        let cases = vec![
+            ("https://api.openai.com/v1", "https://api.openai.com/v1/chat/completions"),
+            ("https://api.openai.com/v1/", "https://api.openai.com/v1/chat/completions"),
+            ("https://api.deepseek.com/v1", "https://api.deepseek.com/v1/chat/completions"),
+            ("https://proxy.example.com/api/v1", "https://proxy.example.com/api/v1/chat/completions"),
+            ("https://api.example.com", "https://api.example.com/chat/completions"),
+        ];
+        for (base_url, expected) in cases {
+            let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+            assert_eq!(url, expected, "base_url={base_url}");
+        }
+    }
+
+    #[test]
+    fn test_effective_protocol() {
+        // Explicit anthropic always wins
+        assert_eq!(effective_protocol("anthropic", "https://any.com"), "anthropic");
+        // URL contains /anthropic → infer anthropic
+        assert_eq!(effective_protocol("openai", "https://open.bigmodel.cn/api/anthropic"), "anthropic");
+        // URL contains anthropic.com → infer anthropic
+        assert_eq!(effective_protocol("openai", "https://api.anthropic.com"), "anthropic");
+        // Normal openai stays openai
+        assert_eq!(effective_protocol("openai", "https://api.openai.com/v1"), "openai");
+        assert_eq!(effective_protocol("openai", "https://api.deepseek.com/v1"), "openai");
+        // Empty protocol with anthropic URL
+        assert_eq!(effective_protocol("", "https://open.bigmodel.cn/api/anthropic"), "anthropic");
+    }
+
+    #[test]
+    fn test_parse_openai_sse_line_normal() {
+        let line = r#"data: {"id":"x","choices":[{"delta":{"content":"Hello"}}]}"#;
+        assert_eq!(parse_openai_sse_line(line), Some("Hello".to_string()));
+    }
+
+    #[test]
+    fn test_parse_openai_sse_line_with_cr() {
+        let line = "data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\r";
+        assert_eq!(parse_openai_sse_line(line), Some("Hi".to_string()));
+    }
+
+    #[test]
+    fn test_parse_openai_sse_done() {
+        assert_eq!(parse_openai_sse_line("data: [DONE]"), None);
+        assert_eq!(parse_openai_sse_line("data: [DONE]\r"), None);
+    }
+
+    #[test]
+    fn test_parse_openai_sse_empty_delta() {
+        let line = r#"data: {"id":"x","choices":[{"delta":{}}]}"#;
+        assert_eq!(parse_openai_sse_line(line), None);
+    }
+
+    #[test]
+    fn test_parse_openai_sse_not_data_line() {
+        assert_eq!(parse_openai_sse_line("event: message"), None);
+        assert_eq!(parse_openai_sse_line(""), None);
+        assert_eq!(parse_openai_sse_line(": comment"), None);
+    }
+
+    #[test]
+    fn test_parse_anthropic_sse_content_delta() {
+        let line = r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"world"}}"#;
+        assert_eq!(parse_anthropic_sse_line(line), Some("world".to_string()));
+    }
+
+    #[test]
+    fn test_parse_anthropic_sse_other_events() {
+        let line = r#"data: {"type":"message_start","message":{}}"#;
+        assert_eq!(parse_anthropic_sse_line(line), None);
+    }
+
+    #[test]
+    fn test_parse_entry_basic() {
+        let json = r#"{"lemma":"test","pos":"n","translation":"测试"}"#;
+        let entry = parse_entry(json, "test", "word").unwrap();
+        assert_eq!(entry.get("lemma").unwrap().as_str().unwrap(), "test");
+        assert_eq!(entry.get("translation").unwrap().as_str().unwrap(), "测试");
+        assert!(entry.get("id").is_some());
+    }
+
+    #[test]
+    fn test_parse_entry_with_markdown_fence() {
+        let raw = "```json\n{\"lemma\":\"hello\",\"translation\":\"你好\"}\n```";
+        let entry = parse_entry(raw, "hello", "word").unwrap();
+        assert_eq!(entry.get("lemma").unwrap().as_str().unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_parse_entry_trailing_comma() {
+        let raw = r#"{"lemma":"ok","pos":"adj","translation":"好的",}"#;
+        let entry = parse_entry(raw, "ok", "word").unwrap();
+        assert_eq!(entry.get("lemma").unwrap().as_str().unwrap(), "ok");
+    }
+
+    #[test]
+    fn test_error_in_200_detection() {
+        let resp: Value = serde_json::from_str(r#"{"code":500,"msg":"404 NOT_FOUND","success":false}"#).unwrap();
+        assert_eq!(resp.get("success"), Some(&Value::Bool(false)));
+        let msg = resp.get("msg").and_then(|m| m.as_str()).unwrap();
+        assert_eq!(msg, "404 NOT_FOUND");
+    }
+
+    #[test]
+    fn test_extract_content_standard() {
+        let resp: Value = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":"hello world"},"finish_reason":"stop"}]}"#
+        ).unwrap();
+        let content = resp.get("choices").unwrap().get(0).unwrap()
+            .get("message").unwrap().get("content").unwrap().as_str().unwrap();
+        assert_eq!(content, "hello world");
+    }
+
+    #[test]
+    fn test_extract_content_null_with_reasoning() {
+        let resp: Value = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":null,"reasoning_content":"thinking output"}}]}"#
+        ).unwrap();
+        let msg = resp.get("choices").unwrap().get(0).unwrap().get("message").unwrap();
+        let content = msg.get("content").and_then(|c| c.as_str());
+        assert!(content.is_none() || content.unwrap().is_empty());
+        let reasoning = msg.get("reasoning_content").and_then(|c| c.as_str()).unwrap();
+        assert_eq!(reasoning, "thinking output");
+    }
 }

@@ -151,3 +151,72 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     }
     Ok(result)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_encrypted() {
+        assert!(!is_encrypted("sk-abc123"));
+        assert!(!is_encrypted(""));
+        assert!(is_encrypted("dpapi:v1:SGVsbG8="));
+    }
+
+    #[test]
+    fn test_encrypt_empty() {
+        assert_eq!(encrypt("").unwrap(), "");
+    }
+
+    #[test]
+    fn test_encrypt_already_encrypted() {
+        let val = "dpapi:v1:SGVsbG8=";
+        assert_eq!(encrypt(val).unwrap(), val);
+    }
+
+    #[test]
+    fn test_decrypt_empty() {
+        assert_eq!(decrypt("").unwrap(), "");
+    }
+
+    #[test]
+    fn test_decrypt_plaintext_passthrough() {
+        assert_eq!(decrypt("sk-abc123xyz").unwrap(), "sk-abc123xyz");
+    }
+
+    #[test]
+    fn test_round_trip() {
+        let key = "sk-test1234567890abcdef";
+        let encrypted = encrypt(key).unwrap();
+        assert!(is_encrypted(&encrypted), "encrypted should have dpapi prefix");
+        assert_ne!(encrypted, key);
+        let decrypted = decrypt(&encrypted).unwrap();
+        assert_eq!(decrypted, key, "round-trip must preserve value");
+    }
+
+    #[test]
+    fn test_round_trip_unicode() {
+        let key = "api-密钥-test-🔑";
+        let encrypted = encrypt(key).unwrap();
+        let decrypted = decrypt(&encrypted).unwrap();
+        assert_eq!(decrypted, key);
+    }
+
+    #[test]
+    fn test_base64_round_trip() {
+        let data: Vec<u8> = (0..=255).collect();
+        let encoded = base64_encode(&data);
+        let decoded = base64_decode(&encoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_base64_known_values() {
+        assert_eq!(base64_encode(b"Hello"), "SGVsbG8=");
+        assert_eq!(base64_encode(b"He"), "SGU=");
+        assert_eq!(base64_encode(b"Hel"), "SGVs");
+        assert_eq!(base64_decode("SGVsbG8=").unwrap(), b"Hello");
+        assert_eq!(base64_decode("SGU=").unwrap(), b"He");
+        assert_eq!(base64_decode("SGVs").unwrap(), b"Hel");
+    }
+}

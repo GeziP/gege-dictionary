@@ -131,6 +131,14 @@ export async function listenLookupError(handler: (e: LookupErrorEvent) => void):
   return listen('lookup://error', handler as (payload: unknown) => void);
 }
 
+export async function emitWordSaved(): Promise<void> {
+  return emit('library://word-saved');
+}
+
+export async function listenWordSaved(handler: () => void): Promise<() => void> {
+  return listen('library://word-saved', handler);
+}
+
 export async function toggleClipboardWatch(): Promise<boolean> {
   return invoke<boolean>('toggle_clipboard_watch');
 }

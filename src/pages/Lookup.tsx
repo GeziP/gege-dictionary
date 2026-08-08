@@ -126,6 +126,7 @@ export function Lookup() {
       note: existing?.note || '',
     };
     ctxSaveWord(word);
+    bridge.emitWordSaved();
     setSaved(true);
     countLookup(0);
     const timer = setTimeout(() => setUndoTimer(null), 5000);

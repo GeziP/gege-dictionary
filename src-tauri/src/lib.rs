@@ -111,10 +111,37 @@ async fn save_settings(
     #[cfg(windows)]
     if let Some(provider) = settings.get_mut("provider").and_then(|p| p.as_object_mut()) {
         if let Some(key_val) = provider.get("apiKey").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+            eprintln!("[save_settings] apiKey len={}, already_encrypted={}", key_val.len(), dpapi::is_encrypted(&key_val));
             if !key_val.is_empty() && !dpapi::is_encrypted(&key_val) {
                 match dpapi::encrypt(&key_val) {
-                    Ok(encrypted) => { provider.insert("apiKey".to_string(), serde_json::Value::String(encrypted)); }
-                    Err(e) => eprintln!("[save_settings] DPAPI encrypt warning: {e}"),
+                    Ok(encrypted) => {
+                        eprintln!("[save_settings] encrypt OK, result_len={}", encrypted.len());
+                        // Verify round-trip
+                        match dpapi::decrypt(&encrypted) {
+                            Ok(decrypted) => {
+                                if decrypted == key_val {
+                                    eprintln!("[save_settings] round-trip OK");
+                                } else {
+                                    eprintln!("[save_settings] WARNING: round-trip MISMATCH! Storing plaintext.");
+                                    provider.insert("apiKey".to_string(), serde_json::Value::String(key_val));
+                                    return {
+                                        let db = state.db.lock().map_err(|e| e.to_string())?;
+                                        db.save_settings(&settings)
+                                    };
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[save_settings] WARNING: decrypt after encrypt FAILED: {e}. Storing plaintext.");
+                                provider.insert("apiKey".to_string(), serde_json::Value::String(key_val));
+                                return {
+                                    let db = state.db.lock().map_err(|e| e.to_string())?;
+                                    db.save_settings(&settings)
+                                };
+                            }
+                        }
+                        provider.insert("apiKey".to_string(), serde_json::Value::String(encrypted));
+                    }
+                    Err(e) => eprintln!("[save_settings] DPAPI encrypt FAILED: {e}, storing plaintext"),
                 }
             }
         }
@@ -205,8 +232,15 @@ async fn lookup_word(
         }
 
         let raw_key = provider.get("apiKey").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        eprintln!("[lookup_word] raw_key starts_with dpapi={}, len={}", raw_key.starts_with("dpapi:"), raw_key.len());
         #[cfg(windows)]
-        let api_key_decrypted = dpapi::decrypt(&raw_key).unwrap_or(raw_key.clone());
+        let api_key_decrypted = match dpapi::decrypt(&raw_key) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("[lookup_word] DPAPI decrypt FAILED: {e}");
+                raw_key.clone()
+            }
+        };
         #[cfg(not(windows))]
         let api_key_decrypted = raw_key;
 
@@ -223,6 +257,9 @@ async fn lookup_word(
         )
     };
 
+    if api_key.starts_with("dpapi:") {
+        return Err("API Key 解密失败，请到设置页重新输入".to_string());
+    }
     eprintln!("[lookup_word] selection={selection:?}, kind={kind:?}, model={model:?}, protocol={protocol:?}, timeout={timeout_secs}s, tpl_len={}", template_body.len());
 
     let normalized = selection.trim().to_lowercase();
@@ -318,8 +355,15 @@ async fn lookup_word_stream(
         if kind == "paragraph" { mt = mt.max(4000); ts = ts.max(120); }
 
         let raw_key = provider.get("apiKey").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        eprintln!("[lookup_stream] raw_key starts_with dpapi={}, len={}", raw_key.starts_with("dpapi:"), raw_key.len());
         #[cfg(windows)]
-        let api_key_decrypted = dpapi::decrypt(&raw_key).unwrap_or(raw_key.clone());
+        let api_key_decrypted = match dpapi::decrypt(&raw_key) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("[lookup_stream] DPAPI decrypt FAILED: {e}");
+                raw_key.clone()
+            }
+        };
         #[cfg(not(windows))]
         let api_key_decrypted = raw_key;
 
@@ -333,6 +377,10 @@ async fn lookup_word_stream(
             format!("{} [{}]", tpl_name, tpl_scope),
         )
     };
+
+    if api_key.starts_with("dpapi:") {
+        return Err("API Key 解密失败，请到设置页重新输入".to_string());
+    }
 
     // Check cache
     let normalized = selection.trim().to_lowercase();
@@ -363,6 +411,8 @@ async fn lookup_word_stream(
         }
     }
 
+    eprintln!("[lookup_stream] starting SSE, key_len={}, url={base_url}", api_key.len());
+
     let rid = request_id.clone();
     let app_clone = app.clone();
 
@@ -385,7 +435,6 @@ async fn lookup_word_stream(
                     if let Some(obj) = entry.as_object_mut() {
                         obj.insert("_templateName".to_string(), serde_json::Value::String(template_name));
                     }
-                    // Cache
                     let db_path = {
                         let db = state.db.lock().map_err(|e| e.to_string())?;
                         db.path().to_string()
@@ -397,24 +446,27 @@ async fn lookup_word_stream(
                         "requestId": request_id,
                         "entry": entry,
                     }));
+                    Ok(())
                 }
                 Err(e) => {
+                    let err_msg = format!("JSON 解析失败: {e}");
                     let _ = app.emit("lookup://error", serde_json::json!({
                         "requestId": request_id,
-                        "error": format!("JSON 解析失败: {e}"),
+                        "error": err_msg,
                     }));
+                    Err(err_msg)
                 }
             }
         }
         Err(e) => {
+            eprintln!("[lookup_stream] SSE failed: {e}");
             let _ = app.emit("lookup://error", serde_json::json!({
                 "requestId": request_id,
                 "error": e,
             }));
+            Err(e)
         }
     }
-
-    Ok(())
 }
 
 #[tauri::command]
