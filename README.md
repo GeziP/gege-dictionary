@@ -133,6 +133,7 @@ npx tauri build
 
 ```
 gege-dictionary/
+├── docs/                   # 产品文档
 ├── src/                    # React 前端
 │   ├── pages/              # 页面（Library, Lookup, Onboarding, Settings）
 │   ├── components/         # UI 组件
@@ -151,11 +152,25 @@ gege-dictionary/
 └── package.json            # 前端依赖
 ```
 
+## 产品文档
+
+如果你想了解产品设计意图、功能取舍的理由，或参与后续开发，可以从这三份文档入手：
+
+| 文档 | 内容 | 适合谁看 |
+|------|------|----------|
+| [v1.0.0 实现版 PRD](docs/PRD-v1.0.0-as-built.md) | 当前版本的实际形态：功能范围、用户流程、技术选型、已知缺口 | 想快速理解产品全貌 |
+| [后续功能规划](docs/ROADMAP-v1.1-v1.3.md) | 竞品分析、差异化定位、v1.1–v1.3 路线，以及明确不做的功能与理由 | 想了解产品方向 |
+| [v1.1 开发规格](docs/PRD-v1.1-spec.md) | 下一版五项改动的详细实现要求、事件契约与验收标准 | 想参与开发 |
+
+开发任务已拆解为 [Issues](https://github.com/GeziP/gege-dictionary/issues)，每个都附带验收清单，欢迎认领。
+
 ## 隐私说明
 
 - 鸽鸽词典 **没有服务端**，不收集任何用户数据
 - 只有「选中的文本 + 上下文 + Prompt」会发送到你自己配置的 LLM 服务
 - 所有数据（生词库、设置、使用记录）保存在本机 `%APPDATA%/GegeDic/` 目录下
+
+> v1.1 起将增加：敏感内容自动过滤（复制密码、密钥、代码、文件路径时不触发查词）、应用黑名单、API Key 通过 Windows DPAPI 加密存储。详见 [v1.1 开发规格](docs/PRD-v1.1-spec.md)。
 
 ## 开源协议
 
