@@ -1,5 +1,37 @@
 use rusqlite::{params, Connection, Result as SqlResult};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
+
+pub const DB_FILENAME: &str = "gege.db";
+pub const LEGACY_DB_FILENAME: &str = "lexnote.db";
+
+/// Resolve the database file path with legacy compatibility.
+/// 1. If `gege.db` exists in dir, return it.
+/// 2. If only `lexnote.db` exists, rename it to `gege.db` and return.
+/// 3. Otherwise return `gege.db` (will be created).
+pub fn resolve_db_path(data_dir: &Path) -> PathBuf {
+    let primary = data_dir.join(DB_FILENAME);
+    if primary.exists() {
+        return primary;
+    }
+    let legacy = data_dir.join(LEGACY_DB_FILENAME);
+    if legacy.exists() {
+        eprintln!(
+            "[db] Migrating legacy database: {} -> {}",
+            legacy.display(),
+            primary.display()
+        );
+        if let Err(e) = std::fs::rename(&legacy, &primary) {
+            eprintln!("[db] Rename failed, copying instead: {e}");
+            if let Err(e2) = std::fs::copy(&legacy, &primary) {
+                eprintln!("[db] Copy also failed: {e2}, using legacy path");
+                return legacy;
+            }
+        }
+        return primary;
+    }
+    primary
+}
 
 pub struct Database {
     conn: Connection,
@@ -549,6 +581,35 @@ impl Database {
         Ok(())
     }
 
+    /// Remove expired cache entries (>30 days) and enforce max 5000 entries.
+    pub fn cleanup_cache(&self) -> Result<u64, String> {
+        let expired = self
+            .conn
+            .execute(
+                "DELETE FROM cache WHERE created_at < datetime('now', '-30 days')",
+                [],
+            )
+            .map_err(|e| e.to_string())? as u64;
+
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM cache", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+
+        let mut evicted: u64 = 0;
+        if count > 5000 {
+            let over = count - 5000;
+            evicted = self
+                .conn
+                .execute(
+                    "DELETE FROM cache WHERE cache_key IN (SELECT cache_key FROM cache ORDER BY created_at ASC LIMIT ?1)",
+                    params![over],
+                )
+                .map_err(|e| e.to_string())? as u64;
+        }
+        Ok(expired + evicted)
+    }
+
     pub fn get_stats(&self) -> Result<Value, String> {
         let word_count: i64 = self
             .conn
@@ -574,7 +635,7 @@ impl Database {
 }
 
 pub fn backup_database(db_path: &str) -> Result<String, String> {
-    let db_dir = std::path::Path::new(db_path)
+    let db_dir = Path::new(db_path)
         .parent()
         .ok_or("Cannot determine database directory")?;
     let backups_dir = db_dir.join("backups");
@@ -582,7 +643,7 @@ pub fn backup_database(db_path: &str) -> Result<String, String> {
         .map_err(|e| format!("创建备份目录失败: {e}"))?;
 
     let now = chrono::Local::now();
-    let backup_name = format!("lexnote-{}.db", now.format("%Y-%m-%d_%H%M%S"));
+    let backup_name = format!("gege-backup-{}.db", now.format("%Y%m%d-%H%M%S"));
     let backup_path = backups_dir.join(&backup_name);
 
     std::fs::copy(db_path, &backup_path)
@@ -592,7 +653,7 @@ pub fn backup_database(db_path: &str) -> Result<String, String> {
 }
 
 pub fn list_backups(db_path: &str) -> Result<Vec<Value>, String> {
-    let db_dir = std::path::Path::new(db_path)
+    let db_dir = Path::new(db_path)
         .parent()
         .ok_or("Cannot determine database directory")?;
     let backups_dir = db_dir.join("backups");
@@ -645,7 +706,7 @@ pub fn list_backups(db_path: &str) -> Result<Vec<Value>, String> {
 }
 
 pub fn restore_backup(db_path: &str, backup_name: &str) -> Result<(), String> {
-    let db_dir = std::path::Path::new(db_path)
+    let db_dir = Path::new(db_path)
         .parent()
         .ok_or("Cannot determine database directory")?;
     let backup_path = db_dir.join("backups").join(backup_name);
@@ -663,20 +724,50 @@ pub fn restore_backup(db_path: &str, backup_name: &str) -> Result<(), String> {
 }
 
 pub fn change_data_dir(old_path: &str, new_dir: &str) -> Result<String, String> {
-    let new_dir_path = std::path::Path::new(new_dir);
+    let new_dir_path = Path::new(new_dir);
     std::fs::create_dir_all(new_dir_path)
         .map_err(|e| format!("创建目标目录失败: {e}"))?;
 
-    let new_db_path = new_dir_path.join("lexnote.db");
+    let new_db_path = new_dir_path.join(DB_FILENAME);
     if new_db_path.exists() {
-        return Err("目标目录已存在 lexnote.db 文件，请选择空目录或先删除该文件".to_string());
+        return Err(format!(
+            "目标目录已存在 {} 文件，请选择空目录或先删除该文件",
+            DB_FILENAME
+        ));
     }
 
-    let old_dir = std::path::Path::new(old_path).parent().ok_or("无法解析原目录")?;
+    // Also check for legacy filename
+    let legacy_in_target = new_dir_path.join(LEGACY_DB_FILENAME);
+    if legacy_in_target.exists() {
+        return Err(format!(
+            "目标目录已存在 {} 文件（旧版本数据），请选择空目录",
+            LEGACY_DB_FILENAME
+        ));
+    }
+
+    let old_dir = Path::new(old_path).parent().ok_or("无法解析原目录")?;
     let old_backups = old_dir.join("backups");
 
     std::fs::copy(old_path, &new_db_path)
         .map_err(|e| format!("复制数据库失败: {e}"))?;
+
+    // Verify integrity of copied database
+    let verify_conn = Connection::open(&new_db_path)
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&new_db_path);
+            format!("验证新数据库失败: {e}")
+        })?;
+    let integrity: String = verify_conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&new_db_path);
+            format!("完整性检查失败: {e}")
+        })?;
+    drop(verify_conn);
+    if integrity != "ok" {
+        let _ = std::fs::remove_file(&new_db_path);
+        return Err(format!("数据库完整性检查未通过: {integrity}"));
+    }
 
     if old_backups.exists() {
         let new_backups = new_dir_path.join("backups");
@@ -693,7 +784,7 @@ pub fn change_data_dir(old_path: &str, new_dir: &str) -> Result<String, String> 
 }
 
 pub fn get_data_dir(db_path: &str) -> String {
-    std::path::Path::new(db_path)
+    Path::new(db_path)
         .parent()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default()

@@ -7,12 +7,18 @@ import { TextInput } from '../ui/TextInput';
 import { SettingsSection } from './SettingsSection';
 import { classNames } from '../../utils/format';
 
+function maskApiKey(key: string): string {
+  if (!key || key.length <= 8) return key ? '••••••••' : '';
+  return `${key.slice(0, 4)}••••${key.slice(-4)}`;
+}
+
 type TestState = {status: 'idle';} | {status: 'testing';} | {status: 'ok';latency: number;} | {status: 'error';};
 
 export function ProviderSection() {
   const { settings, updateSettings } = useLexNote();
   const { provider } = settings;
   const [showKey, setShowKey] = useState(false);
+  const [editingKey, setEditingKey] = useState(false);
   const [test, setTest] = useState<TestState>({ status: 'idle' });
 
   const patch = (changes: Partial<typeof provider>) =>
@@ -66,8 +72,11 @@ export function ProviderSection() {
           <label className="block sm:col-span-2">
             <span className="mb-1 block text-[11px] text-ink-muted">API Key</span>
             <TextInput
-              type={showKey ? 'text' : 'password'}
-              value={provider.apiKey}
+              type={showKey || editingKey ? 'text' : 'password'}
+              value={editingKey || showKey ? provider.apiKey : ''}
+              placeholder={!editingKey && !showKey && provider.apiKey ? maskApiKey(provider.apiKey) : '输入 API Key'}
+              onFocus={() => setEditingKey(true)}
+              onBlur={() => setEditingKey(false)}
               onChange={(event) => patch({ apiKey: event.target.value })}
               trailing={
               <button
@@ -75,7 +84,6 @@ export function ProviderSection() {
                 aria-label={showKey ? '隐藏 Key' : '显示 Key'}
                 onClick={() => setShowKey((value) => !value)}
                 className="text-ink-subtle hover:text-ink">
-                
                   {showKey ? <EyeOffIcon size={13} /> : <EyeIcon size={13} />}
                 </button>
               } />
@@ -125,6 +133,21 @@ export function ProviderSection() {
           {test.status === 'error' ?
           <span className="text-[11px] text-danger">鉴权失败（401）：API Key 为空或无效</span> :
           null}
+        </div>
+
+        <div className="mt-4 border-t border-line pt-3">
+          <label className="flex items-center gap-2.5 text-[12px]">
+            <input
+              type="checkbox"
+              checked={settings.streamingEnabled !== false}
+              onChange={(e) => updateSettings({ streamingEnabled: e.target.checked })}
+              className="h-3.5 w-3.5 rounded border-line accent-accent"
+            />
+            <span className="text-ink">流式渲染（实时显示查词结果）</span>
+          </label>
+          <p className="ml-6 mt-0.5 text-[10px] text-ink-subtle">
+            关闭后等待完整响应再一次性显示，适合不稳定的网络环境
+          </p>
         </div>
       </SettingsSection>
     </div>);

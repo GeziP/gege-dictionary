@@ -5,29 +5,97 @@ use std::time::Duration;
 
 use tauri::Manager;
 
+use crate::content_filter;
 use crate::AppState;
 
-fn get_foreground_window_title() -> String {
+fn get_foreground_window_info() -> (String, String) {
     use std::os::windows::ffi::OsStringExt;
     #[link(name = "user32")]
     extern "system" {
         fn GetForegroundWindow() -> isize;
         fn GetWindowTextW(hwnd: isize, text: *mut u16, max: i32) -> i32;
+        fn GetWindowThreadProcessId(hwnd: isize, process_id: *mut u32) -> u32;
     }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn CloseHandle(handle: isize) -> i32;
+        fn QueryFullProcessImageNameW(
+            process: isize,
+            flags: u32,
+            name: *mut u16,
+            size: *mut u32,
+        ) -> i32;
+    }
+
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd == 0 {
-            return String::new();
+            return (String::new(), String::new());
         }
+
+        // Window title
         let mut buf = [0u16; 256];
         let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
-        if len <= 0 {
-            return String::new();
-        }
-        std::ffi::OsString::from_wide(&buf[..len as usize])
-            .to_string_lossy()
-            .into_owned()
+        let title = if len > 0 {
+            std::ffi::OsString::from_wide(&buf[..len as usize])
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            String::new()
+        };
+
+        // Process name
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        let process_name = if pid != 0 {
+            let handle = OpenProcess(0x1000, 0, pid); // PROCESS_QUERY_LIMITED_INFORMATION
+            if handle != 0 {
+                let mut name_buf = [0u16; 260];
+                let mut size = name_buf.len() as u32;
+                let ok = QueryFullProcessImageNameW(handle, 0, name_buf.as_mut_ptr(), &mut size);
+                CloseHandle(handle);
+                if ok != 0 {
+                    let path = std::ffi::OsString::from_wide(&name_buf[..size as usize])
+                        .to_string_lossy()
+                        .into_owned();
+                    path.rsplit('\\').next().unwrap_or(&path).to_string()
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        (title, process_name)
     }
+}
+
+const DEFAULT_BLACKLIST: &[&str] = &[
+    "1password", "keepass", "bitwarden", "lastpass",
+    "cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe",
+    "code.exe", "devenv.exe", "idea64.exe",
+];
+
+fn is_blacklisted(process_name: &str, window_title: &str, custom_blacklist: &[String]) -> bool {
+    let proc_lower = process_name.to_lowercase();
+    let title_lower = window_title.to_lowercase();
+
+    for entry in DEFAULT_BLACKLIST {
+        if proc_lower.contains(entry) || title_lower.contains(entry) {
+            return true;
+        }
+    }
+    for entry in custom_blacklist {
+        let e = entry.to_lowercase();
+        if proc_lower.contains(&e) || title_lower.contains(&e) {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn start(app_handle: tauri::AppHandle, enabled: Arc<AtomicBool>) {
@@ -59,6 +127,30 @@ pub fn start(app_handle: tauri::AppHandle, enabled: Arc<AtomicBool>) {
     });
 }
 
+fn get_trigger_mode(app_handle: &tauri::AppHandle) -> (String, Vec<String>) {
+    let state = app_handle.state::<AppState>();
+    if let Ok(db) = state.db.lock() {
+        if let Ok(settings) = db.get_settings() {
+            let mode = settings
+                .get("clipboardMode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("smart")
+                .to_string();
+            let blacklist = settings
+                .get("clipboardBlacklist")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            return (mode, blacklist);
+        }
+    }
+    ("smart".to_string(), Vec::new())
+}
+
 fn poll_once(app_handle: &tauri::AppHandle, last_text: &mut String) -> bool {
     let current = match arboard::Clipboard::new() {
         Ok(mut cb) => cb.get_text().unwrap_or_default(),
@@ -71,8 +163,29 @@ fn poll_once(app_handle: &tauri::AppHandle, last_text: &mut String) -> bool {
     }
     *last_text = trimmed.clone();
 
+    let (mode, blacklist) = get_trigger_mode(app_handle);
+
+    // "manual" mode: only trigger via tray/hotkey, never auto
+    if mode == "manual" {
+        return false;
+    }
+
     if !is_english_text(last_text) {
         return false;
+    }
+
+    // "smart" mode: apply content filter and blacklist
+    if mode == "smart" {
+        if content_filter::should_reject(last_text) {
+            eprintln!("[clipboard] rejected by content filter: {:?}", &last_text[..last_text.len().min(40)]);
+            return false;
+        }
+
+        let (win_title, proc_name) = get_foreground_window_info();
+        if is_blacklisted(&proc_name, &win_title, &blacklist) {
+            eprintln!("[clipboard] blacklisted app: {proc_name} / {win_title}");
+            return false;
+        }
     }
 
     let state = app_handle.state::<AppState>();
@@ -84,8 +197,8 @@ fn poll_once(app_handle: &tauri::AppHandle, last_text: &mut String) -> bool {
     }
 
     let kind = detect_kind(last_text);
-    let win_title = get_foreground_window_title();
-    eprintln!("[clipboard] detected: {last_text:?} kind={kind} from={win_title:?}");
+    let (win_title, _) = get_foreground_window_info();
+    eprintln!("[clipboard] detected: {:?} kind={kind} from={win_title:?}", &last_text[..last_text.len().min(60)]);
 
     let capture_data = serde_json::json!({
         "selection": *last_text,
@@ -104,15 +217,24 @@ fn poll_once(app_handle: &tauri::AppHandle, last_text: &mut String) -> bool {
         *ll = trimmed.clone();
     }
 
+    open_or_reuse_lookup(app_handle, kind == "paragraph");
+    true
+}
+
+fn open_or_reuse_lookup(app_handle: &tauri::AppHandle, is_long: bool) {
+    let (w, h) = if is_long { (560.0, 700.0) } else { (420.0, 560.0) };
+
     if let Some(win) = app_handle.get_webview_window("lookup") {
-        let _ = win.close();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Reuse existing window: navigate and resize
+        let _ = win.set_size(tauri::Size::Logical(tauri::LogicalSize { width: w, height: h }));
+        let _ = win.center();
+        let _ = win.show();
+        let _ = win.eval("window.location.reload()");
+        return;
     }
 
-    let is_long = kind == "paragraph";
     let app_h = app_handle.clone();
     let _ = app_handle.run_on_main_thread(move || {
-        let (w, h) = if is_long { (560.0, 700.0) } else { (420.0, 560.0) };
         let _ = tauri::WebviewWindowBuilder::new(
             &app_h,
             "lookup",
@@ -125,11 +247,9 @@ fn poll_once(app_handle: &tauri::AppHandle, last_text: &mut String) -> bool {
         .always_on_top(true)
         .resizable(true)
         .skip_taskbar(true)
-        .focused(true)
+        .focused(false)
         .build();
     });
-
-    true
 }
 
 fn is_english_text(text: &str) -> bool {
@@ -190,7 +310,7 @@ pub fn lookup_clipboard(app_handle: &tauri::AppHandle, last_capture: &Mutex<Opti
     }
 
     let kind = detect_kind(&text);
-    let win_title = get_foreground_window_title();
+    let (win_title, _) = get_foreground_window_info();
 
     let capture_data = serde_json::json!({
         "selection": text,
@@ -205,28 +325,5 @@ pub fn lookup_clipboard(app_handle: &tauri::AppHandle, last_capture: &Mutex<Opti
         *lc = Some(capture_data);
     }
 
-    if let Some(win) = app_handle.get_webview_window("lookup") {
-        let _ = win.close();
-        std::thread::sleep(Duration::from_millis(150));
-    }
-
-    let is_long = kind == "paragraph";
-    let app_h = app_handle.clone();
-    let _ = app_handle.run_on_main_thread(move || {
-        let (w, h) = if is_long { (560.0, 700.0) } else { (420.0, 560.0) };
-        let _ = tauri::WebviewWindowBuilder::new(
-            &app_h,
-            "lookup",
-            tauri::WebviewUrl::App("lookup".into()),
-        )
-        .title("鸽鸽词典")
-        .inner_size(w, h)
-        .center()
-        .decorations(false)
-        .always_on_top(true)
-        .resizable(true)
-        .skip_taskbar(true)
-        .focused(true)
-        .build();
-    });
+    open_or_reuse_lookup(app_handle, kind == "paragraph");
 }

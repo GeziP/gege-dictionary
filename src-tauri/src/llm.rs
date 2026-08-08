@@ -1,9 +1,11 @@
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::Value;
 use std::time::Duration;
 
 const SYSTEM_PROMPT: &str = "You are a precise English-Chinese lexicography assistant. CRITICAL RULES: 1) Respond with a single valid JSON object ONLY. 2) No markdown fences, no extra text before or after the JSON. 3) All string values must use \\n for newlines and \\\" for quotes. 4) Do NOT embed markdown code blocks (```) inside JSON strings. Use plain text or pseudocode instead. 5) No trailing commas.";
 
+/// Blocking (non-streaming) lookup — used as fallback or when streaming is disabled.
 pub async fn stream_lookup(
     base_url: &str,
     api_key: &str,
@@ -23,12 +25,41 @@ pub async fn stream_lookup(
         .replace("{{native_lang}}", "中文");
 
     match protocol {
-        "anthropic" => call_anthropic(base_url, api_key, model, temperature, max_tokens, timeout_secs, &prompt).await,
-        _ => call_openai(base_url, api_key, model, temperature, max_tokens, timeout_secs, &prompt).await,
+        "anthropic" => call_anthropic_blocking(base_url, api_key, model, temperature, max_tokens, timeout_secs, &prompt).await,
+        _ => call_openai_blocking(base_url, api_key, model, temperature, max_tokens, timeout_secs, &prompt).await,
     }
 }
 
-async fn call_openai(
+/// Streaming lookup — emits deltas through a callback, returns full text at the end.
+pub async fn stream_lookup_sse<F>(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    protocol: &str,
+    temperature: f64,
+    max_tokens: u32,
+    timeout_secs: u64,
+    selection: &str,
+    context: &str,
+    _kind: &str,
+    template_body: &str,
+    mut on_delta: F,
+) -> Result<String, String>
+where
+    F: FnMut(&str),
+{
+    let prompt = template_body
+        .replace("{{selection}}", selection)
+        .replace("{{context}}", context)
+        .replace("{{native_lang}}", "中文");
+
+    match protocol {
+        "anthropic" => call_anthropic_streaming(base_url, api_key, model, temperature, max_tokens, timeout_secs, &prompt, &mut on_delta).await,
+        _ => call_openai_streaming(base_url, api_key, model, temperature, max_tokens, timeout_secs, &prompt, &mut on_delta).await,
+    }
+}
+
+async fn call_openai_blocking(
     base_url: &str,
     api_key: &str,
     model: &str,
@@ -77,7 +108,89 @@ async fn call_openai(
     Ok(content)
 }
 
-async fn call_anthropic(
+async fn call_openai_streaming<F: FnMut(&str)>(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    temperature: f64,
+    max_tokens: u32,
+    timeout_secs: u64,
+    prompt: &str,
+    on_delta: &mut F,
+) -> Result<String, String> {
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": SYSTEM_PROMPT },
+            { "role": "user", "content": prompt }
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": true
+    });
+
+    let client = build_client(timeout_secs)?;
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format_request_error(&e))?;
+
+    let response = check_response(response).await?;
+    let mut full_text = String::new();
+    let mut stream = response.bytes_stream();
+    let mut line_buf = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| format!("Stream read error: {e}"))?;
+        let text = String::from_utf8_lossy(&bytes);
+
+        for ch in text.chars() {
+            if ch == '\n' {
+                if let Some(delta) = parse_openai_sse_line(&line_buf) {
+                    full_text.push_str(&delta);
+                    on_delta(&delta);
+                }
+                line_buf.clear();
+            } else {
+                line_buf.push(ch);
+            }
+        }
+    }
+    // Process last line
+    if !line_buf.is_empty() {
+        if let Some(delta) = parse_openai_sse_line(&line_buf) {
+            full_text.push_str(&delta);
+            on_delta(&delta);
+        }
+    }
+
+    if full_text.is_empty() {
+        return Err("流式响应为空".to_string());
+    }
+    Ok(full_text)
+}
+
+fn parse_openai_sse_line(line: &str) -> Option<String> {
+    let data = line.strip_prefix("data: ")?;
+    if data == "[DONE]" {
+        return None;
+    }
+    let json: Value = serde_json::from_str(data).ok()?;
+    json.get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("delta"))
+        .and_then(|d| d.get("content"))
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string())
+}
+
+async fn call_anthropic_blocking(
     base_url: &str,
     api_key: &str,
     model: &str,
@@ -129,6 +242,89 @@ async fn call_anthropic(
         return Err(err_msg.to_string());
     }
     Ok(content)
+}
+
+async fn call_anthropic_streaming<F: FnMut(&str)>(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    temperature: f64,
+    max_tokens: u32,
+    timeout_secs: u64,
+    prompt: &str,
+    on_delta: &mut F,
+) -> Result<String, String> {
+    let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
+
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": true,
+        "system": SYSTEM_PROMPT,
+        "messages": [
+            { "role": "user", "content": prompt }
+        ]
+    });
+
+    let client = build_client(timeout_secs)?;
+    let response = client
+        .post(&url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format_request_error(&e))?;
+
+    let response = check_response(response).await?;
+    let mut full_text = String::new();
+    let mut stream = response.bytes_stream();
+    let mut line_buf = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| format!("Stream read error: {e}"))?;
+        let text = String::from_utf8_lossy(&bytes);
+
+        for ch in text.chars() {
+            if ch == '\n' {
+                if let Some(delta) = parse_anthropic_sse_line(&line_buf) {
+                    full_text.push_str(&delta);
+                    on_delta(&delta);
+                }
+                line_buf.clear();
+            } else {
+                line_buf.push(ch);
+            }
+        }
+    }
+    if !line_buf.is_empty() {
+        if let Some(delta) = parse_anthropic_sse_line(&line_buf) {
+            full_text.push_str(&delta);
+            on_delta(&delta);
+        }
+    }
+
+    if full_text.is_empty() {
+        return Err("流式响应为空".to_string());
+    }
+    Ok(full_text)
+}
+
+fn parse_anthropic_sse_line(line: &str) -> Option<String> {
+    let data = line.strip_prefix("data: ")?;
+    let json: Value = serde_json::from_str(data).ok()?;
+    let event_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match event_type {
+        "content_block_delta" => {
+            json.get("delta")
+                .and_then(|d| d.get("text"))
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
+        }
+        _ => None,
+    }
 }
 
 pub async fn test_connection(

@@ -422,6 +422,9 @@ export function Lookup() {
         {entry && lookupStatus === 'done' && (
           <div className="flex items-center gap-2 border-t border-line bg-sunken/50 px-3 py-1 text-[10px] text-ink-subtle">
             <span>模板: <span className="font-medium text-ink-muted">{(entry as any)._templateName || '未知'}</span></span>
+            {(entry as any).fromCache && (
+              <span className="rounded-full bg-positive/15 px-1.5 py-px text-[9px] font-medium text-positive">缓存</span>
+            )}
             <span className="ml-auto">{settings.provider.model}</span>
           </div>
         )}

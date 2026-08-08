@@ -1,13 +1,25 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { CheckIcon, ClipboardCopyIcon } from 'lucide-react';
+import { CheckIcon, ClipboardCopyIcon, ShieldIcon } from 'lucide-react';
 import { useLexNote } from '../../contexts/LexNoteContext';
 import { Toggle } from '../ui/Toggle';
+import { SegmentedControl } from '../ui/SegmentedControl';
+import { TextInput } from '../ui/TextInput';
 import { SettingsSection } from './SettingsSection';
 import * as bridge from '../../lib/tauri-bridge';
+import { classNames } from '../../utils/format';
+
+const CLIPBOARD_MODES = [
+  { value: 'smart' as const, label: '智能', icon: <ShieldIcon size={12} /> },
+  { value: 'full' as const, label: '全量' },
+  { value: 'manual' as const, label: '手动' },
+];
 
 export function CaptureSection() {
   const { settings, updateSettings } = useLexNote();
   const [watchEnabled, setWatchEnabled] = useState(true);
+  const [blacklistInput, setBlacklistInput] = useState(
+    (settings.clipboardBlacklist || []).join(', ')
+  );
 
   useEffect(() => {
     bridge.getClipboardWatchStatus().then(setWatchEnabled).catch(() => {});
@@ -22,6 +34,14 @@ export function CaptureSection() {
     }
   }, []);
 
+  const handleBlacklistBlur = () => {
+    const entries = blacklistInput
+      .split(/[,，\n]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    updateSettings({ clipboardBlacklist: entries });
+  };
+
   return (
     <div className="space-y-3">
       <SettingsSection
@@ -33,6 +53,34 @@ export function CaptureSection() {
           onChange={handleToggle}
           label="监听剪贴板"
           description="复制英文文本时自动弹出查词窗口。也可在系统托盘右键菜单中开关。" />
+
+        <div className="mt-3">
+          <label className="mb-1.5 block text-[11px] font-medium text-ink-muted">触发模式</label>
+          <SegmentedControl
+            label="剪贴板触发模式"
+            options={CLIPBOARD_MODES}
+            value={(settings.clipboardMode as 'smart' | 'full' | 'manual') || 'smart'}
+            onChange={(mode) => updateSettings({ clipboardMode: mode })}
+          />
+          <p className="mt-1.5 text-[10px] text-ink-subtle">
+            {(settings.clipboardMode || 'smart') === 'smart' && '智能模式：自动过滤密钥、代码、路径等非英文学习内容'}
+            {settings.clipboardMode === 'full' && '全量模式：任何英文文本都会触发查词（慎用）'}
+            {settings.clipboardMode === 'manual' && '手动模式：仅通过托盘菜单或快捷键触发查词'}
+          </p>
+        </div>
+
+        <div className="mt-3">
+          <label className="mb-1.5 block text-[11px] font-medium text-ink-muted">应用黑名单</label>
+          <TextInput
+            label="黑名单"
+            hideLabel
+            value={blacklistInput}
+            onChange={(e) => setBlacklistInput(e.target.value)}
+            onBlur={handleBlacklistBlur}
+            placeholder="逗号分隔的进程名或窗口标题关键词"
+            hint="从这些应用复制时不会触发查词（默认已排除密码管理器和终端）"
+          />
+        </div>
 
         <div className="mt-3 rounded-md border border-line bg-raised p-3">
           <p className="flex items-center gap-1.5 text-[12px] font-medium text-ink">

@@ -1,6 +1,6 @@
 [package]
 name = "gege-dic"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 
 [lib]
@@ -24,10 +24,12 @@ chrono = "0.4"
 arboard = "3"
 dirs = "5"
 rfd = "0.15"
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    "Win32_Security_Cryptography",
 ] }
 
 [features]

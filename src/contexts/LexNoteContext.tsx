@@ -252,6 +252,35 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
 
   const resetTemplates = useCallback(() => setTemplates(DEFAULT_TEMPLATES), []);
 
+  const requestIdRef = React.useRef<string>('');
+
+  // Listen for streaming events
+  useEffect(() => {
+    if (!isTauri) return;
+    const unsubs: Array<() => void> = [];
+
+    bridge.listenLookupDone((e) => {
+      if (e.requestId !== requestIdRef.current) return;
+      setLookupStatus('done');
+      setLookupResult(e.entry as Entry);
+    }).then((u) => unsubs.push(u));
+
+    bridge.listenLookupError((e) => {
+      if (e.requestId !== requestIdRef.current) return;
+      setLookupStatus('error');
+      setLookupError(e.error);
+    }).then((u) => unsubs.push(u));
+
+    bridge.listenLookupDelta((e) => {
+      if (e.requestId !== requestIdRef.current) return;
+      if (lookupStatus !== 'streaming') {
+        setLookupStatus('streaming');
+      }
+    }).then((u) => unsubs.push(u));
+
+    return () => { unsubs.forEach((fn) => fn()); };
+  }, [isTauri]);
+
   const triggerLookup = useCallback(
     async (selection: string, context: string, kind: string, sourceApp?: string, sourceTitle?: string) => {
       setLookupSelection(selection);
@@ -262,7 +291,26 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
       setLookupResult(null);
       setLookupError(null);
 
-      if (isTauri) {
+      if (!isTauri) return;
+
+      const useStreaming = settings.streamingEnabled !== false;
+      if (useStreaming) {
+        const rid = `req-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        requestIdRef.current = rid;
+        try {
+          await bridge.lookupWordStream(selection, context, kind, rid);
+        } catch (e) {
+          // Fallback to blocking if streaming command fails
+          try {
+            const entry = await bridge.lookupWord(selection, context, kind);
+            setLookupStatus('done');
+            setLookupResult(entry as Entry);
+          } catch (e2) {
+            setLookupStatus('error');
+            setLookupError(String(e2));
+          }
+        }
+      } else {
         try {
           const entry = await bridge.lookupWord(selection, context, kind);
           setLookupStatus('done');
@@ -273,7 +321,7 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
         }
       }
     },
-    [isTauri]
+    [isTauri, settings.streamingEnabled]
   );
 
   const clearLookup = useCallback(() => {

@@ -95,6 +95,42 @@ export async function lookupWord(
   return invoke<Entry>('lookup_word', { selection, context, kind });
 }
 
+export async function lookupWordStream(
+  selection: string,
+  context: string,
+  kind: string,
+  requestId: string
+): Promise<void> {
+  return invoke('lookup_word_stream', { selection, context, kind, requestId });
+}
+
+export interface LookupDeltaEvent {
+  requestId: string;
+  delta: string;
+}
+
+export interface LookupDoneEvent {
+  requestId: string;
+  entry: Entry;
+}
+
+export interface LookupErrorEvent {
+  requestId: string;
+  error: string;
+}
+
+export async function listenLookupDelta(handler: (e: LookupDeltaEvent) => void): Promise<() => void> {
+  return listen('lookup://delta', handler as (payload: unknown) => void);
+}
+
+export async function listenLookupDone(handler: (e: LookupDoneEvent) => void): Promise<() => void> {
+  return listen('lookup://done', handler as (payload: unknown) => void);
+}
+
+export async function listenLookupError(handler: (e: LookupErrorEvent) => void): Promise<() => void> {
+  return listen('lookup://error', handler as (payload: unknown) => void);
+}
+
 export async function toggleClipboardWatch(): Promise<boolean> {
   return invoke<boolean>('toggle_clipboard_watch');
 }

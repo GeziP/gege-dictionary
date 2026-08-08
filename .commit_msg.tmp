@@ -1,0 +1,17 @@
+feat(v1.1): 体验与信任债偿还 — 5 项核心改进
+
+- [F0] DB 文件名修复: resolve_db_path 兼容 lexnote.db 自动迁移,
+  备份命名改为 gege-backup-YYYYMMDD-HHmmss.db, change_data_dir
+  增加 integrity_check
+- [F1] 本地缓存接线: SHA-256 缓存键, fromCache 前端标识,
+  启动时自动清理过期/超额缓存
+- [F4] DPAPI 加密 API Key: dpapi.rs 模块, save/get_settings
+  自动加解密, 前端掩码显示
+- [F3] 剪贴板误触发治理: content_filter.rs (7 单元测试),
+  三档模式(智能/全量/手动), 应用黑名单, 窗口复用,
+  托盘暂停30分钟
+- [F2] 真流式渲染: SSE 双协议 (OpenAI/Anthropic),
+  lookup_word_stream 命令 + Tauri Event, 前端事件监听,
+  自动 fallback 非流式, 设置开关
+
+版本号升至 1.1.0
