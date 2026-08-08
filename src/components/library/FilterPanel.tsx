@@ -2,11 +2,7 @@ import React from 'react';
 import { RotateCcwIcon } from 'lucide-react';
 import type { Mastery, SavedWord } from '../../types/lexnote';
 import { classNames } from '../../utils/format';
-
-const MASTERY: {value: Mastery;label: string;dot: string;}[] = [
-{ value: 'new', label: '新词', dot: 'bg-danger' },
-{ value: 'familiar', label: '熟悉', dot: 'bg-warn' },
-{ value: 'mastered', label: '已掌握', dot: 'bg-positive' }];
+import { MASTERY_META, MASTERY_ORDER } from '../ui/MasteryBadge';
 
 
 const RANGES = [
@@ -50,7 +46,7 @@ export function FilterPanel({
   const hasFilters = activeTags.length + activeSources.length + activeMastery.length > 0 || range !== 'all';
 
   return (
-    <aside className="thin-scroll w-[188px] shrink-0 overflow-y-auto border-r border-line bg-surface p-3">
+    <aside aria-label="筛选生词" className="thin-scroll w-filter shrink-0 overflow-y-auto border-r border-line bg-surface p-3">
       <div className="mb-3 flex items-center justify-between">
         <h2 className="text-[10px] font-semibold uppercase tracking-[0.12em] text-ink-subtle">筛选</h2>
         {hasFilters ?
@@ -115,22 +111,27 @@ export function FilterPanel({
       <section className="mb-4">
         <h3 className="mb-1.5 text-[11px] font-medium text-ink-muted">掌握度</h3>
         <div className="space-y-0.5">
-          {MASTERY.map((item) =>
-          <button
-            key={item.value}
-            type="button"
-            onClick={() => onToggleMastery(item.value)}
-            className={classNames(
-              'flex w-full items-center gap-2 rounded px-2 py-1 text-left text-[12px] transition-colors',
-              activeMastery.includes(item.value) ?
-              'bg-accent-soft text-accent' :
-              'text-ink-muted hover:bg-sunken hover:text-ink'
-            )}>
-            
-              <span className={classNames('h-1.5 w-1.5 rounded-full', item.dot)} />
-              {item.label}
-            </button>
-          )}
+          {MASTERY_ORDER.map((value) => {
+            const meta = MASTERY_META[value];
+            const Icon = meta.icon;
+            return (
+              <button
+                key={value}
+                type="button"
+                aria-pressed={activeMastery.includes(value)}
+                onClick={() => onToggleMastery(value)}
+                className={classNames(
+                  'flex w-full items-center gap-2 rounded px-2 py-1 text-left text-[12px] transition-colors',
+                  activeMastery.includes(value)
+                    ? 'bg-accent-soft text-accent'
+                    : 'text-ink-muted hover:bg-sunken hover:text-ink'
+                )}
+              >
+                <Icon size={13} className={meta.tone} aria-hidden="true" />
+                {meta.label}
+              </button>
+            );
+          })}
         </div>
       </section>
 

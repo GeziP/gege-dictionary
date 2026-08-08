@@ -33,6 +33,27 @@ module.exports = {
         ipa: ['"Gentium Book Plus"', '"Charis SIL"', '"Doulos SIL"', 'Georgia', 'serif'],
         mono: ['"JetBrains Mono"', 'Consolas', 'ui-monospace', 'monospace'],
       },
+      fontSize: {
+        '2xs': ['0.6875rem', { lineHeight: '1.45' }],
+        xs: ['0.75rem', { lineHeight: '1.5' }],
+        sm: ['0.8125rem', { lineHeight: '1.55' }],
+        base: ['0.875rem', { lineHeight: '1.6' }],
+        lg: ['1rem', { lineHeight: '1.5' }],
+        xl: ['1.25rem', { lineHeight: '1.3' }],
+        '2xl': ['1.625rem', { lineHeight: '1.2' }],
+      },
+      spacing: {
+        titlebar: '2.25rem',
+        toolbar: '3rem',
+        control: '1.75rem',
+        'control-lg': '2rem',
+      },
+      width: {
+        rail: '11.5rem',
+        filter: '13rem',
+        drawer: '29rem',
+        popup: '23rem',
+      },
       boxShadow: {
         window: '0 24px 60px -12px rgb(0 0 0 / 0.35), 0 4px 12px -4px rgb(0 0 0 / 0.18)',
         float: '0 18px 44px -10px rgb(0 0 0 / 0.32), 0 2px 8px -2px rgb(0 0 0 / 0.16)',
