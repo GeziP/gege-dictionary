@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { DEFAULT_PROVIDER, DEFAULT_TEMPLATES } from '../data/providers';
 import type {
@@ -23,6 +24,10 @@ const DEFAULT_SETTINGS: AppSettings = {
   ttsVoice: 'Microsoft Zira',
   ttsRate: 1,
   fontSize: 13,
+  clipboardMode: 'smart',
+  clipboardBlacklist: [],
+  streamingEnabled: true,
+  cacheTtlDays: 30,
 };
 
 interface Usage {
@@ -63,7 +68,7 @@ interface LexNoteValue {
   countLookup: (tokens: number) => void;
   saveTemplate: (template: PromptTemplate) => void;
   resetTemplates: () => void;
-  triggerLookup: (selection: string, context: string, kind: string, sourceApp?: string, sourceTitle?: string) => void;
+  triggerLookup: (selection: string, context: string, kind: string, sourceApp?: string, sourceTitle?: string, forceRefresh?: boolean) => void;
   clearLookup: () => void;
   refreshWords: () => void;
 }
@@ -89,6 +94,7 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
   const [lookupContext, setLookupContext] = useState('');
   const [lookupSourceApp, setLookupSourceApp] = useState('');
   const [lookupSourceTitle, setLookupSourceTitle] = useState('');
+  const [lookupListenersReady, setLookupListenersReady] = useState(false);
 
   const refreshWords = useCallback(async () => {
     if (!isTauri) return;
@@ -253,36 +259,82 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
   const resetTemplates = useCallback(() => setTemplates(DEFAULT_TEMPLATES), []);
 
   const requestIdRef = React.useRef<string>('');
+  const activeLookupRef = React.useRef<{ selection: string; kind: string }>({ selection: '', kind: 'word' });
 
   // Listen for streaming events
   useEffect(() => {
     if (!isTauri) return;
     const unsubs: Array<() => void> = [];
+    let active = true;
 
-    bridge.listenLookupDone((e) => {
+    const doneListener = bridge.listenLookupDone((e) => {
       if (e.requestId !== requestIdRef.current) return;
       setLookupStatus('done');
       setLookupResult(e.entry as Entry);
-    }).then((u) => unsubs.push(u));
+    });
 
-    bridge.listenLookupError((e) => {
+    const errorListener = bridge.listenLookupError((e) => {
       if (e.requestId !== requestIdRef.current) return;
-      setLookupStatus('error');
-      setLookupError(e.error);
-    }).then((u) => unsubs.push(u));
+      setLookupStatus('loading');
+      setLookupError(null);
+    });
 
-    bridge.listenLookupDelta((e) => {
+    const deltaListener = bridge.listenLookupDelta((e) => {
       if (e.requestId !== requestIdRef.current) return;
-      if (lookupStatus !== 'streaming') {
-        setLookupStatus('streaming');
-      }
-    }).then((u) => unsubs.push(u));
+      const aliases: Record<string, keyof Entry> = {
+        word: 'selection',
+        context_meaning: 'contextMeaning',
+        ipa_us: 'ipaUS',
+        ipa_uk: 'ipaUK',
+        translation_pairs: 'translationPairs',
+        key_terms: 'keyTerms',
+      };
+      const field = aliases[e.field] || e.field as keyof Entry;
+      const active = activeLookupRef.current;
+      setLookupResult((previous) => ({
+        id: previous?.id || `stream-${e.requestId}`,
+        selection: previous?.selection || active.selection,
+        lemma: previous?.lemma || active.selection,
+        pos: previous?.pos || '',
+        ipaUS: previous?.ipaUS || '',
+        ipaUK: previous?.ipaUK || '',
+        translation: previous?.translation || '',
+        contextMeaning: previous?.contextMeaning || '',
+        explanation: previous?.explanation || '',
+        senses: previous?.senses || [],
+        associations: previous?.associations || [],
+        examples: previous?.examples || [],
+        collocations: previous?.collocations || [],
+        register: previous?.register || 'neutral',
+        kind: previous?.kind || active.kind as Entry['kind'],
+        ...previous,
+        [field]: e.value,
+      } as Entry));
+      setLookupStatus('streaming');
+    });
 
-    return () => { unsubs.forEach((fn) => fn()); };
+    Promise.all([doneListener, errorListener, deltaListener])
+      .then((listeners) => {
+        if (active) {
+          unsubs.push(...listeners);
+          setLookupListenersReady(true);
+        } else {
+          listeners.forEach((unlisten) => unlisten());
+        }
+      })
+      .catch((error) => {
+        console.error('Failed to register lookup event listeners:', error);
+        setLookupListenersReady(false);
+      });
+
+    return () => {
+      active = false;
+      unsubs.forEach((fn) => fn());
+    };
   }, [isTauri]);
 
   const triggerLookup = useCallback(
-    async (selection: string, context: string, kind: string, sourceApp?: string, sourceTitle?: string) => {
+    async (selection: string, context: string, kind: string, sourceApp?: string, sourceTitle?: string, forceRefresh = false) => {
       setLookupSelection(selection);
       setLookupContext(context);
       if (sourceApp) setLookupSourceApp(sourceApp);
@@ -290,20 +342,21 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
       setLookupStatus('loading');
       setLookupResult(null);
       setLookupError(null);
+      activeLookupRef.current = { selection, kind };
 
       if (!isTauri) return;
 
-      const useStreaming = settings.streamingEnabled === true;
+      const useStreaming = settings.streamingEnabled === true && lookupListenersReady;
       if (useStreaming) {
         const rid = `req-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         requestIdRef.current = rid;
         try {
-          await bridge.lookupWordStream(selection, context, kind, rid);
+          await bridge.lookupWordStream(selection, context, kind, rid, forceRefresh);
         } catch (e) {
           console.warn('[triggerLookup] streaming failed, falling back to blocking:', e);
           requestIdRef.current = '';
           try {
-            const entry = await bridge.lookupWord(selection, context, kind);
+            const entry = await bridge.lookupWord(selection, context, kind, forceRefresh);
             setLookupStatus('done');
             setLookupResult(entry as Entry);
           } catch (e2) {
@@ -313,7 +366,7 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
         }
       } else {
         try {
-          const entry = await bridge.lookupWord(selection, context, kind);
+          const entry = await bridge.lookupWord(selection, context, kind, forceRefresh);
           setLookupStatus('done');
           setLookupResult(entry as Entry);
         } catch (e) {
@@ -322,7 +375,7 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
         }
       }
     },
-    [isTauri, settings.streamingEnabled]
+    [isTauri, lookupListenersReady, settings.streamingEnabled]
   );
 
   const clearLookup = useCallback(() => {
@@ -380,13 +433,4 @@ export function useLexNote(): LexNoteValue {
   const ctx = useContext(LexNoteContext);
   if (!ctx) throw new Error('useLexNote must be used inside LexNoteProvider');
   return ctx;
-}
-
-function detectKind(text: string): string {
-  const trimmed = text.trim();
-  const wordCount = trimmed.split(/\s+/).length;
-  if (wordCount >= 30) return 'paragraph';
-  if (wordCount >= 6) return 'sentence';
-  if (trimmed.includes(' ')) return 'phrase';
-  return 'word';
 }

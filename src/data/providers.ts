@@ -33,9 +33,9 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   id: 'deepseek',
   name: 'DeepSeek',
   protocol: 'openai',
-  baseUrl: 'https://api.deepseek.com/v1',
-  model: 'deepseek-chat',
-  hint: '中文释义质量好，价格低',
+  baseUrl: 'https://api.deepseek.com',
+  model: 'deepseek-v4-flash',
+  hint: 'V4 Flash，中文释义质量好、响应快',
   keyUrl: 'platform.deepseek.com'
 },
 {

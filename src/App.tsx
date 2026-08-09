@@ -6,8 +6,6 @@ import { Settings } from './pages/Settings';
 import { Onboarding } from './pages/Onboarding';
 import { Lookup } from './pages/Lookup';
 
-type InitState = 'loading' | 'ready';
-
 function MainRouter() {
   const { onboarded, initState } = useLexNote();
   const isLookup = window.location.pathname === '/lookup';

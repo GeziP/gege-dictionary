@@ -75,9 +75,17 @@ fn get_foreground_window_info() -> (String, String) {
 }
 
 const DEFAULT_BLACKLIST: &[&str] = &[
-    "1password", "keepass", "bitwarden", "lastpass",
-    "cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe",
-    "code.exe", "devenv.exe", "idea64.exe",
+    "1password",
+    "keepass",
+    "bitwarden",
+    "lastpass",
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "windowsterminal.exe",
+    "code.exe",
+    "devenv.exe",
+    "idea64.exe",
 ];
 
 fn is_blacklisted(process_name: &str, window_title: &str, custom_blacklist: &[String]) -> bool {
@@ -102,13 +110,46 @@ pub fn start(app_handle: tauri::AppHandle, enabled: Arc<AtomicBool>) {
     thread::spawn(move || {
         let mut last_text = String::new();
         let mut cooldown_until = std::time::Instant::now();
+        let mut last_clipboard_poll = std::time::Instant::now() - Duration::from_millis(500);
+        let mut last_mode_check = std::time::Instant::now() - Duration::from_millis(500);
+        let mut mode = "smart".to_string();
+        let mut ctrl_c_was_down = false;
+        let mut first_ctrl_c: Option<std::time::Instant> = None;
 
         loop {
-            thread::sleep(Duration::from_millis(500));
+            thread::sleep(Duration::from_millis(50));
 
             if !enabled.load(Ordering::Relaxed) {
                 continue;
             }
+            let now = std::time::Instant::now();
+            if now.duration_since(last_mode_check) >= Duration::from_millis(500) {
+                mode = get_trigger_mode(&app_handle).0;
+                if mode == "manual" {
+                    mode = "double".into();
+                }
+                last_mode_check = now;
+            }
+            if mode == "double" {
+                let ctrl_c_down = is_ctrl_c_down();
+                if ctrl_c_down && !ctrl_c_was_down {
+                    if first_ctrl_c.is_some_and(|first| {
+                        now.duration_since(first) <= Duration::from_millis(700)
+                    }) {
+                        let state = app_handle.state::<AppState>();
+                        lookup_clipboard(&app_handle, &state.last_capture);
+                        first_ctrl_c = None;
+                    } else {
+                        first_ctrl_c = Some(now);
+                    }
+                }
+                ctrl_c_was_down = ctrl_c_down;
+                continue;
+            }
+            if now.duration_since(last_clipboard_poll) < Duration::from_millis(500) {
+                continue;
+            }
+            last_clipboard_poll = now;
             if std::time::Instant::now() < cooldown_until {
                 continue;
             }
@@ -125,6 +166,19 @@ pub fn start(app_handle: tauri::AppHandle, enabled: Arc<AtomicBool>) {
             }
         }
     });
+}
+
+fn is_ctrl_c_down() -> bool {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetAsyncKeyState(vkey: i32) -> i16;
+    }
+    const VK_CONTROL: i32 = 0x11;
+    const VK_C: i32 = 0x43;
+    unsafe {
+        (GetAsyncKeyState(VK_CONTROL) as u16 & 0x8000) != 0
+            && (GetAsyncKeyState(VK_C) as u16 & 0x8000) != 0
+    }
 }
 
 fn get_trigger_mode(app_handle: &tauri::AppHandle) -> (String, Vec<String>) {
@@ -177,7 +231,10 @@ fn poll_once(app_handle: &tauri::AppHandle, last_text: &mut String) -> bool {
     // "smart" mode: apply content filter and blacklist
     if mode == "smart" {
         if content_filter::should_reject(last_text) {
-            eprintln!("[clipboard] rejected by content filter: {:?}", &last_text[..last_text.len().min(40)]);
+            eprintln!(
+                "[clipboard] rejected by content filter: {:?}",
+                &last_text[..last_text.len().min(40)]
+            );
             return false;
         }
 
@@ -198,7 +255,10 @@ fn poll_once(app_handle: &tauri::AppHandle, last_text: &mut String) -> bool {
 
     let kind = detect_kind(last_text);
     let (win_title, _) = get_foreground_window_info();
-    eprintln!("[clipboard] detected: {:?} kind={kind} from={win_title:?}", &last_text[..last_text.len().min(60)]);
+    eprintln!(
+        "[clipboard] detected: {:?} kind={kind} from={win_title:?}",
+        &last_text[..last_text.len().min(60)]
+    );
 
     let capture_data = serde_json::json!({
         "selection": *last_text,
@@ -222,12 +282,19 @@ fn poll_once(app_handle: &tauri::AppHandle, last_text: &mut String) -> bool {
 }
 
 fn open_or_reuse_lookup(app_handle: &tauri::AppHandle, is_long: bool) {
-    let (w, h) = if is_long { (560.0, 700.0) } else { (420.0, 560.0) };
+    let (w, h) = if is_long {
+        (560.0, 700.0)
+    } else {
+        (420.0, 560.0)
+    };
 
     if let Some(win) = app_handle.get_webview_window("lookup") {
         // Reuse existing window: navigate and resize
-        let _ = win.set_size(tauri::Size::Logical(tauri::LogicalSize { width: w, height: h }));
-        let _ = win.center();
+        let _ = win.set_size(tauri::Size::Logical(tauri::LogicalSize {
+            width: w,
+            height: h,
+        }));
+        position_lookup_window(app_handle, &win, w, h);
         let _ = win.show();
         let _ = win.eval("window.location.reload()");
         return;
@@ -242,14 +309,50 @@ fn open_or_reuse_lookup(app_handle: &tauri::AppHandle, is_long: bool) {
         )
         .title("鸽鸽词典")
         .inner_size(w, h)
-        .center()
         .decorations(false)
         .always_on_top(true)
         .resizable(true)
         .skip_taskbar(true)
         .focused(false)
-        .build();
+        .build()
+        .map(|win| position_lookup_window(&app_h, &win, w, h));
     });
+}
+
+fn position_lookup_window(
+    app_handle: &tauri::AppHandle,
+    window: &tauri::WebviewWindow,
+    logical_width: f64,
+    logical_height: f64,
+) {
+    let Ok(cursor) = app_handle.cursor_position() else {
+        return;
+    };
+    let Ok(Some(monitor)) = app_handle.monitor_from_point(cursor.x, cursor.y) else {
+        return;
+    };
+    let scale = monitor.scale_factor();
+    let width = logical_width * scale;
+    let height = logical_height * scale;
+    let origin = monitor.position();
+    let size = monitor.size();
+    let left = origin.x as f64 + 8.0;
+    let top = origin.y as f64 + 8.0;
+    let right = origin.x as f64 + size.width as f64 - 8.0;
+    let bottom = origin.y as f64 + size.height as f64 - 8.0;
+    let mut x = cursor.x + 14.0;
+    let mut y = cursor.y + 20.0;
+    if x + width > right {
+        x = cursor.x - width - 14.0;
+    }
+    if y + height > bottom {
+        y = cursor.y - height - 14.0;
+    }
+    x = x.clamp(left, (right - width).max(left));
+    y = y.clamp(top, (bottom - height).max(top));
+    let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(
+        x as i32, y as i32,
+    )));
 }
 
 fn is_english_text(text: &str) -> bool {
@@ -284,7 +387,10 @@ fn detect_kind(text: &str) -> &'static str {
     }
 }
 
-pub fn lookup_clipboard(app_handle: &tauri::AppHandle, last_capture: &Mutex<Option<serde_json::Value>>) {
+pub fn lookup_clipboard(
+    app_handle: &tauri::AppHandle,
+    last_capture: &Mutex<Option<serde_json::Value>>,
+) {
     let text = match arboard::Clipboard::new() {
         Ok(mut cb) => cb.get_text().unwrap_or_default().trim().to_string(),
         Err(_) => return,
@@ -297,10 +403,11 @@ pub fn lookup_clipboard(app_handle: &tauri::AppHandle, last_capture: &Mutex<Opti
     let state = app_handle.state::<AppState>();
     if let Ok(ll) = state.last_looked_up.lock() {
         if *ll == text {
-            eprintln!("[clipboard] skipping duplicate lookup: {:?}", &text[..text.len().min(40)]);
-            if let Some(win) = app_handle.get_webview_window("lookup") {
-                let _ = win.set_focus();
-            }
+            eprintln!(
+                "[clipboard] skipping duplicate lookup: {:?}",
+                &text[..text.len().min(40)]
+            );
+            open_or_reuse_lookup(app_handle, detect_kind(&text) == "paragraph");
             return;
         }
     }

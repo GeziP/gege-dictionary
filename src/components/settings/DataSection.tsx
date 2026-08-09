@@ -24,6 +24,8 @@ interface DbInfo {
   wordCount: number;
   sizeBytes: number;
   dataDir: string;
+  cacheCount: number;
+  cacheSizeBytes: number;
 }
 
 export function DataSection() {
@@ -44,10 +46,16 @@ export function DataSection() {
     if (!isTauri) return;
     try {
       const [stats, bks] = await Promise.all([
-        bridge.getDbStats() as Promise<DbInfo & { tagCount: number; cacheCount: number }>,
+        bridge.getDbStats() as Promise<DbInfo & { tagCount: number }>,
         bridge.listBackups(),
       ]);
-      setDbInfo({ wordCount: stats.wordCount, sizeBytes: stats.sizeBytes, dataDir: stats.dataDir });
+      setDbInfo({
+        wordCount: stats.wordCount,
+        sizeBytes: stats.sizeBytes,
+        dataDir: stats.dataDir,
+        cacheCount: stats.cacheCount,
+        cacheSizeBytes: stats.cacheSizeBytes,
+      });
       setNewDir(stats.dataDir);
       setBackups(bks as Backup[]);
     } catch (e) {
@@ -159,6 +167,19 @@ export function DataSection() {
     }
   };
 
+  const handleClearCache = async () => {
+    setLoading('clear-cache');
+    try {
+      const count = await bridge.clearCache();
+      flash('ok', `已清空 ${count} 条缓存`);
+      await loadInfo();
+    } catch (e) {
+      flash('error', `清空缓存失败: ${e}`);
+    } finally {
+      setLoading(null);
+    }
+  };
+
   const formatSize = (bytes: number) => {
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -237,6 +258,35 @@ export function DataSection() {
           onClick={handleBackup}>
           立即备份
         </Button>
+      </SettingsSection>
+
+      <SettingsSection title="查询缓存" description="重复查询会直接使用本地结果，不消耗模型额度。">
+        <div className="flex items-center gap-2">
+          <label className="flex flex-1 items-center gap-2 text-[11px] text-ink-muted">
+            有效期
+            <select
+              value={settings.cacheTtlDays ?? 30}
+              onChange={(event) => updateSettings({ cacheTtlDays: Number(event.target.value) as 0 | 7 | 30 | 90 })}
+              className="h-7 rounded border border-line bg-surface px-2 text-[11px] text-ink"
+            >
+              <option value={7}>7 天</option>
+              <option value={30}>30 天</option>
+              <option value={90}>90 天</option>
+              <option value={0}>永不过期</option>
+            </select>
+          </label>
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={loading === 'clear-cache' || !dbInfo?.cacheCount}
+            onClick={handleClearCache}
+          >
+            {loading === 'clear-cache' ? '清理中…' : '清空缓存'}
+          </Button>
+        </div>
+        <p className="mt-2 text-[11px] text-ink-subtle">
+          当前 {dbInfo?.cacheCount ?? 0} 条 · {formatSize(dbInfo?.cacheSizeBytes ?? 0)}
+        </p>
       </SettingsSection>
 
       <SettingsSection title="用量" description="仅在本机统计，不上报。token 数为按字符估算值，实际以服务商账单为准。">

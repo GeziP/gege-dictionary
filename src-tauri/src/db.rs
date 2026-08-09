@@ -4,6 +4,33 @@ use std::path::{Path, PathBuf};
 
 pub const DB_FILENAME: &str = "gege.db";
 pub const LEGACY_DB_FILENAME: &str = "lexnote.db";
+pub const DATA_DIR_POINTER_FILENAME: &str = "data-dir.txt";
+
+/// Resolve the configured data directory from a small pointer file kept in the
+/// default application directory. The pointer is deliberately stored outside
+/// the database so a moved database can still be found on the next launch.
+pub fn resolve_configured_data_dir(default_dir: &Path) -> PathBuf {
+    let pointer = default_dir.join(DATA_DIR_POINTER_FILENAME);
+    let Ok(raw) = std::fs::read_to_string(pointer) else {
+        return default_dir.to_path_buf();
+    };
+    let configured = PathBuf::from(raw.trim());
+    if configured.is_dir() {
+        configured
+    } else {
+        eprintln!("[db] Configured data directory is unavailable; using default directory");
+        default_dir.to_path_buf()
+    }
+}
+
+pub fn persist_configured_data_dir(default_dir: &Path, data_dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(default_dir).map_err(|e| format!("创建默认数据目录失败: {e}"))?;
+    std::fs::write(
+        default_dir.join(DATA_DIR_POINTER_FILENAME),
+        data_dir.to_string_lossy().as_bytes(),
+    )
+    .map_err(|e| format!("保存数据目录配置失败: {e}"))
+}
 
 /// Resolve the database file path with legacy compatibility.
 /// 1. If `gege.db` exists in dir, return it.
@@ -169,6 +196,10 @@ impl Database {
                     "timeoutSeconds": 60
                 },
                 "clipboardWatch": true,
+                "clipboardMode": "smart",
+                "clipboardBlacklist": [],
+                "streamingEnabled": true,
+                "cacheTtlDays": 30,
                 "theme": "system",
                 "cardScale": "default",
                 "captureContext": true,
@@ -253,13 +284,20 @@ impl Database {
         if ids.is_empty() {
             return self.get_all_words();
         }
-        let placeholders: Vec<String> = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+        let placeholders: Vec<String> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
         let sql = format!(
             "SELECT data FROM words WHERE id IN ({}) ORDER BY saved_at DESC",
             placeholders.join(",")
         );
         let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
-        let params: Vec<&dyn rusqlite::types::ToSql> = ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+        let params: Vec<&dyn rusqlite::types::ToSql> = ids
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
         let rows = stmt
             .query_map(params.as_slice(), |row| {
                 let data: String = row.get(0)?;
@@ -361,13 +399,28 @@ impl Database {
     pub fn save_word(&self, word: &Value) -> Result<(), String> {
         let id = word.get("id").and_then(|v| v.as_str()).unwrap_or("");
         let lemma = word.get("lemma").and_then(|v| v.as_str()).unwrap_or("");
-        let translation = word.get("translation").and_then(|v| v.as_str()).unwrap_or("");
+        let translation = word
+            .get("translation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let pos = word.get("pos").and_then(|v| v.as_str()).unwrap_or("");
-        let context_meaning = word.get("contextMeaning").and_then(|v| v.as_str()).unwrap_or("");
-        let explanation = word.get("explanation").and_then(|v| v.as_str()).unwrap_or("");
+        let context_meaning = word
+            .get("contextMeaning")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let explanation = word
+            .get("explanation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let source_app = word.get("sourceApp").and_then(|v| v.as_str()).unwrap_or("");
-        let source_title = word.get("sourceTitle").and_then(|v| v.as_str()).unwrap_or("");
-        let mastery = word.get("mastery").and_then(|v| v.as_str()).unwrap_or("new");
+        let source_title = word
+            .get("sourceTitle")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let mastery = word
+            .get("mastery")
+            .and_then(|v| v.as_str())
+            .unwrap_or("new");
         let kind = word.get("kind").and_then(|v| v.as_str()).unwrap_or("word");
         let saved_at = word.get("savedAt").and_then(|v| v.as_str()).unwrap_or("");
         let lookups = word.get("lookups").and_then(|v| v.as_u64()).unwrap_or(1) as i64;
@@ -460,11 +513,11 @@ impl Database {
     }
 
     pub fn get_settings(&self) -> Result<Value, String> {
-        match self.conn.query_row(
-            "SELECT value FROM settings WHERE key = 'app'",
-            [],
-            |row| row.get::<_, String>(0),
-        ) {
+        match self
+            .conn
+            .query_row("SELECT value FROM settings WHERE key = 'app'", [], |row| {
+                row.get::<_, String>(0)
+            }) {
             Ok(data) => serde_json::from_str(&data).map_err(|e| e.to_string()),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(serde_json::json!({})),
             Err(e) => Err(format!("Settings error: {e}")),
@@ -554,12 +607,20 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_cache(&self, key: &str) -> Result<Option<Value>, String> {
-        let result: SqlResult<String> = self.conn.query_row(
-            "SELECT response FROM cache WHERE cache_key = ?1 AND created_at > datetime('now', '-30 days')",
-            params![key],
-            |row| row.get(0),
-        );
+    pub fn get_cache(&self, key: &str, ttl_days: i64) -> Result<Option<Value>, String> {
+        let result: SqlResult<String> = if ttl_days <= 0 {
+            self.conn.query_row(
+                "SELECT response FROM cache WHERE cache_key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+        } else {
+            self.conn.query_row(
+                "SELECT response FROM cache WHERE cache_key = ?1 AND created_at > datetime('now', ?2)",
+                params![key, format!("-{ttl_days} days")],
+                |row| row.get(0),
+            )
+        };
         match result {
             Ok(data) => {
                 let val = serde_json::from_str(&data).map_err(|e| e.to_string())?;
@@ -581,15 +642,18 @@ impl Database {
         Ok(())
     }
 
-    /// Remove expired cache entries (>30 days) and enforce max 5000 entries.
-    pub fn cleanup_cache(&self) -> Result<u64, String> {
-        let expired = self
-            .conn
-            .execute(
-                "DELETE FROM cache WHERE created_at < datetime('now', '-30 days')",
-                [],
-            )
-            .map_err(|e| e.to_string())? as u64;
+    /// Remove expired cache entries and reduce an oversized cache to 4000 rows.
+    pub fn cleanup_cache(&self, ttl_days: i64) -> Result<u64, String> {
+        let expired = if ttl_days <= 0 {
+            0
+        } else {
+            self.conn
+                .execute(
+                    "DELETE FROM cache WHERE created_at < datetime('now', ?1)",
+                    params![format!("-{ttl_days} days")],
+                )
+                .map_err(|e| e.to_string())? as u64
+        };
 
         let count: i64 = self
             .conn
@@ -598,7 +662,7 @@ impl Database {
 
         let mut evicted: u64 = 0;
         if count > 5000 {
-            let over = count - 5000;
+            let over = count - 4000;
             evicted = self
                 .conn
                 .execute(
@@ -608,6 +672,13 @@ impl Database {
                 .map_err(|e| e.to_string())? as u64;
         }
         Ok(expired + evicted)
+    }
+
+    pub fn clear_cache(&self) -> Result<u64, String> {
+        self.conn
+            .execute("DELETE FROM cache", [])
+            .map(|count| count as u64)
+            .map_err(|e| e.to_string())
     }
 
     pub fn get_stats(&self) -> Result<Value, String> {
@@ -625,11 +696,20 @@ impl Database {
             .conn
             .query_row("SELECT COUNT(*) FROM cache", [], |row| row.get(0))
             .map_err(|e| e.to_string())?;
+        let cache_size_bytes: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(response)), 0) FROM cache",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
 
         Ok(serde_json::json!({
             "wordCount": word_count,
             "tagCount": tag_count,
             "cacheCount": cache_count,
+            "cacheSizeBytes": cache_size_bytes,
         }))
     }
 }
@@ -639,15 +719,13 @@ pub fn backup_database(db_path: &str) -> Result<String, String> {
         .parent()
         .ok_or("Cannot determine database directory")?;
     let backups_dir = db_dir.join("backups");
-    std::fs::create_dir_all(&backups_dir)
-        .map_err(|e| format!("创建备份目录失败: {e}"))?;
+    std::fs::create_dir_all(&backups_dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
 
     let now = chrono::Local::now();
     let backup_name = format!("gege-backup-{}.db", now.format("%Y%m%d-%H%M%S"));
     let backup_path = backups_dir.join(&backup_name);
 
-    std::fs::copy(db_path, &backup_path)
-        .map_err(|e| format!("备份文件复制失败: {e}"))?;
+    std::fs::copy(db_path, &backup_path).map_err(|e| format!("备份文件复制失败: {e}"))?;
 
     Ok(backup_name)
 }
@@ -717,16 +795,14 @@ pub fn restore_backup(db_path: &str, backup_name: &str) -> Result<(), String> {
 
     backup_database(db_path)?;
 
-    std::fs::copy(&backup_path, db_path)
-        .map_err(|e| format!("恢复失败: {e}"))?;
+    std::fs::copy(&backup_path, db_path).map_err(|e| format!("恢复失败: {e}"))?;
 
     Ok(())
 }
 
 pub fn change_data_dir(old_path: &str, new_dir: &str) -> Result<String, String> {
     let new_dir_path = Path::new(new_dir);
-    std::fs::create_dir_all(new_dir_path)
-        .map_err(|e| format!("创建目标目录失败: {e}"))?;
+    std::fs::create_dir_all(new_dir_path).map_err(|e| format!("创建目标目录失败: {e}"))?;
 
     let new_db_path = new_dir_path.join(DB_FILENAME);
     if new_db_path.exists() {
@@ -748,15 +824,13 @@ pub fn change_data_dir(old_path: &str, new_dir: &str) -> Result<String, String> 
     let old_dir = Path::new(old_path).parent().ok_or("无法解析原目录")?;
     let old_backups = old_dir.join("backups");
 
-    std::fs::copy(old_path, &new_db_path)
-        .map_err(|e| format!("复制数据库失败: {e}"))?;
+    std::fs::copy(old_path, &new_db_path).map_err(|e| format!("复制数据库失败: {e}"))?;
 
     // Verify integrity of copied database
-    let verify_conn = Connection::open(&new_db_path)
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&new_db_path);
-            format!("验证新数据库失败: {e}")
-        })?;
+    let verify_conn = Connection::open(&new_db_path).map_err(|e| {
+        let _ = std::fs::remove_file(&new_db_path);
+        format!("验证新数据库失败: {e}")
+    })?;
     let integrity: String = verify_conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .map_err(|e| {
@@ -797,12 +871,16 @@ pub fn get_db_size(db_path: &str) -> u64 {
 pub fn export_words(words: &[Value], format: &str) -> Result<String, String> {
     match format {
         "csv" => {
-            let mut lines = vec!["lemma,translation,pos,context_meaning,source,tags,saved_at".to_string()];
+            let mut lines =
+                vec!["lemma,translation,pos,context_meaning,source,tags,saved_at".to_string()];
             for w in words {
                 let lemma = w.get("lemma").and_then(|v| v.as_str()).unwrap_or("");
                 let tr = w.get("translation").and_then(|v| v.as_str()).unwrap_or("");
                 let pos = w.get("pos").and_then(|v| v.as_str()).unwrap_or("");
-                let cm = w.get("contextMeaning").and_then(|v| v.as_str()).unwrap_or("");
+                let cm = w
+                    .get("contextMeaning")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let src = w.get("sourceApp").and_then(|v| v.as_str()).unwrap_or("");
                 let tags = w
                     .get("tags")
@@ -834,7 +912,10 @@ pub fn export_words(words: &[Value], format: &str) -> Result<String, String> {
                 let lemma = w.get("lemma").and_then(|v| v.as_str()).unwrap_or("");
                 let pos = w.get("pos").and_then(|v| v.as_str()).unwrap_or("");
                 let tr = w.get("translation").and_then(|v| v.as_str()).unwrap_or("");
-                let cm = w.get("contextMeaning").and_then(|v| v.as_str()).unwrap_or("");
+                let cm = w
+                    .get("contextMeaning")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let ctx = w.get("context").and_then(|v| v.as_str()).unwrap_or("");
                 md.push_str(&format!("## {} ({})\n\n", lemma, pos));
                 md.push_str(&format!("**翻译**: {}\n\n", tr));
@@ -861,7 +942,10 @@ pub fn export_words(words: &[Value], format: &str) -> Result<String, String> {
             for w in words {
                 let lemma = w.get("lemma").and_then(|v| v.as_str()).unwrap_or("");
                 let tr = w.get("translation").and_then(|v| v.as_str()).unwrap_or("");
-                let cm = w.get("contextMeaning").and_then(|v| v.as_str()).unwrap_or("");
+                let cm = w
+                    .get("contextMeaning")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let ipa = w.get("ipaUS").and_then(|v| v.as_str()).unwrap_or("");
                 let mut back = format!("{}<br>{}", tr, cm);
                 if let Some(examples) = w.get("examples").and_then(|v| v.as_array()) {
@@ -876,10 +960,83 @@ pub fn export_words(words: &[Value], format: &str) -> Result<String, String> {
                 } else {
                     format!("{} {}", lemma, ipa)
                 };
-                lines.push(format!("{}\t{}", front.replace('\t', " "), back.replace('\t', " ")));
+                lines.push(format!(
+                    "{}\t{}",
+                    front.replace('\t', " "),
+                    back.replace('\t', " ")
+                ));
             }
             Ok(lines.join("\n"))
         }
         _ => Err(format!("Unknown format: {format}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "gege-dictionary-test-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            if self
+                .0
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("gege-dictionary-test-"))
+            {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    #[test]
+    fn resolves_and_renames_legacy_database() {
+        let dir = TestDir::new("legacy");
+        std::fs::write(dir.0.join(LEGACY_DB_FILENAME), b"legacy").unwrap();
+        let resolved = resolve_db_path(&dir.0);
+        assert_eq!(resolved, dir.0.join(DB_FILENAME));
+        assert!(resolved.exists());
+        assert!(!dir.0.join(LEGACY_DB_FILENAME).exists());
+    }
+
+    #[test]
+    fn persists_custom_data_directory_pointer() {
+        let root = TestDir::new("pointer");
+        let default_dir = root.0.join("default");
+        let custom_dir = root.0.join("custom");
+        std::fs::create_dir_all(&custom_dir).unwrap();
+        persist_configured_data_dir(&default_dir, &custom_dir).unwrap();
+        assert_eq!(resolve_configured_data_dir(&default_dir), custom_dir);
+    }
+
+    #[test]
+    fn cache_ttl_and_clear_are_enforced() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        db.set_cache("old", "model", &serde_json::json!({"value": 1}))
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE cache SET created_at = datetime('now', '-31 days') WHERE cache_key = 'old'",
+                [],
+            )
+            .unwrap();
+        assert!(db.get_cache("old", 30).unwrap().is_none());
+        assert!(db.get_cache("old", 0).unwrap().is_some());
+        assert_eq!(db.clear_cache().unwrap(), 1);
     }
 }

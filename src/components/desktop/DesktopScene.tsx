@@ -120,7 +120,7 @@ export function DesktopScene() {
   const captureSelection = useCallback(() => {
     const selection = window.getSelection();
     const text = selection?.toString() ?? '';
-    if (!text.trim()) {
+    if (!text.trim() || !selection || selection.rangeCount === 0) {
       const scene = sceneRef.current?.getBoundingClientRect();
       setEmptyHint({
         x: Math.min(Math.max(mouse.current.x - (scene?.left ?? 0), 16), (scene?.width ?? 400) - 260),
@@ -128,7 +128,7 @@ export function DesktopScene() {
       });
       return;
     }
-    const range = selection!.getRangeAt(0);
+    const range = selection.getRangeAt(0);
     const rect = range.getBoundingClientRect();
     const host = (range.startContainer.parentElement as HTMLElement | null)?.closest(
       'p, h1, h2, figcaption, [data-selectable]'

@@ -38,7 +38,9 @@ export function Library() {
     let unlisten: (() => void) | null = null;
     import('../lib/tauri-bridge').then((b) =>
       b.listenWordSaved(() => refreshWords())
-    ).then((u) => { unlisten = u; }).catch(() => {});
+    ).then((u) => { unlisten = u; }).catch((error) => {
+      console.error('Failed to listen for saved words:', error);
+    });
 
     return () => {
       window.removeEventListener('focus', onFocus);

@@ -24,8 +24,95 @@ pub struct AppState {
     pub last_looked_up: Mutex<String>,
 }
 
+fn normalize_selection(selection: &str, kind: &str) -> String {
+    let collapsed = selection.split_whitespace().collect::<Vec<_>>().join(" ");
+    if kind == "word" {
+        collapsed.to_lowercase()
+    } else {
+        collapsed
+    }
+}
+
+fn cache_ttl_days(settings: &serde_json::Value) -> i64 {
+    settings
+        .get("cacheTtlDays")
+        .and_then(|v| v.as_i64())
+        .filter(|days| matches!(*days, 0 | 7 | 30 | 90))
+        .unwrap_or(30)
+}
+
+#[cfg(windows)]
+fn migrate_api_key_storage(database: &db::Database) -> Result<(), String> {
+    let mut settings = database.get_settings()?;
+    let Some(provider) = settings.get_mut("provider").and_then(|p| p.as_object_mut()) else {
+        return Ok(());
+    };
+    let key = provider
+        .get("apiKey")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if key.is_empty() {
+        return Ok(());
+    }
+
+    if dpapi::is_encrypted(&key) {
+        if let Err(e) = dpapi::decrypt(&key) {
+            provider.insert("apiKey".into(), serde_json::Value::String(String::new()));
+            settings.as_object_mut().map(|root| {
+                root.insert(
+                    "apiKeyError".into(),
+                    serde_json::Value::String(
+                        "API Key 无法在当前 Windows 用户下解密，请重新配置".into(),
+                    ),
+                )
+            });
+            database.save_settings(&settings)?;
+            eprintln!("[startup] DPAPI decrypt failed; encrypted key was cleared: {e}");
+        }
+        return Ok(());
+    }
+
+    let encrypted = match dpapi::encrypt(&key) {
+        Ok(encrypted) if dpapi::decrypt(&encrypted).ok().as_deref() == Some(key.as_str()) => {
+            encrypted
+        }
+        Ok(_) => {
+            provider.insert("apiKey".into(), serde_json::Value::String(String::new()));
+            settings.as_object_mut().map(|root| {
+                root.insert(
+                    "apiKeyError".into(),
+                    serde_json::Value::String("API Key 加密校验失败，请重新配置".into()),
+                )
+            });
+            database.save_settings(&settings)?;
+            return Err("API Key 自动加密校验失败，明文 Key 已清除".into());
+        }
+        Err(e) => {
+            provider.insert("apiKey".into(), serde_json::Value::String(String::new()));
+            settings.as_object_mut().map(|root| {
+                root.insert(
+                    "apiKeyError".into(),
+                    serde_json::Value::String("API Key 加密失败，请重新配置".into()),
+                )
+            });
+            database.save_settings(&settings)?;
+            return Err(format!("API Key 自动加密失败，明文 Key 已清除: {e}"));
+        }
+    };
+    provider.insert("apiKey".into(), serde_json::Value::String(encrypted));
+    if let Some(root) = settings.as_object_mut() {
+        root.remove("apiKeyError");
+    }
+    database.save_settings(&settings)?;
+    eprintln!("[startup] Migrated plaintext API Key to DPAPI storage");
+    Ok(())
+}
+
 #[tauri::command]
-async fn get_all_words(state: tauri::State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
+async fn get_all_words(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.get_all_words()
 }
@@ -39,7 +126,12 @@ async fn search_words(
     mastery: Option<String>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.search_words(&query, tag.as_deref(), source.as_deref(), mastery.as_deref())
+    db.search_words(
+        &query,
+        tag.as_deref(),
+        source.as_deref(),
+        mastery.as_deref(),
+    )
 }
 
 #[tauri::command]
@@ -62,10 +154,7 @@ async fn update_word(
 }
 
 #[tauri::command]
-async fn delete_words(
-    state: tauri::State<'_, AppState>,
-    ids: Vec<String>,
-) -> Result<(), String> {
+async fn delete_words(state: tauri::State<'_, AppState>, ids: Vec<String>) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.delete_words(&ids)
 }
@@ -84,13 +173,22 @@ async fn get_settings(state: tauri::State<'_, AppState>) -> Result<serde_json::V
     // Decrypt API key for the frontend
     #[cfg(windows)]
     if let Some(provider) = settings.get_mut("provider").and_then(|p| p.as_object_mut()) {
-        if let Some(key_val) = provider.get("apiKey").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+        if let Some(key_val) = provider
+            .get("apiKey")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+        {
             if dpapi::is_encrypted(&key_val) {
                 match dpapi::decrypt(&key_val) {
-                    Ok(plain) => { provider.insert("apiKey".to_string(), serde_json::Value::String(plain)); }
+                    Ok(plain) => {
+                        provider.insert("apiKey".to_string(), serde_json::Value::String(plain));
+                    }
                     Err(e) => {
                         eprintln!("[get_settings] DPAPI decrypt failed: {e}, clearing key");
-                        provider.insert("apiKey".to_string(), serde_json::Value::String(String::new()));
+                        provider.insert(
+                            "apiKey".to_string(),
+                            serde_json::Value::String(String::new()),
+                        );
                     }
                 }
             }
@@ -110,41 +208,43 @@ async fn save_settings(
     // Encrypt API key before storage
     #[cfg(windows)]
     if let Some(provider) = settings.get_mut("provider").and_then(|p| p.as_object_mut()) {
-        if let Some(key_val) = provider.get("apiKey").and_then(|v| v.as_str()).map(|s| s.to_string()) {
-            eprintln!("[save_settings] apiKey len={}, already_encrypted={}", key_val.len(), dpapi::is_encrypted(&key_val));
+        if let Some(key_val) = provider
+            .get("apiKey")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+        {
+            eprintln!(
+                "[save_settings] apiKey len={}, already_encrypted={}",
+                key_val.len(),
+                dpapi::is_encrypted(&key_val)
+            );
             if !key_val.is_empty() && !dpapi::is_encrypted(&key_val) {
                 match dpapi::encrypt(&key_val) {
                     Ok(encrypted) => {
                         eprintln!("[save_settings] encrypt OK, result_len={}", encrypted.len());
-                        // Verify round-trip
+                        // Verify round-trip before committing encrypted settings.
                         match dpapi::decrypt(&encrypted) {
                             Ok(decrypted) => {
                                 if decrypted == key_val {
                                     eprintln!("[save_settings] round-trip OK");
                                 } else {
-                                    eprintln!("[save_settings] WARNING: round-trip MISMATCH! Storing plaintext.");
-                                    provider.insert("apiKey".to_string(), serde_json::Value::String(key_val));
-                                    return {
-                                        let db = state.db.lock().map_err(|e| e.to_string())?;
-                                        db.save_settings(&settings)
-                                    };
+                                    return Err("API Key 加密校验失败，设置未保存".into());
                                 }
                             }
                             Err(e) => {
-                                eprintln!("[save_settings] WARNING: decrypt after encrypt FAILED: {e}. Storing plaintext.");
-                                provider.insert("apiKey".to_string(), serde_json::Value::String(key_val));
-                                return {
-                                    let db = state.db.lock().map_err(|e| e.to_string())?;
-                                    db.save_settings(&settings)
-                                };
+                                return Err(format!("API Key 加密校验失败，设置未保存: {e}"));
                             }
                         }
                         provider.insert("apiKey".to_string(), serde_json::Value::String(encrypted));
                     }
-                    Err(e) => eprintln!("[save_settings] DPAPI encrypt FAILED: {e}, storing plaintext"),
+                    Err(e) => return Err(format!("API Key 加密失败，设置未保存: {e}")),
                 }
             }
         }
+    }
+
+    if let Some(root) = settings.as_object_mut() {
+        root.remove("apiKeyError");
     }
 
     let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -152,7 +252,9 @@ async fn save_settings(
 }
 
 #[tauri::command]
-async fn get_templates(state: tauri::State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
+async fn get_templates(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.get_templates()
 }
@@ -173,10 +275,7 @@ async fn get_usage(state: tauri::State<'_, AppState>) -> Result<serde_json::Valu
 }
 
 #[tauri::command]
-async fn increment_usage(
-    state: tauri::State<'_, AppState>,
-    tokens: u32,
-) -> Result<(), String> {
+async fn increment_usage(state: tauri::State<'_, AppState>, tokens: u32) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.increment_usage(tokens)
 }
@@ -187,8 +286,20 @@ async fn lookup_word(
     selection: String,
     context: String,
     kind: String,
+    force_refresh: bool,
 ) -> Result<serde_json::Value, String> {
-    let (base_url, api_key, model, protocol, temperature, max_tokens, timeout_secs, template_body, template_name) = {
+    let (
+        base_url,
+        api_key,
+        model,
+        protocol,
+        temperature,
+        max_tokens,
+        timeout_secs,
+        template_body,
+        template_name,
+        cache_ttl,
+    ) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let settings = db.get_settings()?;
         let provider = settings
@@ -207,32 +318,69 @@ async fn lookup_word(
                 let s = t.get("scope").and_then(|v| v.as_str()).unwrap_or("");
                 s == scope
             })
-            .or_else(|| templates.iter().find(|t| {
-                let s = t.get("scope").and_then(|v| v.as_str()).unwrap_or("");
-                s == "all"
-            }))
+            .or_else(|| {
+                templates.iter().find(|t| {
+                    let s = t.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+                    s == "all"
+                })
+            })
             .or(templates.first());
-        let tpl_body = matched.map(|t| {
-            t.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string()
-        }).unwrap_or_default();
-        let tpl_name = matched.map(|t| {
-            t.get("name").and_then(|v| v.as_str()).unwrap_or("未知模板").to_string()
-        }).unwrap_or_else(|| "无匹配模板".to_string());
-        let tpl_scope = matched.map(|t| {
-            t.get("scope").and_then(|v| v.as_str()).unwrap_or("").to_string()
-        }).unwrap_or_default();
+        let tpl_body = matched
+            .map(|t| {
+                t.get("body")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        let tpl_name = matched
+            .map(|t| {
+                t.get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("未知模板")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "无匹配模板".to_string());
+        let tpl_scope = matched
+            .map(|t| {
+                t.get("scope")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .unwrap_or_default();
 
-        let mut mt = provider.get("maxTokens").and_then(|v| v.as_u64()).unwrap_or(1200) as u32;
-        let mut ts = provider.get("timeoutSeconds")
+        let base_url_value = provider
+            .get("baseUrl")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut mt = provider
+            .get("maxTokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1200) as u32;
+        let mut ts = provider
+            .get("timeoutSeconds")
             .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
             .unwrap_or(60);
         if kind == "paragraph" {
             mt = mt.max(4000);
             ts = ts.max(120);
         }
+        if base_url_value.to_ascii_lowercase().contains("deepseek.com") {
+            mt = mt.max(3000);
+        }
 
-        let raw_key = provider.get("apiKey").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        eprintln!("[lookup_word] raw_key starts_with dpapi={}, len={}", raw_key.starts_with("dpapi:"), raw_key.len());
+        let raw_key = provider
+            .get("apiKey")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        eprintln!(
+            "[lookup_word] raw_key starts_with dpapi={}, len={}",
+            raw_key.starts_with("dpapi:"),
+            raw_key.len()
+        );
         #[cfg(windows)]
         let api_key_decrypted = match dpapi::decrypt(&raw_key) {
             Ok(k) => k,
@@ -245,15 +393,27 @@ async fn lookup_word(
         let api_key_decrypted = raw_key;
 
         (
-            provider.get("baseUrl").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            base_url_value,
             api_key_decrypted,
-            provider.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            provider.get("protocol").and_then(|v| v.as_str()).unwrap_or("openai").to_string(),
-            provider.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.3),
+            provider
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            provider
+                .get("protocol")
+                .and_then(|v| v.as_str())
+                .unwrap_or("openai")
+                .to_string(),
+            provider
+                .get("temperature")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.3),
             mt,
             ts,
             tpl_body,
             format!("{} [{}]", tpl_name, tpl_scope),
+            cache_ttl_days(&settings),
         )
     };
 
@@ -262,12 +422,15 @@ async fn lookup_word(
     }
     eprintln!("[lookup_word] selection={selection:?}, kind={kind:?}, model={model:?}, protocol={protocol:?}, timeout={timeout_secs}s, tpl_len={}", template_body.len());
 
-    let normalized = selection.trim().to_lowercase();
+    let normalized = normalize_selection(&selection, &kind);
     let tpl_hash = {
         let mut h = Sha256::new();
         h.update(template_body.as_bytes());
         let bytes = h.finalize();
-        format!("{:02x}{:02x}{:02x}{:02x}", bytes[0], bytes[1], bytes[2], bytes[3])
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}",
+            bytes[0], bytes[1], bytes[2], bytes[3]
+        )
     };
     let cache_key = {
         let raw = format!("{}|{}|{}|{}", normalized, kind, model, tpl_hash);
@@ -275,9 +438,9 @@ async fn lookup_word(
         h.update(raw.as_bytes());
         format!("{:x}", h.finalize())
     };
-    {
+    if !force_refresh {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        if let Some(mut cached) = db.get_cache(&cache_key)? {
+        if let Some(mut cached) = db.get_cache(&cache_key, cache_ttl)? {
             eprintln!("[lookup_word] cache HIT");
             if let Some(obj) = cached.as_object_mut() {
                 obj.insert("fromCache".to_string(), serde_json::Value::Bool(true));
@@ -288,10 +451,20 @@ async fn lookup_word(
     eprintln!("[lookup_word] cache miss, calling LLM...");
 
     let full_text = llm::stream_lookup(
-        &base_url, &api_key, &model, &protocol,
-        temperature, max_tokens, timeout_secs,
-        &selection, &context, &kind, &template_body,
-    ).await.map_err(|e| {
+        &base_url,
+        &api_key,
+        &model,
+        &protocol,
+        temperature,
+        max_tokens,
+        timeout_secs,
+        &selection,
+        &context,
+        &kind,
+        &template_body,
+    )
+    .await
+    .map_err(|e| {
         eprintln!("[lookup_word] LLM ERROR: {e}");
         e
     })?;
@@ -304,7 +477,10 @@ async fn lookup_word(
     })?;
 
     if let Some(obj) = entry.as_object_mut() {
-        obj.insert("_templateName".to_string(), serde_json::Value::String(template_name.clone()));
+        obj.insert(
+            "_templateName".to_string(),
+            serde_json::Value::String(template_name.clone()),
+        );
     }
 
     let db_path = {
@@ -327,8 +503,20 @@ async fn lookup_word_stream(
     context: String,
     kind: String,
     request_id: String,
+    force_refresh: bool,
 ) -> Result<(), String> {
-    let (base_url, api_key, model, protocol, temperature, max_tokens, timeout_secs, template_body, template_name) = {
+    let (
+        base_url,
+        api_key,
+        model,
+        protocol,
+        temperature,
+        max_tokens,
+        timeout_secs,
+        template_body,
+        template_name,
+        cache_ttl,
+    ) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let settings = db.get_settings()?;
         let provider = settings
@@ -344,18 +532,68 @@ async fn lookup_word_stream(
         let matched = templates
             .iter()
             .find(|t| t.get("scope").and_then(|v| v.as_str()).unwrap_or("") == scope)
-            .or_else(|| templates.iter().find(|t| t.get("scope").and_then(|v| v.as_str()).unwrap_or("") == "all"))
+            .or_else(|| {
+                templates
+                    .iter()
+                    .find(|t| t.get("scope").and_then(|v| v.as_str()).unwrap_or("") == "all")
+            })
             .or(templates.first());
-        let tpl_body = matched.map(|t| t.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string()).unwrap_or_default();
-        let tpl_name = matched.map(|t| t.get("name").and_then(|v| v.as_str()).unwrap_or("未知模板").to_string()).unwrap_or_else(|| "无匹配模板".to_string());
-        let tpl_scope = matched.map(|t| t.get("scope").and_then(|v| v.as_str()).unwrap_or("").to_string()).unwrap_or_default();
+        let tpl_body = matched
+            .map(|t| {
+                t.get("body")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        let tpl_name = matched
+            .map(|t| {
+                t.get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("未知模板")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "无匹配模板".to_string());
+        let tpl_scope = matched
+            .map(|t| {
+                t.get("scope")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .unwrap_or_default();
 
-        let mut mt = provider.get("maxTokens").and_then(|v| v.as_u64()).unwrap_or(1200) as u32;
-        let mut ts = provider.get("timeoutSeconds").and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64))).unwrap_or(60);
-        if kind == "paragraph" { mt = mt.max(4000); ts = ts.max(120); }
+        let base_url_value = provider
+            .get("baseUrl")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut mt = provider
+            .get("maxTokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1200) as u32;
+        let mut ts = provider
+            .get("timeoutSeconds")
+            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
+            .unwrap_or(60);
+        if kind == "paragraph" {
+            mt = mt.max(4000);
+            ts = ts.max(120);
+        }
+        if base_url_value.to_ascii_lowercase().contains("deepseek.com") {
+            mt = mt.max(3000);
+        }
 
-        let raw_key = provider.get("apiKey").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        eprintln!("[lookup_stream] raw_key starts_with dpapi={}, len={}", raw_key.starts_with("dpapi:"), raw_key.len());
+        let raw_key = provider
+            .get("apiKey")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        eprintln!(
+            "[lookup_stream] raw_key starts_with dpapi={}, len={}",
+            raw_key.starts_with("dpapi:"),
+            raw_key.len()
+        );
         #[cfg(windows)]
         let api_key_decrypted = match dpapi::decrypt(&raw_key) {
             Ok(k) => k,
@@ -368,13 +606,27 @@ async fn lookup_word_stream(
         let api_key_decrypted = raw_key;
 
         (
-            provider.get("baseUrl").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            base_url_value,
             api_key_decrypted,
-            provider.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            provider.get("protocol").and_then(|v| v.as_str()).unwrap_or("openai").to_string(),
-            provider.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.3),
-            mt, ts, tpl_body,
+            provider
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            provider
+                .get("protocol")
+                .and_then(|v| v.as_str())
+                .unwrap_or("openai")
+                .to_string(),
+            provider
+                .get("temperature")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.3),
+            mt,
+            ts,
+            tpl_body,
             format!("{} [{}]", tpl_name, tpl_scope),
+            cache_ttl_days(&settings),
         )
     };
 
@@ -383,12 +635,15 @@ async fn lookup_word_stream(
     }
 
     // Check cache
-    let normalized = selection.trim().to_lowercase();
+    let normalized = normalize_selection(&selection, &kind);
     let tpl_hash = {
         let mut h = Sha256::new();
         h.update(template_body.as_bytes());
         let bytes = h.finalize();
-        format!("{:02x}{:02x}{:02x}{:02x}", bytes[0], bytes[1], bytes[2], bytes[3])
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}",
+            bytes[0], bytes[1], bytes[2], bytes[3]
+        )
     };
     let cache_key = {
         let raw = format!("{}|{}|{}|{}", normalized, kind, model, tpl_hash);
@@ -396,74 +651,116 @@ async fn lookup_word_stream(
         h.update(raw.as_bytes());
         format!("{:x}", h.finalize())
     };
-    {
+    if !force_refresh {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        if let Some(mut cached) = db.get_cache(&cache_key)? {
+        if let Some(mut cached) = db.get_cache(&cache_key, cache_ttl)? {
             if let Some(obj) = cached.as_object_mut() {
                 obj.insert("fromCache".to_string(), serde_json::Value::Bool(true));
-                obj.insert("_templateName".to_string(), serde_json::Value::String(template_name.clone()));
+                obj.insert(
+                    "_templateName".to_string(),
+                    serde_json::Value::String(template_name.clone()),
+                );
             }
-            let _ = app.emit("lookup://done", serde_json::json!({
-                "requestId": request_id,
-                "entry": cached,
-            }));
+            let _ = app.emit(
+                "lookup://done",
+                serde_json::json!({
+                    "requestId": request_id,
+                    "entry": cached,
+                    "fromCache": true,
+                }),
+            );
             return Ok(());
         }
     }
 
-    eprintln!("[lookup_stream] starting SSE, key_len={}, url={base_url}", api_key.len());
+    eprintln!(
+        "[lookup_stream] starting SSE, key_len={}, url={base_url}",
+        api_key.len()
+    );
 
     let rid = request_id.clone();
     let app_clone = app.clone();
+    let mut extractor = llm::IncrementalJsonExtractor::new();
 
     let result = llm::stream_lookup_sse(
-        &base_url, &api_key, &model, &protocol,
-        temperature, max_tokens, timeout_secs,
-        &selection, &context, &kind, &template_body,
+        &base_url,
+        &api_key,
+        &model,
+        &protocol,
+        temperature,
+        max_tokens,
+        timeout_secs,
+        &selection,
+        &context,
+        &kind,
+        &template_body,
         |delta| {
-            let _ = app_clone.emit("lookup://delta", serde_json::json!({
-                "requestId": rid,
-                "delta": delta,
-            }));
+            for (field, value) in extractor.push(delta) {
+                let _ = app_clone.emit(
+                    "lookup://delta",
+                    serde_json::json!({
+                        "requestId": rid,
+                        "field": field,
+                        "value": value,
+                    }),
+                );
+            }
         },
-    ).await;
+    )
+    .await;
 
     match result {
-        Ok(full_text) => {
-            match llm::parse_entry(&full_text, &selection, &kind) {
-                Ok(mut entry) => {
-                    if let Some(obj) = entry.as_object_mut() {
-                        obj.insert("_templateName".to_string(), serde_json::Value::String(template_name));
-                    }
-                    let db_path = {
-                        let db = state.db.lock().map_err(|e| e.to_string())?;
-                        db.path().to_string()
-                    };
-                    if let Ok(db) = db::Database::open(&db_path) {
-                        let _ = db.set_cache(&cache_key, &model, &entry);
-                    }
-                    let _ = app.emit("lookup://done", serde_json::json!({
+        Ok(full_text) => match llm::parse_entry(&full_text, &selection, &kind) {
+            Ok(mut entry) => {
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert(
+                        "_templateName".to_string(),
+                        serde_json::Value::String(template_name),
+                    );
+                }
+                let db_path = {
+                    let db = state.db.lock().map_err(|e| e.to_string())?;
+                    db.path().to_string()
+                };
+                if let Ok(db) = db::Database::open(&db_path) {
+                    let _ = db.set_cache(&cache_key, &model, &entry);
+                }
+                let _ = app.emit(
+                    "lookup://done",
+                    serde_json::json!({
                         "requestId": request_id,
                         "entry": entry,
-                    }));
-                    Ok(())
-                }
-                Err(e) => {
-                    let err_msg = format!("JSON 解析失败: {e}");
-                    let _ = app.emit("lookup://error", serde_json::json!({
-                        "requestId": request_id,
-                        "error": err_msg,
-                    }));
-                    Err(err_msg)
-                }
+                        "raw": full_text,
+                        "fromCache": false,
+                    }),
+                );
+                Ok(())
             }
-        }
+            Err(e) => {
+                let err_msg = format!("JSON 解析失败: {e}");
+                let _ = app.emit(
+                    "lookup://error",
+                    serde_json::json!({
+                        "requestId": request_id,
+                        "stage": "parse",
+                        "message": err_msg,
+                        "retryable": true,
+                    }),
+                );
+                Err(err_msg)
+            }
+        },
         Err(e) => {
             eprintln!("[lookup_stream] SSE failed: {e}");
-            let _ = app.emit("lookup://error", serde_json::json!({
-                "requestId": request_id,
-                "error": e,
-            }));
+            let _ = app.emit(
+                "lookup://error",
+                serde_json::json!({
+                    "requestId": request_id,
+                    "stage": "stream",
+                    "message": e,
+                    "retryable": true,
+                }),
+            );
             Err(e)
         }
     }
@@ -521,6 +818,12 @@ async fn get_db_stats(state: tauri::State<'_, AppState>) -> Result<serde_json::V
 }
 
 #[tauri::command]
+async fn clear_cache(state: tauri::State<'_, AppState>) -> Result<u64, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.clear_cache()
+}
+
+#[tauri::command]
 async fn backup_database(state: tauri::State<'_, AppState>) -> Result<String, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let db_path = db.path().to_string();
@@ -567,11 +870,34 @@ async fn change_data_dir(
     };
     match db::change_data_dir(&old_path, &new_dir) {
         Ok(new_db_path) => {
-            let new_db = db::Database::open(&new_db_path)
-                .map_err(|e| format!("打开新数据库失败: {e}"))?;
-            let mut db = state.db.lock().map_err(|e| e.to_string())?;
-            *db = new_db;
-            Ok(new_db_path)
+            let activate = (|| -> Result<db::Database, String> {
+                let new_db = db::Database::open(&new_db_path)
+                    .map_err(|e| format!("打开新数据库失败: {e}"))?;
+                let mut settings = new_db.get_settings()?;
+                if let Some(root) = settings.as_object_mut() {
+                    root.insert("dataDir".into(), serde_json::Value::String(new_dir.clone()));
+                }
+                new_db.save_settings(&settings)?;
+                let default_dir = dirs::data_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join("GegeDic");
+                db::persist_configured_data_dir(&default_dir, std::path::Path::new(&new_dir))?;
+                Ok(new_db)
+            })();
+            match activate {
+                Ok(new_db) => {
+                    let mut db = state.db.lock().map_err(|e| e.to_string())?;
+                    *db = new_db;
+                    Ok(new_db_path)
+                }
+                Err(e) => {
+                    let fallback = db::Database::open(&old_path)
+                        .map_err(|e2| format!("迁移启用失败且无法恢复原数据库: {e} / {e2}"))?;
+                    let mut db = state.db.lock().map_err(|e| e.to_string())?;
+                    *db = fallback;
+                    Err(e)
+                }
+            }
         }
         Err(e) => {
             let fallback = db::Database::open(&old_path)
@@ -613,8 +939,7 @@ async fn get_last_capture(state: tauri::State<'_, AppState>) -> Result<serde_jso
 
 #[tauri::command]
 async fn pick_folder(title: Option<String>) -> Result<Option<String>, String> {
-    let dialog = rfd::AsyncFileDialog::new()
-        .set_title(title.as_deref().unwrap_or("选择数据目录"));
+    let dialog = rfd::AsyncFileDialog::new().set_title(title.as_deref().unwrap_or("选择数据目录"));
     let result = dialog.pick_folder().await;
     Ok(result.map(|f| f.path().to_string_lossy().to_string()))
 }
@@ -637,8 +962,7 @@ async fn save_file_dialog(
     match result {
         Some(handle) => {
             let path = handle.path().to_string_lossy().to_string();
-            std::fs::write(&path, content.as_bytes())
-                .map_err(|e| format!("写入文件失败: {e}"))?;
+            std::fs::write(&path, content.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))?;
             Ok(Some(path))
         }
         None => Ok(None),
@@ -658,10 +982,21 @@ async fn get_clipboard_watch_status(state: tauri::State<'_, AppState>) -> Result
     Ok(state.clipboard_enabled.load(Ordering::Relaxed))
 }
 
-fn setup_tray(app: &tauri::App, clipboard_enabled: Arc<AtomicBool>) -> Result<(), Box<dyn std::error::Error>> {
-    let watch_item = CheckMenuItem::with_id(app, "watch", "划词即查", true, true, None::<&str>)?;
+fn setup_tray(
+    app: &tauri::App,
+    clipboard_enabled: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let watch_item = CheckMenuItem::with_id(
+        app,
+        "watch",
+        "划词即查",
+        true,
+        clipboard_enabled.load(Ordering::Relaxed),
+        None::<&str>,
+    )?;
     let pause30_item = MenuItem::with_id(app, "pause30", "暂停 30 分钟", true, None::<&str>)?;
-    let lookup_item = MenuItem::with_id(app, "lookup_clip", "查词（读取剪贴板）", true, None::<&str>)?;
+    let lookup_item =
+        MenuItem::with_id(app, "lookup_clip", "查词（读取剪贴板）", true, None::<&str>)?;
     let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "退出鸽鸽词典", true, None::<&str>)?;
     let menu = Menu::new(app)?;
@@ -688,6 +1023,15 @@ fn setup_tray(app: &tauri::App, clipboard_enabled: Arc<AtomicBool>) -> Result<()
                     let check = item.as_check_menuitem_unchecked();
                     let _ = check.set_checked(next);
                 }
+                let state = app.state::<AppState>();
+                if let Ok(db) = state.db.lock() {
+                    if let Ok(mut settings) = db.get_settings() {
+                        if let Some(root) = settings.as_object_mut() {
+                            root.insert("clipboardWatch".into(), serde_json::Value::Bool(next));
+                        }
+                        let _ = db.save_settings(&settings);
+                    }
+                };
             }
             "pause30" => {
                 cb_flag.store(false, Ordering::Relaxed);
@@ -696,9 +1040,14 @@ fn setup_tray(app: &tauri::App, clipboard_enabled: Arc<AtomicBool>) -> Result<()
                     let _ = check.set_checked(false);
                 }
                 let flag = cb_flag.clone();
+                let app_handle = app.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_secs(30 * 60));
                     flag.store(true, Ordering::Relaxed);
+                    if let Some(item) = app_handle.menu().and_then(|m| m.get("watch")) {
+                        let check = item.as_check_menuitem_unchecked();
+                        let _ = check.set_checked(true);
+                    }
                 });
             }
             "lookup_clip" => {
@@ -737,24 +1086,41 @@ fn setup_tray(app: &tauri::App, clipboard_enabled: Arc<AtomicBool>) -> Result<()
 }
 
 pub fn run() {
-    let data_dir = dirs::data_dir()
+    let default_data_dir = dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("GegeDic");
 
-    std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
+    std::fs::create_dir_all(&default_data_dir).expect("Failed to create data directory");
+    let data_dir = db::resolve_configured_data_dir(&default_data_dir);
+    std::fs::create_dir_all(&data_dir).expect("Failed to create configured data directory");
 
     let db_path = db::resolve_db_path(&data_dir);
-    let database = db::Database::open(db_path.to_str().unwrap())
-        .expect("Failed to open database");
-    database.initialize().expect("Failed to initialize database");
+    let database = db::Database::open(db_path.to_str().unwrap()).expect("Failed to open database");
+    database
+        .initialize()
+        .expect("Failed to initialize database");
 
-    match database.cleanup_cache() {
+    #[cfg(windows)]
+    if let Err(e) = migrate_api_key_storage(&database) {
+        eprintln!("[startup] API Key storage migration failed: {e}");
+    }
+
+    let ttl_days = database
+        .get_settings()
+        .map(|settings| cache_ttl_days(&settings))
+        .unwrap_or(30);
+    match database.cleanup_cache(ttl_days) {
         Ok(n) if n > 0 => eprintln!("[startup] Cleaned {n} expired/excess cache entries"),
         Err(e) => eprintln!("[startup] Cache cleanup error: {e}"),
         _ => {}
     }
 
-    let clipboard_enabled = Arc::new(AtomicBool::new(true));
+    let clipboard_watch_enabled = database
+        .get_settings()
+        .ok()
+        .and_then(|settings| settings.get("clipboardWatch").and_then(|v| v.as_bool()))
+        .unwrap_or(true);
+    let clipboard_enabled = Arc::new(AtomicBool::new(clipboard_watch_enabled));
 
     tauri::Builder::default()
         .manage(AppState {
@@ -783,6 +1149,7 @@ pub fn run() {
             list_voices,
             export_words_data,
             get_db_stats,
+            clear_cache,
             backup_database,
             list_backups,
             restore_backup,
@@ -810,4 +1177,46 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("Error while running GegeDic");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_normalization_preserves_sentence_case() {
+        assert_eq!(normalize_selection("  Hello\n  World  ", "word"), "hello world");
+        assert_eq!(normalize_selection("  Hello\n  World  ", "sentence"), "Hello World");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn plaintext_api_key_is_migrated_to_dpapi() {
+        let database = db::Database::open_memory().unwrap();
+        database.initialize().unwrap();
+        let mut settings = database.get_settings().unwrap();
+        settings["provider"]["apiKey"] = serde_json::Value::String("sk-test-migration".into());
+        database.save_settings(&settings).unwrap();
+
+        migrate_api_key_storage(&database).unwrap();
+        let stored = database.get_settings().unwrap();
+        let encrypted = stored["provider"]["apiKey"].as_str().unwrap();
+        assert!(dpapi::is_encrypted(encrypted));
+        assert_eq!(dpapi::decrypt(encrypted).unwrap(), "sk-test-migration");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invalid_dpapi_key_is_cleared_without_crashing() {
+        let database = db::Database::open_memory().unwrap();
+        database.initialize().unwrap();
+        let mut settings = database.get_settings().unwrap();
+        settings["provider"]["apiKey"] = serde_json::Value::String("dpapi:v1:not-base64!".into());
+        database.save_settings(&settings).unwrap();
+
+        migrate_api_key_storage(&database).unwrap();
+        let stored = database.get_settings().unwrap();
+        assert_eq!(stored["provider"]["apiKey"], "");
+        assert!(stored["apiKeyError"].as_str().is_some());
+    }
 }

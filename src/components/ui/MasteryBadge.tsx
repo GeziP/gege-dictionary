@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components */
 import React from 'react';
 import { CheckCircle2Icon, CircleDashedIcon, CircleDotIcon } from 'lucide-react';
 import { classNames } from '../../utils/format';

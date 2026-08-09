@@ -38,7 +38,9 @@ async function minimizeWindow() {
       const mod = await import('@tauri-apps/api/webviewWindow');
       const win = mod.getCurrentWebviewWindow();
       await win.hide();
-    } catch {}
+    } catch (error) {
+      console.error('Failed to minimize window:', error);
+    }
   }
 }
 
@@ -48,7 +50,9 @@ async function closeWindow() {
       const mod = await import('@tauri-apps/api/webviewWindow');
       const win = mod.getCurrentWebviewWindow();
       await win.hide();
-    } catch {}
+    } catch (error) {
+      console.error('Failed to close window:', error);
+    }
   }
 }
 

@@ -106,9 +106,11 @@ export interface PromptTemplate {
 export interface AppSettings {
   provider: ProviderConfig;
   clipboardWatch: boolean;
-  clipboardMode?: 'smart' | 'full' | 'manual';
+  clipboardMode?: 'smart' | 'full' | 'double';
   clipboardBlacklist?: string[];
   streamingEnabled?: boolean;
+  cacheTtlDays?: 0 | 7 | 30 | 90;
+  apiKeyError?: string;
   theme: 'light' | 'dark' | 'system';
   cardScale: 'compact' | 'default' | 'large';
   captureContext: boolean;

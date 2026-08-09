@@ -4,6 +4,7 @@ import type {
   PromptTemplate,
   SavedWord,
 } from '../types/lexnote';
+import { emit as tauriEmit, listen as tauriListen } from '@tauri-apps/api/event';
 
 const IS_TAURI = '__TAURI_INTERNALS__' in window;
 
@@ -16,18 +17,13 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 }
 
 async function listen(event: string, handler: (payload: unknown) => void): Promise<() => void> {
-  if (!IS_TAURI) return () => {};
-  // @ts-expect-error Tauri injects this at runtime
-  const unlisten = await window.__TAURI_INTERNALS__.event.listen(event, (e: { payload: unknown }) => {
-    handler(e.payload);
-  });
-  return unlisten;
+  if (!IS_TAURI) return () => undefined;
+  return tauriListen(event, (eventData) => handler(eventData.payload));
 }
 
 async function emit(event: string, payload?: unknown): Promise<void> {
   if (!IS_TAURI) return;
-  // @ts-expect-error Tauri injects this at runtime
-  await window.__TAURI_INTERNALS__.event.emit(event, payload);
+  await tauriEmit(event, payload);
 }
 
 export function isTauri(): boolean {
@@ -90,33 +86,40 @@ export async function incrementUsage(tokens: number): Promise<void> {
 export async function lookupWord(
   selection: string,
   context: string,
-  kind: string
+  kind: string,
+  forceRefresh = false,
 ): Promise<Entry> {
-  return invoke<Entry>('lookup_word', { selection, context, kind });
+  return invoke<Entry>('lookup_word', { selection, context, kind, forceRefresh });
 }
 
 export async function lookupWordStream(
   selection: string,
   context: string,
   kind: string,
-  requestId: string
+  requestId: string,
+  forceRefresh = false,
 ): Promise<void> {
-  return invoke('lookup_word_stream', { selection, context, kind, requestId });
+  return invoke('lookup_word_stream', { selection, context, kind, requestId, forceRefresh });
 }
 
 export interface LookupDeltaEvent {
   requestId: string;
-  delta: string;
+  field: string;
+  value: unknown;
 }
 
 export interface LookupDoneEvent {
   requestId: string;
   entry: Entry;
+  raw?: string;
+  fromCache: boolean;
 }
 
 export interface LookupErrorEvent {
   requestId: string;
-  error: string;
+  stage: 'stream' | 'parse';
+  message: string;
+  retryable: boolean;
 }
 
 export async function listenLookupDelta(handler: (e: LookupDeltaEvent) => void): Promise<() => void> {
@@ -175,8 +178,13 @@ export async function getDbStats(): Promise<{
   wordCount: number;
   tagCount: number;
   cacheCount: number;
+  cacheSizeBytes: number;
 }> {
   return invoke('get_db_stats');
+}
+
+export async function clearCache(): Promise<number> {
+  return invoke<number>('clear_cache');
 }
 
 export async function backupDatabase(): Promise<string> {
@@ -289,7 +297,7 @@ export async function closeLookupWindow(): Promise<void> {
   try {
     const mod = await import('@tauri-apps/api/webviewWindow');
     const win = await mod.WebviewWindow.getByLabel('lookup');
-    if (win) await win.close();
+    if (win) await win.hide();
   } catch (e) {
     console.error('Failed to close lookup window:', e);
   }

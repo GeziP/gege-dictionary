@@ -6,12 +6,11 @@ import { SegmentedControl } from '../ui/SegmentedControl';
 import { TextInput } from '../ui/TextInput';
 import { SettingsSection } from './SettingsSection';
 import * as bridge from '../../lib/tauri-bridge';
-import { classNames } from '../../utils/format';
 
 const CLIPBOARD_MODES = [
   { value: 'smart' as const, label: '智能', icon: <ShieldIcon size={12} /> },
   { value: 'full' as const, label: '全量' },
-  { value: 'manual' as const, label: '手动' },
+  { value: 'double' as const, label: '双击 Ctrl+C' },
 ];
 
 export function CaptureSection() {
@@ -22,17 +21,20 @@ export function CaptureSection() {
   );
 
   useEffect(() => {
-    bridge.getClipboardWatchStatus().then(setWatchEnabled).catch(() => {});
+    bridge.getClipboardWatchStatus().then(setWatchEnabled).catch((error) => {
+      console.error('Failed to read clipboard watch status:', error);
+    });
   }, []);
 
   const handleToggle = useCallback(async () => {
     try {
       const next = await bridge.toggleClipboardWatch();
       setWatchEnabled(next);
+      updateSettings({ clipboardWatch: next });
     } catch (e) {
       console.error('Failed to toggle clipboard watch:', e);
     }
-  }, []);
+  }, [updateSettings]);
 
   const handleBlacklistBlur = () => {
     const entries = blacklistInput
@@ -59,13 +61,13 @@ export function CaptureSection() {
           <SegmentedControl
             label="剪贴板触发模式"
             options={CLIPBOARD_MODES}
-            value={(settings.clipboardMode as 'smart' | 'full' | 'manual') || 'smart'}
+            value={(settings.clipboardMode as 'smart' | 'full' | 'double') || 'smart'}
             onChange={(mode) => updateSettings({ clipboardMode: mode })}
           />
           <p className="mt-1.5 text-[10px] text-ink-subtle">
             {(settings.clipboardMode || 'smart') === 'smart' && '智能模式：自动过滤密钥、代码、路径等非英文学习内容'}
             {settings.clipboardMode === 'full' && '全量模式：任何英文文本都会触发查词（慎用）'}
-            {settings.clipboardMode === 'manual' && '手动模式：仅通过托盘菜单或快捷键触发查词'}
+            {settings.clipboardMode === 'double' && '双击模式：700ms 内连续按两次 Ctrl+C 才触发'}
           </p>
         </div>
 

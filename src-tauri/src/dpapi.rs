@@ -1,9 +1,8 @@
-use windows::Win32::Security::Cryptography::{
-    CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB,
-    CRYPTPROTECT_UI_FORBIDDEN,
-};
-use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::core::PCWSTR;
+use windows::Win32::Foundation::{LocalFree, HLOCAL};
+use windows::Win32::Security::Cryptography::{
+    CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+};
 
 const PREFIX: &str = "dpapi:v1:";
 
@@ -46,8 +45,7 @@ pub fn encrypt(plaintext: &str) -> Result<String, String> {
             return Err("DPAPI CryptProtectData failed".to_string());
         }
 
-        let encrypted_slice =
-            std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize);
+        let encrypted_slice = std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize);
         let encoded = base64_encode(encrypted_slice);
 
         let _ = LocalFree(HLOCAL(data_out.pbData as *mut _));
@@ -65,8 +63,8 @@ pub fn decrypt(ciphertext: &str) -> Result<String, String> {
     }
 
     let encoded = &ciphertext[PREFIX.len()..];
-    let encrypted_bytes = base64_decode(encoded)
-        .map_err(|e| format!("Base64 decode failed: {e}"))?;
+    let encrypted_bytes =
+        base64_decode(encoded).map_err(|e| format!("Base64 decode failed: {e}"))?;
 
     let mut data_in = CRYPT_INTEGER_BLOB {
         cbData: encrypted_bytes.len() as u32,
@@ -92,8 +90,7 @@ pub fn decrypt(ciphertext: &str) -> Result<String, String> {
             return Err("DPAPI CryptUnprotectData failed — key may have been encrypted on a different user/machine".to_string());
         }
 
-        let decrypted_slice =
-            std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize);
+        let decrypted_slice = std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize);
         let plaintext = String::from_utf8(decrypted_slice.to_vec())
             .map_err(|e| format!("UTF-8 decode failed: {e}"))?;
 
@@ -188,7 +185,10 @@ mod tests {
     fn test_round_trip() {
         let key = "sk-test1234567890abcdef";
         let encrypted = encrypt(key).unwrap();
-        assert!(is_encrypted(&encrypted), "encrypted should have dpapi prefix");
+        assert!(
+            is_encrypted(&encrypted),
+            "encrypted should have dpapi prefix"
+        );
         assert_ne!(encrypted, key);
         let decrypted = decrypt(&encrypted).unwrap();
         assert_eq!(decrypted, key, "round-trip must preserve value");

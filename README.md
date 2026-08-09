@@ -113,7 +113,7 @@ npx tauri build
 | 提供商 | 协议 | 推荐模型 | 备注 |
 |--------|------|----------|------|
 | [智谱 GLM](https://open.bigmodel.cn) | Anthropic 兼容 | GLM-5.2 | 国内直连，免费额度 |
-| [DeepSeek](https://platform.deepseek.com) | OpenAI 兼容 | deepseek-chat | 中文好，价格低 |
+| [DeepSeek](https://platform.deepseek.com) | OpenAI 兼容 | deepseek-v4-flash | 中文好，响应快 |
 | [OpenAI](https://platform.openai.com) | OpenAI | gpt-4o-mini | 结构化输出好 |
 | [Kimi](https://platform.moonshot.cn) | OpenAI 兼容 | moonshot-v1-8k | 国内直连 |
 | [Anthropic](https://console.anthropic.com) | Anthropic | claude-sonnet-4 | 高质量 |
@@ -170,7 +170,7 @@ gege-dictionary/
 - 只有「选中的文本 + 上下文 + Prompt」会发送到你自己配置的 LLM 服务
 - 所有数据（生词库、设置、使用记录）保存在本机 `%APPDATA%/GegeDic/` 目录下
 
-> v1.1 起将增加：敏感内容自动过滤（复制密码、密钥、代码、文件路径时不触发查词）、应用黑名单、API Key 通过 Windows DPAPI 加密存储。详见 [v1.1 开发规格](docs/PRD-v1.1-spec.md)。
+> v1.1 已增加敏感内容自动过滤（复制密码、密钥、代码、文件路径时不触发查词）、应用黑名单，并使用 Windows DPAPI 加密存储 API Key。被过滤的内容不会写入缓存或发送给模型。详见 [v1.1 开发规格](docs/PRD-v1.1-spec.md)。
 
 ## 开源协议
 

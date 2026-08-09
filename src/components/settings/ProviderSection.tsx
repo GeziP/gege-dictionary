@@ -102,6 +102,9 @@ export function ProviderSection() {
               <ShieldCheckIcon size={11} className="text-positive" />
               经 Windows DPAPI 加密后存储，不会以明文写入配置文件或日志
             </span>
+            {settings.apiKeyError && (
+              <span className="mt-1 block text-[11px] text-danger">{settings.apiKeyError}</span>
+            )}
           </label>
         </div>
 

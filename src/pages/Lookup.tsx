@@ -16,10 +16,12 @@ import {
 import { useLexNote } from '../contexts/LexNoteContext';
 import { Skeleton } from '../components/ui/Skeleton';
 import { SpeakButton } from '../components/card/SpeakButton';
-import type { SavedWord } from '../types/lexnote';
+import type { Entry, SavedWord } from '../types/lexnote';
 import { classNames } from '../utils/format';
 import { RichText } from '../components/ui/RichText';
 import * as bridge from '../lib/tauri-bridge';
+
+type EntryMetadata = Entry & { _templateName?: string; fromCache?: boolean };
 
 export function Lookup() {
   const {
@@ -80,23 +82,6 @@ export function Lookup() {
   const existing = entry ? findByLemma(entry.lemma) : undefined;
 
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !pinned) {
-        bridge.closeLookupWindow();
-      }
-      if (e.key === 'Enter' && entry && !saved) {
-        handleSave();
-      }
-      if (e.key === ' ' && entry) {
-        e.preventDefault();
-        bridge.speakText(entry.lemma, settings.ttsVoice, settings.ttsRate);
-      }
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [entry, saved, pinned]);
-
-  useEffect(() => {
     if (pinned) return;
     if (lookupStatus !== 'done' && lookupStatus !== 'error') return;
 
@@ -133,12 +118,34 @@ export function Lookup() {
     setUndoTimer(timer);
   }, [entry, existing, lookupContext, lookupSourceApp, lookupSourceTitle, tagInput, ctxSaveWord, countLookup]);
 
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !pinned) {
+        bridge.closeLookupWindow();
+      }
+      if (event.key === 'Enter' && entry && !saved) {
+        handleSave();
+      }
+      if (event.key === ' ' && entry) {
+        event.preventDefault();
+        bridge.speakText(entry.lemma, settings.ttsVoice, settings.ttsRate);
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [entry, handleSave, pinned, saved, settings.ttsRate, settings.ttsVoice]);
+
   const handleRetry = () => {
     if (lookupSelection) {
       const wc = lookupSelection.split(/\s+/).length;
       const kind = wc >= 30 ? 'paragraph' : wc >= 6 ? 'sentence' : lookupSelection.includes(' ') ? 'phrase' : 'word';
       triggerLookup(lookupSelection, lookupContext, kind);
     }
+  };
+
+  const handleReanalyze = () => {
+    if (!lookupSelection || !entry) return;
+    triggerLookup(lookupSelection, lookupContext, entry.kind, lookupSourceApp, lookupSourceTitle, true);
   };
 
   return (
@@ -172,6 +179,16 @@ export function Lookup() {
               )}
             >
               {interleave ? <ListIcon size={11} /> : <AlignJustifyIcon size={11} />}
+            </button>
+          )}
+          {entry && lookupStatus === 'done' && (
+            <button
+              type="button"
+              title="跳过缓存，重新解析"
+              onClick={handleReanalyze}
+              className="flex h-5 w-5 items-center justify-center rounded text-ink-subtle hover:text-accent"
+            >
+              <RefreshCwIcon size={11} />
             </button>
           )}
           <button
@@ -422,8 +439,8 @@ export function Lookup() {
         {/* Template & Model Info */}
         {entry && lookupStatus === 'done' && (
           <div className="flex items-center gap-2 border-t border-line bg-sunken/50 px-3 py-1 text-[10px] text-ink-subtle">
-            <span>模板: <span className="font-medium text-ink-muted">{(entry as any)._templateName || '未知'}</span></span>
-            {(entry as any).fromCache && (
+            <span>模板: <span className="font-medium text-ink-muted">{(entry as EntryMetadata)._templateName || '未知'}</span></span>
+            {(entry as EntryMetadata).fromCache && (
               <span className="rounded-full bg-positive/15 px-1.5 py-px text-[9px] font-medium text-positive">缓存</span>
             )}
             <span className="ml-auto">{settings.provider.model}</span>

@@ -14,7 +14,9 @@ pub fn should_reject(text: &str) -> bool {
 }
 
 fn is_secret(text: &str) -> bool {
-    let prefixes = ["sk-", "sk_", "ghp_", "gho_", "ghs_", "AKIA", "xoxb-", "xoxp-"];
+    let prefixes = [
+        "sk-", "sk_", "ghp_", "gho_", "ghs_", "AKIA", "xoxb-", "xoxp-",
+    ];
     for prefix in &prefixes {
         if text.starts_with(prefix) {
             return true;
@@ -36,7 +38,10 @@ fn is_file_path(text: &str) -> bool {
         return false;
     }
     // Windows paths
-    if line.len() >= 3 && line.as_bytes()[1] == b':' && (line.as_bytes()[2] == b'\\' || line.as_bytes()[2] == b'/') {
+    if line.len() >= 3
+        && line.as_bytes()[1] == b':'
+        && (line.as_bytes()[2] == b'\\' || line.as_bytes()[2] == b'/')
+    {
         return true;
     }
     // Unix paths
@@ -55,12 +60,38 @@ fn is_file_path(text: &str) -> bool {
 
 fn is_code_snippet(text: &str) -> bool {
     let indicators = [
-        "function ", "fn ", "def ", "class ", "import ", "from ", "#include",
-        "const ", "let ", "var ", "pub fn", "async fn", "impl ", "struct ",
-        "interface ", "type ", "enum ", "package ", "namespace ",
-        "if (", "for (", "while (", "switch (", "catch (",
-        "=>", "->", "::", "&&", "||",
-        "};", "});", ");",
+        "function ",
+        "fn ",
+        "def ",
+        "class ",
+        "import ",
+        "from ",
+        "#include",
+        "const ",
+        "let ",
+        "var ",
+        "pub fn",
+        "async fn",
+        "impl ",
+        "struct ",
+        "interface ",
+        "type ",
+        "enum ",
+        "package ",
+        "namespace ",
+        "if (",
+        "for (",
+        "while (",
+        "switch (",
+        "catch (",
+        "=>",
+        "->",
+        "::",
+        "&&",
+        "||",
+        "};",
+        "});",
+        ");",
     ];
     let lines: Vec<&str> = text.lines().take(5).collect();
     let first_line = lines.first().copied().unwrap_or("");
@@ -74,10 +105,17 @@ fn is_code_snippet(text: &str) -> bool {
 
     // Multiple lines with code indicators
     if lines.len() >= 3 {
-        let code_line_count = lines.iter().filter(|l| {
-            let t = l.trim();
-            t.ends_with(';') || t.ends_with('{') || t.ends_with('}') || t.starts_with("//") || t.starts_with('#')
-        }).count();
+        let code_line_count = lines
+            .iter()
+            .filter(|l| {
+                let t = l.trim();
+                t.ends_with(';')
+                    || t.ends_with('{')
+                    || t.ends_with('}')
+                    || t.starts_with("//")
+                    || t.starts_with('#')
+            })
+            .count();
         if code_line_count >= 2 {
             return true;
         }
@@ -90,7 +128,9 @@ fn is_base64_blob(text: &str) -> bool {
     if text.contains(' ') || text.len() < 40 || text.len() > 10000 {
         return false;
     }
-    let valid_b64 = text.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=' || c == '\n' || c == '\r');
+    let valid_b64 = text.chars().all(|c| {
+        c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=' || c == '\n' || c == '\r'
+    });
     if !valid_b64 {
         return false;
     }
@@ -174,7 +214,9 @@ mod tests {
 
     #[test]
     fn test_rejects_base64() {
-        assert!(should_reject("SGVsbG8gV29ybGQhIFRoaXMgaXMgYSB0ZXN0IG9mIGJhc2U2NCBlbmNvZGluZw=="));
+        assert!(should_reject(
+            "SGVsbG8gV29ybGQhIFRoaXMgaXMgYSB0ZXN0IG9mIGJhc2U2NCBlbmNvZGluZw=="
+        ));
     }
 
     #[test]
@@ -192,7 +234,9 @@ mod tests {
     #[test]
     fn test_allows_english_text() {
         assert!(!should_reject("hello world"));
-        assert!(!should_reject("The quick brown fox jumps over the lazy dog"));
+        assert!(!should_reject(
+            "The quick brown fox jumps over the lazy dog"
+        ));
         assert!(!should_reject("unprecedented"));
         assert!(!should_reject("machine learning"));
     }
