@@ -43,10 +43,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $version = (Get-Content -Raw -Encoding utf8 src-tauri/tauri.conf.json | ConvertFrom-Json).version
-          $releases = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" | ConvertFrom-Json
           $releaseId = $null
-          foreach ($release in $releases) {
-            if ($release.tag_name -eq "v$version") { $releaseId = $release.id; break }
+          for ($attempt = 1; $attempt -le 6 -and -not $releaseId; $attempt++) {
+            $releases = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" | ConvertFrom-Json
+            foreach ($release in $releases) {
+              if ($release.tag_name -eq "v$version") { $releaseId = $release.id; break }
+            }
+            if (-not $releaseId) { Start-Sleep -Seconds 3 }
           }
           if (-not $releaseId) { throw "Draft release v$version was not found" }
           $assets = gh api "repos/$env:GITHUB_REPOSITORY/releases/$releaseId/assets" | ConvertFrom-Json
