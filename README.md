@@ -78,7 +78,7 @@
 
 ### 下载安装包
 
-前往 [Releases](https://github.com/GeziP/gege-dictionary/releases/latest) 页面，下载最新的 `鸽鸽词典_x.x.x_x64-setup.exe`，双击安装即可。应用内可在「设置 → 应用更新」立即检查新版本；自动检查默认开启，启动 30 秒后静默执行。
+前往 [Releases](https://github.com/GeziP/gege-dictionary/releases/latest) 页面，下载最新的 `Gege-Dictionary_x.x.x_x64-setup.exe`，双击安装即可。应用内可在「设置 → 应用更新」立即检查新版本；自动检查默认开启，启动 30 秒后静默执行。
 
 > 系统要求：Windows 10 (1803+) / Windows 11，需要 WebView2 运行时（Win10 通常已自带，Win11 100% 自带）。
 

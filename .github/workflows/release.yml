@@ -37,3 +37,24 @@ jobs:
           releaseBody: 请查看本版本发布说明并通过应用内更新安全升级。
           releaseDraft: true
           prerelease: false
+      - name: Normalize Windows release asset names
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = (Get-Content -Raw -Encoding utf8 src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          $releases = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" | ConvertFrom-Json
+          $releaseId = $null
+          foreach ($release in $releases) {
+            if ($release.tag_name -eq "v$version") { $releaseId = $release.id; break }
+          }
+          if (-not $releaseId) { throw "Draft release v$version was not found" }
+          $assets = gh api "repos/$env:GITHUB_REPOSITORY/releases/$releaseId/assets" | ConvertFrom-Json
+          foreach ($asset in $assets) {
+            if ($asset.name -like "*$version*x64-setup.exe") {
+              gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/releases/assets/$($asset.id)" `
+                -f "name=Gege-Dictionary_${version}_x64-setup.exe" --silent
+            } elseif ($asset.name -like "*$version*x64-setup.exe.sig") {
+              gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/releases/assets/$($asset.id)" `
+                -f "name=Gege-Dictionary_${version}_x64-setup.exe.sig" --silent
+            }
