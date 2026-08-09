@@ -18,6 +18,23 @@ function publish(patch: Partial<UpdaterState>) {
   listeners.forEach((listener) => listener(state));
 }
 
+function describeUpdateError(error: unknown, action: 'check' | 'install') {
+  const detail = String(error);
+  const normalized = detail.toLowerCase();
+  if (normalized.includes('404') || normalized.includes('not found')) {
+    return '在线发布包尚未就绪，请稍后重试或前往 GitHub Releases 手动确认';
+  }
+  if (normalized.includes('timed out') || normalized.includes('timeout')) {
+    return '连接更新服务器超时，请检查网络后重试';
+  }
+  if (normalized.includes('signature') || normalized.includes('verify')) {
+    return '更新包签名校验失败，已停止安装；当前版本仍可正常使用';
+  }
+  return action === 'check'
+    ? `检查更新失败：${detail}`
+    : `更新失败，当前版本仍可正常使用：${detail}`;
+}
+
 export function getUpdaterState() { return state; }
 export function subscribeUpdater(listener: (next: UpdaterState) => void) {
   listeners.add(listener);
@@ -25,7 +42,7 @@ export function subscribeUpdater(listener: (next: UpdaterState) => void) {
 }
 
 export async function checkForUpdates(skippedVersion = '', manual = false): Promise<UpdaterState> {
-  publish({ status: 'checking', progress: 0, message: undefined });
+  publish({ status: 'checking', version: undefined, notes: undefined, progress: 0, message: undefined });
   try {
     pending?.close();
     pending = await check({ timeout: 15_000 });
@@ -39,8 +56,9 @@ export async function checkForUpdates(skippedVersion = '', manual = false): Prom
       publish({ status: 'available', version: pending.version, notes: pending.body ?? '', message: undefined });
     }
   } catch (error) {
+    pending = null;
     publish(manual
-      ? { status: 'error', message: `检查更新失败：${String(error)}` }
+      ? { status: 'error', version: undefined, notes: undefined, message: describeUpdateError(error, 'check') }
       : { status: 'idle', message: undefined });
   }
   return state;
@@ -60,7 +78,7 @@ export async function installPendingUpdate() {
     });
     publish({ status: 'installed', progress: 100, message: '更新已安装，请重新启动应用' });
   } catch (error) {
-    publish({ status: 'error', message: `更新失败，当前版本仍可正常使用：${String(error)}` });
+    publish({ status: 'error', message: describeUpdateError(error, 'install') });
   }
 }
 

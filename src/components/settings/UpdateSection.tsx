@@ -10,7 +10,7 @@ import { SettingsSection } from './SettingsSection';
 
 export function UpdateSection() {
   const { settings, updateSettings } = useLexNote();
-  const [version, setVersion] = useState('1.2.0');
+  const [version, setVersion] = useState('…');
   const [state, setState] = useState(getUpdaterState());
   useEffect(() => subscribeUpdater(setState), []);
   useEffect(() => { if (isTauri()) getVersion().then(setVersion).catch(() => undefined); }, []);

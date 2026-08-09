@@ -38,6 +38,12 @@
     <td><img src="docs/screenshots/library-main.png" width="480" alt="Library"></td>
     <td><img src="docs/screenshots/paragraph-interleave.png" width="480" alt="Paragraph Interleave"></td>
   </tr>
+  <tr>
+    <td colspan="2" align="center"><b>个人术语表 · 领域 Profile · 解析风格</b></td>
+  </tr>
+  <tr>
+    <td colspan="2"><img src="docs/screenshots/glossary-domain-profile.png" width="960" alt="Personal glossary and domain profiles"></td>
+  </tr>
 </table>
 
 ## 简介
@@ -72,7 +78,7 @@
 
 ### 下载安装包
 
-前往 [Releases](https://github.com/GeziP/gege-dictionary/releases/latest) 页面，下载最新的 `鸽鸽词典_x.x.x_x64-setup.exe`，双击安装即可。
+前往 [Releases](https://github.com/GeziP/gege-dictionary/releases/latest) 页面，下载最新的 `鸽鸽词典_x.x.x_x64-setup.exe`，双击安装即可。应用内可在「设置 → 应用更新」立即检查新版本；自动检查默认开启，启动 30 秒后静默执行。
 
 > 系统要求：Windows 10 (1803+) / Windows 11，需要 WebView2 运行时（Win10 通常已自带，Win11 100% 自带）。
 
