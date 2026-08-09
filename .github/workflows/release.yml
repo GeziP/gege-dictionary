@@ -23,6 +23,8 @@ jobs:
           workspaces: "./src-tauri -> target"
       - run: npm ci
       - run: npm run lint
+      # generate_context! validates frontendDist even for Rust unit-test builds.
+      - run: npm run build
       - run: cargo test --manifest-path src-tauri/Cargo.toml --lib
       - uses: tauri-apps/tauri-action@v1
         env:
