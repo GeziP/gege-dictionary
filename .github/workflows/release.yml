@@ -58,3 +58,4 @@ jobs:
               gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/releases/assets/$($asset.id)" `
                 -f "name=Gege-Dictionary_${version}_x64-setup.exe.sig" --silent
             }
+          }
