@@ -191,7 +191,9 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
     (word: SavedWord) => {
       setWords((prev) => [word, ...prev.filter((w) => w.id !== word.id)]);
       if (isTauri) {
-        bridge.saveWord(word).catch(console.error);
+        bridge.saveWord(word)
+          .then(() => bridge.emitWordSaved())
+          .catch(console.error);
       }
     },
     [isTauri]
@@ -201,7 +203,9 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
     (ids: string[]) => {
       setWords((prev) => prev.filter((w) => !ids.includes(w.id)));
       if (isTauri) {
-        bridge.deleteWords(ids).catch(console.error);
+        bridge.deleteWords(ids)
+          .then(() => bridge.emitWordSaved())
+          .catch(console.error);
       }
     },
     [isTauri]
@@ -211,7 +215,9 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
     (id: string, patch: Partial<SavedWord>) => {
       setWords((prev) => prev.map((w) => (w.id === id ? { ...w, ...patch } : w)));
       if (isTauri) {
-        bridge.updateWord(id, patch).catch(console.error);
+        bridge.updateWord(id, patch)
+          .then(() => bridge.emitWordSaved())
+          .catch(console.error);
       }
     },
     [isTauri]
