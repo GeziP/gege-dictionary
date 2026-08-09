@@ -443,12 +443,16 @@ async fn call_openai_streaming<F: FnMut(&str)>(
     let mut line_buf = String::new();
     let mut finish_reason: Option<String> = None;
 
-    while let Some(chunk) = stream.next().await {
+    'stream: while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| format!("Stream read error: {e}"))?;
         let text = String::from_utf8_lossy(&bytes);
 
         for ch in text.chars() {
             if ch == '\n' {
+                if is_openai_sse_done(&line_buf) {
+                    line_buf.clear();
+                    break 'stream;
+                }
                 let (delta, finish) = parse_openai_sse_event(&line_buf);
                 if finish.is_some() {
                     finish_reason = finish;
@@ -458,6 +462,9 @@ async fn call_openai_streaming<F: FnMut(&str)>(
                     on_delta(&delta);
                 }
                 line_buf.clear();
+                if finish_reason.is_some() {
+                    break 'stream;
+                }
             } else {
                 line_buf.push(ch);
             }
@@ -489,6 +496,10 @@ async fn call_openai_streaming<F: FnMut(&str)>(
 #[cfg(test)]
 fn parse_openai_sse_line(line: &str) -> Option<String> {
     parse_openai_sse_event(line).0
+}
+
+fn is_openai_sse_done(line: &str) -> bool {
+    line.trim_end_matches('\r').trim() == "data: [DONE]"
 }
 
 fn parse_openai_sse_event(line: &str) -> (Option<String>, Option<String>) {
@@ -1051,6 +1062,9 @@ mod tests {
     fn test_parse_openai_sse_done() {
         assert_eq!(parse_openai_sse_line("data: [DONE]"), None);
         assert_eq!(parse_openai_sse_line("data: [DONE]\r"), None);
+        assert!(is_openai_sse_done("data: [DONE]"));
+        assert!(is_openai_sse_done("data: [DONE]\r"));
+        assert!(!is_openai_sse_done("data: {}"));
     }
 
     #[test]

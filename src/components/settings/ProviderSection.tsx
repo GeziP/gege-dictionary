@@ -12,7 +12,11 @@ function maskApiKey(key: string): string {
   return `${key.slice(0, 4)}••••${key.slice(-4)}`;
 }
 
-type TestState = {status: 'idle';} | {status: 'testing';} | {status: 'ok';latency: number;} | {status: 'error';};
+type TestState =
+  | {status: 'idle';}
+  | {status: 'testing';}
+  | {status: 'ok';latency: number;}
+  | {status: 'error';message: string;};
 
 export function ProviderSection() {
   const { settings, updateSettings } = useLexNote();
@@ -31,7 +35,7 @@ export function ProviderSection() {
       const result = await testConnection(provider.baseUrl, provider.apiKey, provider.model, provider.protocol);
       setTest({ status: 'ok', latency: result.latency });
     } catch (e) {
-      setTest({ status: 'error' });
+      setTest({ status: 'error', message: String(e) });
     }
   };
 
@@ -144,9 +148,12 @@ export function ProviderSection() {
             </span> :
           null}
           {test.status === 'error' ?
-          <span className="text-[11px] text-danger">鉴权失败（401）：API Key 为空或无效</span> :
+          <span className="text-[11px] text-danger">{test.message}</span> :
           null}
         </div>
+        <p className="mt-1 text-[10px] text-ink-subtle">
+          连接测试只验证鉴权、模型名和短响应；完整翻译会按上方 tokens 与超时设置执行。
+        </p>
 
         <div className="mt-4 border-t border-line pt-3">
           <label className="flex items-center gap-2.5 text-[12px]">

@@ -1,23 +1,25 @@
 import React, { useEffect, useState } from 'react';
-import { getVersion } from '@tauri-apps/api/app';
 import { RefreshCwIcon } from 'lucide-react';
 import { useLexNote } from '../../contexts/LexNoteContext';
 import { checkForUpdates, getUpdaterState, installPendingUpdate, subscribeUpdater } from '../../lib/updater';
-import { isTauri } from '../../lib/tauri-bridge';
+import { bundledVersion, getAppVersion } from '../../lib/version';
 import { Button } from '../ui/Button';
 import { Toggle } from '../ui/Toggle';
 import { SettingsSection } from './SettingsSection';
 
 export function UpdateSection() {
   const { settings, updateSettings } = useLexNote();
-  const [version, setVersion] = useState('…');
+  const [version, setVersion] = useState(bundledVersion);
   const [state, setState] = useState(getUpdaterState());
   useEffect(() => subscribeUpdater(setState), []);
-  useEffect(() => { if (isTauri()) getVersion().then(setVersion).catch(() => undefined); }, []);
+  useEffect(() => { getAppVersion().then(setVersion); }, []);
   return (
     <SettingsSection title="应用更新" description="更新检查只请求 GitHub Releases 的版本文件，不上传用户数据或使用统计。">
       <div className="flex items-center justify-between border-b border-line pb-3">
-        <div><p className="text-sm text-ink">当前版本</p><p className="text-xs text-ink-subtle">v{version}</p></div>
+        <div>
+          <p className="text-sm text-ink">当前版本</p>
+          <p className="text-xs text-ink-subtle">v{version} · Windows x64</p>
+        </div>
         <Button
           size="sm"
           loading={state.status === 'checking'}

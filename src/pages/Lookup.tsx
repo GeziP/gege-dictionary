@@ -49,8 +49,22 @@ export function Lookup() {
   const [emptyHint, setEmptyHint] = useState(false);
   const [fontSize, setFontSize] = useState(13);
   const [interleave, setInterleave] = useState(true);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const fontUp = () => setFontSize((s) => Math.min(s + 1, 18));
   const fontDown = () => setFontSize((s) => Math.max(s - 1, 10));
+
+  useEffect(() => {
+    if (lookupStatus !== 'loading' && lookupStatus !== 'streaming') {
+      setElapsedSeconds(0);
+      return;
+    }
+    const startedAt = Date.now();
+    setElapsedSeconds(0);
+    const timer = window.setInterval(() => {
+      setElapsedSeconds(Math.floor((Date.now() - startedAt) / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [lookupStatus]);
 
   useEffect(() => {
     if (initDone) return;
@@ -229,6 +243,9 @@ export function Lookup() {
 
           {(lookupStatus === 'loading' || lookupStatus === 'streaming') && !entry && (
             <div className="space-y-3">
+              <p className="text-[11px] text-ink-subtle">
+                正在请求模型 · {elapsedSeconds} 秒（超时上限 {settings.provider.timeoutSeconds} 秒）
+              </p>
               <Skeleton className="h-7 w-2/3" />
               <Skeleton className="h-4 w-1/3" />
               <Skeleton className="h-4 w-full" />

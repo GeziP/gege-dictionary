@@ -16,6 +16,7 @@ import { useLexNote } from '../../contexts/LexNoteContext';
 import { classNames } from '../../utils/format';
 import { SegmentedControl } from '../ui/SegmentedControl';
 import { isTauri } from '../../lib/tauri-bridge';
+import { bundledVersion } from '../../lib/version';
 
 const NAV = [
   { to: '/library', label: '生词库', icon: LibraryBigIcon },
@@ -117,6 +118,7 @@ export function WindowFrame({ title, children }: WindowFrameProps) {
           ))}
 
           <div className="mt-auto space-y-2 border-t border-line pt-2">
+            <p className="px-1 text-2xs text-ink-subtle">鸽鸽词典 v{bundledVersion}</p>
             <dl className="space-y-0.5 px-1 text-2xs text-ink-subtle">
               <div className="flex justify-between gap-2">
                 <dt>生词</dt>

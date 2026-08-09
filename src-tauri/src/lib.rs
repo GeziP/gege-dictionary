@@ -1508,4 +1508,48 @@ mod tests {
         assert_eq!(stored["provider"]["apiKey"], "");
         assert!(stored["apiKeyError"].as_str().is_some());
     }
+
+    /// Opt-in smoke test for the complete configured DeepSeek streaming path.
+    /// It reads the encrypted key from a caller-supplied database and never logs it.
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "requires GEGE_LIVE_DB and makes a paid network request"]
+    async fn live_configured_stream_lookup_completes() {
+        let db_path = std::env::var("GEGE_LIVE_DB").expect("GEGE_LIVE_DB is required");
+        let database = db::Database::open(&db_path).unwrap();
+        let settings = database.get_settings().unwrap();
+        let provider = &settings["provider"];
+        let api_key = dpapi::decrypt(provider["apiKey"].as_str().unwrap()).unwrap();
+        let templates = database.get_templates().unwrap();
+        let template = templates
+            .iter()
+            .find(|item| item["scope"] == "word")
+            .and_then(|item| item["body"].as_str())
+            .unwrap();
+        let prompt = glossary::enrich_template(template, "computing", "standard", &[]);
+        let started = std::time::Instant::now();
+        let raw = llm::stream_lookup_sse(
+            provider["baseUrl"].as_str().unwrap(),
+            &api_key,
+            provider["model"].as_str().unwrap(),
+            provider["protocol"].as_str().unwrap_or("openai"),
+            provider["temperature"].as_f64().unwrap_or(0.3),
+            provider["maxTokens"].as_u64().unwrap_or(2000).max(3000) as u32,
+            provider["timeoutSeconds"].as_u64().unwrap_or(60),
+            "semaphore",
+            "A semaphore controls access to a shared resource in concurrent code.",
+            "word",
+            &prompt,
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let entry = llm::parse_entry(&raw, "semaphore", "word").unwrap();
+        assert!(!entry["translation"].as_str().unwrap_or("").is_empty());
+        eprintln!(
+            "live lookup completed in {} ms ({} response bytes)",
+            started.elapsed().as_millis(),
+            raw.len()
+        );
+    }
 }

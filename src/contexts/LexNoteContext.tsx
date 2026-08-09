@@ -295,8 +295,8 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
 
     const errorListener = bridge.listenLookupError((e) => {
       if (e.requestId !== requestIdRef.current) return;
-      setLookupStatus('loading');
-      setLookupError(null);
+      setLookupStatus('error');
+      setLookupError(e.message);
     });
 
     const deltaListener = bridge.listenLookupDelta((e) => {
@@ -374,16 +374,10 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
         try {
           await bridge.lookupWordStream(selection, context, kind, rid, forceRefresh);
         } catch (e) {
-          console.warn('[triggerLookup] streaming failed, falling back to blocking:', e);
+          console.warn('[triggerLookup] streaming failed:', e);
           requestIdRef.current = '';
-          try {
-            const entry = await bridge.lookupWord(selection, context, kind, forceRefresh);
-            setLookupStatus('done');
-            setLookupResult(entry as Entry);
-          } catch (e2) {
-            setLookupStatus('error');
-            setLookupError(String(e2));
-          }
+          setLookupStatus('error');
+          setLookupError(String(e));
         }
       } else {
         try {
