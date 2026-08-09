@@ -1,10 +1,63 @@
-use rusqlite::{params, Connection, Result as SqlResult};
+use crate::glossary::{self, GlossaryTerm};
+use rusqlite::{params, params_from_iter, Connection, Result as SqlResult, Row};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 pub const DB_FILENAME: &str = "gege.db";
 pub const LEGACY_DB_FILENAME: &str = "lexnote.db";
 pub const DATA_DIR_POINTER_FILENAME: &str = "data-dir.txt";
+
+fn glossary_term_from_row(row: &Row<'_>) -> rusqlite::Result<GlossaryTerm> {
+    Ok(GlossaryTerm {
+        id: row.get(0)?,
+        term: row.get(1)?,
+        translation: row.get(2)?,
+        domain: row.get(3)?,
+        note: row.get(4)?,
+        case_sensitive: row.get::<_, i64>(5)? != 0,
+        enabled: row.get::<_, i64>(6)? != 0,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn escape_tsv(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+}
+
+fn unescape_tsv(value: &str) -> String {
+    let mut result = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            result.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => result.push('\t'),
+            Some('r') => result.push('\r'),
+            Some('n') => result.push('\n'),
+            Some('\\') => result.push('\\'),
+            Some(other) => {
+                result.push('\\');
+                result.push(other);
+            }
+            None => result.push('\\'),
+        }
+    }
+    result
+}
 
 /// Resolve the configured data directory from a small pointer file kept in the
 /// default application directory. The pointer is deliberately stored outside
@@ -209,6 +262,8 @@ impl Database {
             "reviewLimit": 20,
             "includeLongFormReview": false,
             "sessionGapMinutes": 30,
+            "activeDomainProfile": "general",
+            "analysisStyle": "standard",
             "autoCheckUpdates": true,
             "skippedUpdateVersion": "",
             "theme": "system",
@@ -984,6 +1039,329 @@ impl Database {
         Ok(())
     }
 
+    pub fn list_glossary_terms(
+        &self,
+        query: Option<&str>,
+        domain: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Value, String> {
+        if let Some(value) = domain.filter(|value| !value.is_empty()) {
+            if !glossary::DOMAINS.contains(&value) {
+                return Err(format!("未知领域：{value}"));
+            }
+        }
+        let mut conditions = Vec::new();
+        let mut values = Vec::new();
+        if let Some(value) = query.map(str::trim).filter(|value| !value.is_empty()) {
+            conditions.push("(term LIKE ? ESCAPE '\\' OR translation LIKE ? ESCAPE '\\')");
+            let pattern = format!("%{}%", escape_like(value));
+            values.push(pattern.clone());
+            values.push(pattern);
+        }
+        if let Some(value) = domain.filter(|value| !value.is_empty()) {
+            conditions.push("domain = ?");
+            values.push(value.to_string());
+        }
+        let where_sql = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
+        };
+        let count_sql = format!("SELECT COUNT(*) FROM glossary_terms{where_sql}");
+        let total: i64 = self
+            .conn
+            .query_row(&count_sql, params_from_iter(values.iter()), |row| {
+                row.get(0)
+            })
+            .map_err(|e| e.to_string())?;
+        let limit = limit.clamp(1, 200);
+        let sql = format!(
+            "SELECT id,term,translation,domain,note,case_sensitive,enabled,created_at,updated_at \
+             FROM glossary_terms{where_sql} ORDER BY domain, term_key LIMIT {limit} OFFSET {offset}"
+        );
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params_from_iter(values.iter()), glossary_term_from_row)
+            .map_err(|e| e.to_string())?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(serde_json::json!({ "items": items, "total": total }))
+    }
+
+    pub fn save_glossary_term(&self, input: &Value) -> Result<Value, String> {
+        let mut term: GlossaryTerm =
+            serde_json::from_value(input.clone()).map_err(|e| format!("术语格式无效：{e}"))?;
+        term.term = term.term.split_whitespace().collect::<Vec<_>>().join(" ");
+        term.translation = term.translation.trim().to_string();
+        term.note = term.note.trim().to_string();
+        glossary::validate_term(&term)?;
+        let term_key = glossary::normalize_term(&term.term);
+        let now = chrono::Utc::now().to_rfc3339();
+        let id_exists = if term.id.is_empty() {
+            false
+        } else {
+            self.conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM glossary_terms WHERE id=?1)",
+                    params![term.id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|e| e.to_string())?
+        };
+        if id_exists {
+            self.conn
+                .execute(
+                    "UPDATE glossary_terms SET term=?2,term_key=?3,translation=?4,domain=?5,note=?6,case_sensitive=?7,enabled=?8,updated_at=?9 WHERE id=?1",
+                    params![term.id, term.term, term_key, term.translation, term.domain, term.note, term.case_sensitive as i64, term.enabled as i64, now],
+                )
+                .map_err(|e| {
+                    if e.to_string().contains("UNIQUE constraint failed") {
+                        "该领域已存在同名术语".to_string()
+                    } else {
+                        e.to_string()
+                    }
+                })?;
+        } else {
+            let id = if term.id.is_empty() {
+                uuid::Uuid::new_v4().to_string()
+            } else {
+                term.id.clone()
+            };
+            self.conn
+                .execute(
+                    "INSERT INTO glossary_terms (id,term,term_key,translation,domain,note,case_sensitive,enabled,created_at,updated_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)
+                     ON CONFLICT(term_key,domain) DO UPDATE SET term=excluded.term,translation=excluded.translation,note=excluded.note,case_sensitive=excluded.case_sensitive,enabled=excluded.enabled,updated_at=excluded.updated_at",
+                    params![id, term.term, term_key, term.translation, term.domain, term.note, term.case_sensitive as i64, term.enabled as i64, now],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        self.conn
+            .query_row(
+                "SELECT id,term,translation,domain,note,case_sensitive,enabled,created_at,updated_at FROM glossary_terms WHERE term_key=?1 AND domain=?2",
+                params![term_key, term.domain],
+                glossary_term_from_row,
+            )
+            .map(|saved| serde_json::to_value(saved).unwrap_or(Value::Null))
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn delete_glossary_terms(&self, ids: &[String]) -> Result<u32, String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let mut deleted = 0;
+        for id in ids {
+            deleted += tx
+                .execute("DELETE FROM glossary_terms WHERE id=?1", params![id])
+                .map_err(|e| e.to_string())? as u32;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(deleted)
+    }
+
+    fn all_glossary_terms_for_domains(&self, domain: &str) -> Result<Vec<GlossaryTerm>, String> {
+        let domain = if glossary::DOMAINS.contains(&domain) {
+            domain
+        } else {
+            "general"
+        };
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id,term,translation,domain,note,case_sensitive,enabled,created_at,updated_at
+                 FROM glossary_terms WHERE enabled=1 AND (domain='general' OR domain=?1)",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![domain], glossary_term_from_row)
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn find_glossary_matches(
+        &self,
+        selection: &str,
+        context: &str,
+        domain: &str,
+    ) -> Result<Vec<GlossaryTerm>, String> {
+        let terms = self.all_glossary_terms_for_domains(domain)?;
+        Ok(glossary::match_terms(&terms, selection, context, domain))
+    }
+
+    pub fn import_glossary(
+        &self,
+        content: &str,
+        format: &str,
+        conflict_policy: &str,
+    ) -> Result<Value, String> {
+        if !matches!(conflict_policy, "overwrite" | "skip") {
+            return Err("冲突策略必须为 overwrite 或 skip".into());
+        }
+        let mut raw_terms = Vec::<Result<GlossaryTerm, String>>::new();
+        match format {
+            "json" => {
+                let values: Vec<Value> =
+                    serde_json::from_str(content).map_err(|e| format!("JSON 格式错误：{e}"))?;
+                if values.len() > 10_000 {
+                    return Err("单次最多导入 10000 条术语".into());
+                }
+                raw_terms.extend(values.into_iter().map(|value| {
+                    serde_json::from_value(value).map_err(|e| format!("字段格式错误：{e}"))
+                }));
+            }
+            "tsv" => {
+                let mut lines = content.lines();
+                let header = lines.next().unwrap_or("").trim_start_matches('\u{feff}');
+                if header != "term\ttranslation\tdomain\tnote\tcase_sensitive\tenabled" {
+                    return Err("TSV 表头不符合术语表格式".into());
+                }
+                for (index, line) in lines.enumerate() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    if raw_terms.len() >= 10_000 {
+                        return Err("单次最多导入 10000 条术语".into());
+                    }
+                    let fields = line.split('\t').collect::<Vec<_>>();
+                    if fields.len() != 6 {
+                        raw_terms.push(Err(format!("第 {} 行列数不是 6", index + 2)));
+                        continue;
+                    }
+                    let parse_bool = |value: &str| match value.trim().to_ascii_lowercase().as_str()
+                    {
+                        "true" | "1" | "yes" => Ok(true),
+                        "false" | "0" | "no" => Ok(false),
+                        _ => Err(format!("第 {} 行布尔值无效", index + 2)),
+                    };
+                    raw_terms.push((|| {
+                        Ok(GlossaryTerm {
+                            id: String::new(),
+                            term: unescape_tsv(fields[0]),
+                            translation: unescape_tsv(fields[1]),
+                            domain: unescape_tsv(fields[2]),
+                            note: unescape_tsv(fields[3]),
+                            case_sensitive: parse_bool(fields[4])?,
+                            enabled: parse_bool(fields[5])?,
+                            created_at: String::new(),
+                            updated_at: String::new(),
+                        })
+                    })());
+                }
+            }
+            _ => return Err("仅支持 json 或 tsv 格式".into()),
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut inserted = 0_u32;
+        let mut updated = 0_u32;
+        let mut skipped = 0_u32;
+        let mut errors = Vec::new();
+        for (index, item) in raw_terms.into_iter().enumerate() {
+            let mut term = match item {
+                Ok(term) => term,
+                Err(error) => {
+                    errors.push(error);
+                    continue;
+                }
+            };
+            term.term = term.term.split_whitespace().collect::<Vec<_>>().join(" ");
+            term.translation = term.translation.trim().to_string();
+            term.note = term.note.trim().to_string();
+            if let Err(error) = glossary::validate_term(&term) {
+                errors.push(format!("第 {} 条：{error}", index + 1));
+                continue;
+            }
+            let term_key = glossary::normalize_term(&term.term);
+            let existing: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM glossary_terms WHERE term_key=?1 AND domain=?2)",
+                    params![term_key, term.domain],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if existing && conflict_policy == "skip" {
+                skipped += 1;
+                continue;
+            }
+            if existing {
+                tx.execute(
+                    "UPDATE glossary_terms SET term=?3,translation=?4,note=?5,case_sensitive=?6,enabled=?7,updated_at=?8 WHERE term_key=?1 AND domain=?2",
+                    params![term_key, term.domain, term.term, term.translation, term.note, term.case_sensitive as i64, term.enabled as i64, now],
+                ).map_err(|e| e.to_string())?;
+                updated += 1;
+            } else {
+                tx.execute(
+                    "INSERT INTO glossary_terms (id,term,term_key,translation,domain,note,case_sensitive,enabled,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
+                    params![uuid::Uuid::new_v4().to_string(), term.term, term_key, term.translation, term.domain, term.note, term.case_sensitive as i64, term.enabled as i64, now],
+                ).map_err(|e| e.to_string())?;
+                inserted += 1;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
+            "inserted": inserted,
+            "updated": updated,
+            "skipped": skipped,
+            "errorCount": errors.len(),
+            "errors": errors.into_iter().take(100).collect::<Vec<_>>(),
+        }))
+    }
+
+    pub fn export_glossary(&self, format: &str, domain: Option<&str>) -> Result<String, String> {
+        if let Some(value) = domain.filter(|value| !value.is_empty()) {
+            if !glossary::DOMAINS.contains(&value) {
+                return Err(format!("未知领域：{value}"));
+            }
+        }
+        let mut sql = "SELECT id,term,translation,domain,note,case_sensitive,enabled,created_at,updated_at FROM glossary_terms".to_string();
+        if domain.is_some_and(|value| !value.is_empty()) {
+            sql.push_str(" WHERE domain=?1");
+        }
+        sql.push_str(" ORDER BY domain,term_key");
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let terms = if let Some(value) = domain.filter(|value| !value.is_empty()) {
+            stmt.query_map(params![value], glossary_term_from_row)
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        } else {
+            stmt.query_map([], glossary_term_from_row)
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        match format {
+            "json" => serde_json::to_string_pretty(&terms).map_err(|e| e.to_string()),
+            "tsv" => {
+                let mut lines =
+                    vec!["term\ttranslation\tdomain\tnote\tcase_sensitive\tenabled".to_string()];
+                for term in terms {
+                    lines.push(format!(
+                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        escape_tsv(&term.term),
+                        escape_tsv(&term.translation),
+                        term.domain,
+                        escape_tsv(&term.note),
+                        term.case_sensitive,
+                        term.enabled,
+                    ));
+                }
+                Ok(lines.join("\n"))
+            }
+            _ => Err("仅支持 json 或 tsv 格式".into()),
+        }
+    }
+
     pub fn get_usage(&self) -> Result<Value, String> {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let month_prefix = &today[..7];
@@ -1470,6 +1848,94 @@ mod tests {
         assert_eq!(settings["reviewLimit"], 20);
         assert_eq!(settings["sessionGapMinutes"], 30);
         assert_eq!(settings["autoCheckUpdates"], true);
+        assert_eq!(settings["activeDomainProfile"], "general");
+        assert_eq!(settings["analysisStyle"], "standard");
+    }
+
+    #[test]
+    fn glossary_crud_matching_and_round_trip_work() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        let saved = db
+            .save_glossary_term(&serde_json::json!({
+                "term": "deadlock",
+                "translation": "死锁",
+                "domain": "computing",
+                "note": "并发控制",
+                "caseSensitive": false,
+                "enabled": true
+            }))
+            .unwrap();
+        assert!(!saved["id"].as_str().unwrap().is_empty());
+        assert_eq!(
+            db.list_glossary_terms(Some("dead"), Some("computing"), 20, 0)
+                .unwrap()["total"],
+            1
+        );
+        assert_eq!(
+            db.find_glossary_matches("deadlock", "avoid deadlock", "computing")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(db
+            .find_glossary_matches("deadlock", "", "finance")
+            .unwrap()
+            .is_empty());
+
+        let tsv = db.export_glossary("tsv", None).unwrap();
+        db.delete_glossary_terms(&[saved["id"].as_str().unwrap().into()])
+            .unwrap();
+        let report = db.import_glossary(&tsv, "tsv", "overwrite").unwrap();
+        assert_eq!(report["inserted"], 1);
+        let json = db.export_glossary("json", None).unwrap();
+        let report = db.import_glossary(&json, "json", "skip").unwrap();
+        assert_eq!(report["skipped"], 1);
+    }
+
+    #[test]
+    fn glossary_import_reports_bad_rows_and_overwrites_conflicts() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        let first = "term\ttranslation\tdomain\tnote\tcase_sensitive\tenabled\nPCR\t聚合酶链式反应\tmedical_ivd\t初始\ttrue\ttrue\nbad\trow";
+        let report = db.import_glossary(first, "tsv", "overwrite").unwrap();
+        assert_eq!(report["inserted"], 1);
+        assert_eq!(report["errorCount"], 1);
+        let second = "term\ttranslation\tdomain\tnote\tcase_sensitive\tenabled\nPCR\tPCR 扩增\tmedical_ivd\t更新\ttrue\ttrue";
+        let report = db.import_glossary(second, "tsv", "overwrite").unwrap();
+        assert_eq!(report["updated"], 1);
+        assert!(db
+            .export_glossary("tsv", Some("medical_ivd"))
+            .unwrap()
+            .contains("PCR 扩增"));
+    }
+
+    #[test]
+    fn ten_thousand_glossary_terms_match_within_budget() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        for index in 0..10_000 {
+            tx.execute(
+                "INSERT INTO glossary_terms (id,term,term_key,translation,domain,note,case_sensitive,enabled,created_at,updated_at) VALUES (?1,?2,?2,?3,'general','',0,1,'now','now')",
+                params![format!("g-{index}"), format!("term{index}"), format!("译法{index}")],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let started = std::time::Instant::now();
+        let matched = db
+            .find_glossary_matches("term9999", "unrelated context", "general")
+            .unwrap();
+        assert_eq!(matched.len(), 1);
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        assert_eq!(
+            db.list_glossary_terms(None, None, 20, 0).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            20
+        );
     }
 
     fn sample_word(id: &str, source: &str, saved_at: &str) -> Value {

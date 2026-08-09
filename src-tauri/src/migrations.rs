@@ -2,7 +2,7 @@ use chrono::Local;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
-pub const LATEST_SCHEMA_VERSION: i64 = 2;
+pub const LATEST_SCHEMA_VERSION: i64 = 3;
 
 const REVIEW_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS review_state (
@@ -19,6 +19,24 @@ CREATE INDEX IF NOT EXISTS idx_review_due ON review_state(due_at);
 CREATE INDEX IF NOT EXISTS idx_review_box ON review_state(box);
 "#;
 
+const GLOSSARY_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS glossary_terms (
+    id TEXT PRIMARY KEY,
+    term TEXT NOT NULL,
+    term_key TEXT NOT NULL,
+    translation TEXT NOT NULL,
+    domain TEXT NOT NULL DEFAULT 'general',
+    note TEXT NOT NULL DEFAULT '',
+    case_sensitive INTEGER NOT NULL DEFAULT 0 CHECK (case_sensitive IN (0, 1)),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(term_key, domain)
+);
+CREATE INDEX IF NOT EXISTS idx_glossary_domain_enabled
+ON glossary_terms(domain, enabled);
+"#;
+
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, REVIEW_SCHEMA),
     (
@@ -32,6 +50,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         WHERE kind IN ('word', 'phrase');
         "#,
     ),
+    (3, GLOSSARY_SCHEMA),
 ];
 
 pub fn current_version(conn: &Connection) -> Result<i64, String> {
@@ -40,7 +59,7 @@ pub fn current_version(conn: &Connection) -> Result<i64, String> {
 }
 
 pub fn initialize_latest(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch(REVIEW_SCHEMA)
+    conn.execute_batch(&format!("{REVIEW_SCHEMA}\n{GLOSSARY_SCHEMA}"))
         .map_err(|e| format!("创建最新 schema 失败: {e}"))?;
     conn.pragma_update(None, "user_version", LATEST_SCHEMA_VERSION)
         .map_err(|e| format!("写入 schema 版本失败: {e}"))
@@ -138,7 +157,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE words (id TEXT PRIMARY KEY, kind TEXT, saved_at TEXT);")
             .unwrap();
         migrate(&conn, "").unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 2);
+        assert_eq!(current_version(&conn).unwrap(), 3);
         let first_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM review_state", [], |row| row.get(0))
             .unwrap();
@@ -177,6 +196,42 @@ mod tests {
             .unwrap();
         initialize_latest(&conn).unwrap();
         assert_eq!(current_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn upgrades_v2_without_changing_learning_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE words (id TEXT PRIMARY KEY, kind TEXT, saved_at TEXT);
+             INSERT INTO words VALUES ('kept', 'word', '2026-08-01');",
+        )
+        .unwrap();
+        conn.execute_batch(REVIEW_SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO review_state (word_id,box,due_at,created_at) VALUES ('kept',2,'2026-08-10','2026-08-01')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        migrate(&conn, "").unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 3);
+        assert_eq!(
+            conn.query_row(
+                "SELECT box FROM review_state WHERE word_id='kept'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+        let glossary_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='glossary_terms')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(glossary_exists);
     }
 
     #[test]

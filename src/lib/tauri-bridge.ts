@@ -1,6 +1,9 @@
 import type {
   AppSettings,
   Entry,
+  GlossaryImportReport,
+  GlossaryPage,
+  GlossaryTerm,
   PromptTemplate,
   ReadingSession,
   ReviewState,
@@ -110,12 +113,59 @@ export async function saveSettings(settings: AppSettings): Promise<void> {
   return invoke('save_settings', { settings });
 }
 
+export async function saveAnalysisPreferences(
+  domain: AppSettings['activeDomainProfile'],
+  style: AppSettings['analysisStyle'],
+): Promise<void> {
+  return invoke('save_analysis_preferences', { domain, style });
+}
+
 export async function getTemplates(): Promise<PromptTemplate[]> {
   return invoke<PromptTemplate[]>('get_templates');
 }
 
 export async function saveTemplate(template: PromptTemplate): Promise<void> {
   return invoke('save_template', { template });
+}
+
+export async function listGlossaryTerms(
+  query = '',
+  domain = '',
+  limit = 20,
+  offset = 0,
+): Promise<GlossaryPage> {
+  return invoke<GlossaryPage>('list_glossary_terms', { query, domain: domain || null, limit, offset });
+}
+
+export async function saveGlossaryTerm(term: Partial<GlossaryTerm>): Promise<GlossaryTerm> {
+  return invoke<GlossaryTerm>('save_glossary_term', { term });
+}
+
+export async function deleteGlossaryTerms(ids: string[]): Promise<number> {
+  return invoke<number>('delete_glossary_terms', { ids });
+}
+
+export async function importGlossary(
+  content: string,
+  format: 'json' | 'tsv',
+  conflictPolicy: 'overwrite' | 'skip' = 'overwrite',
+): Promise<GlossaryImportReport> {
+  return invoke<GlossaryImportReport>('import_glossary', { content, format, conflictPolicy });
+}
+
+export async function exportGlossary(
+  format: 'json' | 'tsv',
+  domain?: string,
+): Promise<string> {
+  return invoke<string>('export_glossary', { format, domain: domain || null });
+}
+
+export async function previewGlossaryMatches(
+  selection: string,
+  context: string,
+  domain: string,
+): Promise<GlossaryTerm[]> {
+  return invoke<GlossaryTerm[]>('preview_glossary_matches', { selection, context, domain });
 }
 
 export async function getUsage(): Promise<{ today: number; month: number; tokens: number }> {

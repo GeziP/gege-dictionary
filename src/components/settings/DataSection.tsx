@@ -307,12 +307,13 @@ export function DataSection() {
       <SettingsSection title="隐私边界">
         <div className="rounded-md border border-line bg-raised p-3 text-[12px] leading-relaxed text-ink-muted">
           <p className="flex items-center gap-1.5 font-medium text-ink">
-            <ShieldIcon size={13} className="text-positive" /> 发送给模型的只有三样东西
+            <ShieldIcon size={13} className="text-positive" /> 发送给模型的内容边界
           </p>
           <ol className="mt-1.5 list-decimal space-y-0.5 pl-5">
             <li>你选中的文本</li>
             <li>抓取的上下文句子（可在「取词与上下文」中关闭）</li>
             <li>当前 Prompt 模板</li>
+            <li>当前领域与解析风格，以及实际命中的个人术语（未命中时不发送术语表）</li>
           </ol>
           <p className="mt-2">
             鸽鸽词典没有服务端，不收集任何内容；崩溃日志默认不包含用户文本，API Key 在日志中脱敏。

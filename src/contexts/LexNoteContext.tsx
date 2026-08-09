@@ -31,6 +31,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   reviewLimit: 20,
   includeLongFormReview: false,
   sessionGapMinutes: 30,
+  activeDomainProfile: 'general',
+  analysisStyle: 'standard',
   autoCheckUpdates: true,
   skippedUpdateVersion: '',
 };
@@ -170,7 +172,14 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
       setSettings((prev) => {
         const next = { ...prev, ...patch };
         if (isTauri) {
-          bridge.saveSettings(next).catch(console.error);
+          const keys = Object.keys(patch);
+          const analysisOnly = keys.length > 0 && keys.every((key) =>
+            key === 'activeDomainProfile' || key === 'analysisStyle'
+          );
+          const save = analysisOnly
+            ? bridge.saveAnalysisPreferences(next.activeDomainProfile, next.analysisStyle)
+            : bridge.saveSettings(next);
+          save.catch(console.error);
         }
         return next;
       });

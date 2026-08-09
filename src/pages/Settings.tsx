@@ -7,12 +7,14 @@ import { AppearanceSection } from '../components/settings/AppearanceSection';
 import { DataSection } from '../components/settings/DataSection';
 import { ReviewSection } from '../components/settings/ReviewSection';
 import { UpdateSection } from '../components/settings/UpdateSection';
+import { GlossarySection } from '../components/settings/GlossarySection';
 import { classNames } from '../utils/format';
 
 const TABS = [
 { id: 'provider', label: '模型服务' },
 { id: 'capture', label: '热键与取词' },
 { id: 'prompt', label: 'Prompt 模板' },
+{ id: 'glossary', label: '术语与领域' },
 { id: 'appearance', label: '外观与朗读' },
 { id: 'review', label: '复习与会话' },
 { id: 'update', label: '应用更新' },
@@ -51,6 +53,7 @@ export function Settings() {
           {tab === 'provider' ? <ProviderSection /> : null}
           {tab === 'capture' ? <CaptureSection /> : null}
           {tab === 'prompt' ? <PromptSection /> : null}
+          {tab === 'glossary' ? <GlossarySection /> : null}
           {tab === 'appearance' ? <AppearanceSection /> : null}
           {tab === 'review' ? <ReviewSection /> : null}
           {tab === 'update' ? <UpdateSection /> : null}

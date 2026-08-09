@@ -3,6 +3,7 @@ mod content_filter;
 mod db;
 #[cfg(windows)]
 mod dpapi;
+mod glossary;
 mod llm;
 mod migrations;
 mod tts;
@@ -40,6 +41,27 @@ fn cache_ttl_days(settings: &serde_json::Value) -> i64 {
         .and_then(|v| v.as_i64())
         .filter(|days| matches!(*days, 0 | 7 | 30 | 90))
         .unwrap_or(30)
+}
+
+fn lookup_cache_key(
+    selection: &str,
+    context: &str,
+    kind: &str,
+    model: &str,
+    enriched_template: &str,
+) -> String {
+    let normalized = normalize_selection(selection, kind);
+    let normalized_context = context.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut template_hasher = Sha256::new();
+    template_hasher.update(enriched_template.as_bytes());
+    let template_hash = template_hasher.finalize();
+    let raw = format!(
+        "{}|{}|{}|{}|{:x}",
+        normalized, normalized_context, kind, model, template_hash
+    );
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(windows)]
@@ -281,6 +303,24 @@ async fn get_settings(state: tauri::State<'_, AppState>) -> Result<serde_json::V
     Ok(settings)
 }
 
+#[cfg(windows)]
+fn secure_api_key_for_storage(incoming: &str, stored: &str) -> Result<String, String> {
+    if incoming.is_empty() || dpapi::is_encrypted(incoming) {
+        return Ok(incoming.to_string());
+    }
+    if dpapi::is_encrypted(stored) && dpapi::decrypt(stored).ok().as_deref() == Some(incoming) {
+        return Ok(stored.to_string());
+    }
+    let encrypted = dpapi::encrypt(incoming)
+        .map_err(|error| format!("API Key 加密失败，设置未保存: {error}"))?;
+    let decrypted = dpapi::decrypt(&encrypted)
+        .map_err(|error| format!("API Key 加密校验失败，设置未保存: {error}"))?;
+    if decrypted != incoming {
+        return Err("API Key 加密校验失败，设置未保存".into());
+    }
+    Ok(encrypted)
+}
+
 #[tauri::command]
 async fn save_settings(
     state: tauri::State<'_, AppState>,
@@ -288,7 +328,37 @@ async fn save_settings(
 ) -> Result<(), String> {
     let mut settings = settings;
 
-    // Encrypt API key before storage
+    if let Some(domain) = settings
+        .get("activeDomainProfile")
+        .and_then(|value| value.as_str())
+    {
+        if !glossary::DOMAINS.contains(&domain) {
+            return Err(format!("未知领域 Profile：{domain}"));
+        }
+    }
+    if let Some(style) = settings
+        .get("analysisStyle")
+        .and_then(|value| value.as_str())
+    {
+        if !glossary::STYLES.contains(&style) {
+            return Err(format!("未知解析风格：{style}"));
+        }
+    }
+
+    // Reuse the existing ciphertext when the plaintext key did not change.
+    // This avoids invoking DPAPI for unrelated settings edits and remains safe
+    // when Windows is locked or the credential service is temporarily busy.
+    #[cfg(windows)]
+    let stored_key = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db.get_settings()?
+            .get("provider")
+            .and_then(|provider| provider.get("apiKey"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
     #[cfg(windows)]
     if let Some(provider) = settings.get_mut("provider").and_then(|p| p.as_object_mut()) {
         if let Some(key_val) = provider
@@ -301,28 +371,8 @@ async fn save_settings(
                 key_val.len(),
                 dpapi::is_encrypted(&key_val)
             );
-            if !key_val.is_empty() && !dpapi::is_encrypted(&key_val) {
-                match dpapi::encrypt(&key_val) {
-                    Ok(encrypted) => {
-                        eprintln!("[save_settings] encrypt OK, result_len={}", encrypted.len());
-                        // Verify round-trip before committing encrypted settings.
-                        match dpapi::decrypt(&encrypted) {
-                            Ok(decrypted) => {
-                                if decrypted == key_val {
-                                    eprintln!("[save_settings] round-trip OK");
-                                } else {
-                                    return Err("API Key 加密校验失败，设置未保存".into());
-                                }
-                            }
-                            Err(e) => {
-                                return Err(format!("API Key 加密校验失败，设置未保存: {e}"));
-                            }
-                        }
-                        provider.insert("apiKey".to_string(), serde_json::Value::String(encrypted));
-                    }
-                    Err(e) => return Err(format!("API Key 加密失败，设置未保存: {e}")),
-                }
-            }
+            let secured = secure_api_key_for_storage(&key_val, &stored_key)?;
+            provider.insert("apiKey".to_string(), serde_json::Value::String(secured));
         }
     }
 
@@ -331,6 +381,29 @@ async fn save_settings(
     }
 
     let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.save_settings(&settings)
+}
+
+#[tauri::command]
+async fn save_analysis_preferences(
+    state: tauri::State<'_, AppState>,
+    domain: String,
+    style: String,
+) -> Result<(), String> {
+    if !glossary::DOMAINS.contains(&domain.as_str()) {
+        return Err(format!("未知领域 Profile：{domain}"));
+    }
+    if !glossary::STYLES.contains(&style.as_str()) {
+        return Err(format!("未知解析风格：{style}"));
+    }
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let mut settings = db.get_settings()?;
+    let root = settings.as_object_mut().ok_or("设置格式无效")?;
+    root.insert(
+        "activeDomainProfile".into(),
+        serde_json::Value::String(domain),
+    );
+    root.insert("analysisStyle".into(), serde_json::Value::String(style));
     db.save_settings(&settings)
 }
 
@@ -349,6 +422,73 @@ async fn save_template(
 ) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.save_template(&template)
+}
+
+#[tauri::command]
+async fn list_glossary_terms(
+    state: tauri::State<'_, AppState>,
+    query: Option<String>,
+    domain: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.list_glossary_terms(
+        query.as_deref(),
+        domain.as_deref(),
+        limit.unwrap_or(20),
+        offset.unwrap_or(0),
+    )
+}
+
+#[tauri::command]
+async fn save_glossary_term(
+    state: tauri::State<'_, AppState>,
+    term: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.save_glossary_term(&term)
+}
+
+#[tauri::command]
+async fn delete_glossary_terms(
+    state: tauri::State<'_, AppState>,
+    ids: Vec<String>,
+) -> Result<u32, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.delete_glossary_terms(&ids)
+}
+
+#[tauri::command]
+async fn import_glossary(
+    state: tauri::State<'_, AppState>,
+    content: String,
+    format: String,
+    conflict_policy: String,
+) -> Result<serde_json::Value, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.import_glossary(&content, &format, &conflict_policy)
+}
+
+#[tauri::command]
+async fn export_glossary(
+    state: tauri::State<'_, AppState>,
+    format: String,
+    domain: Option<String>,
+) -> Result<String, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.export_glossary(&format, domain.as_deref())
+}
+
+#[tauri::command]
+async fn preview_glossary_matches(
+    state: tauri::State<'_, AppState>,
+    selection: String,
+    context: String,
+    domain: String,
+) -> Result<Vec<glossary::GlossaryTerm>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.find_glossary_matches(&selection, &context, &domain)
 }
 
 #[tauri::command]
@@ -432,6 +572,24 @@ async fn lookup_word(
                     .to_string()
             })
             .unwrap_or_default();
+        let domain = settings
+            .get("activeDomainProfile")
+            .and_then(|value| value.as_str())
+            .filter(|value| glossary::DOMAINS.contains(value))
+            .unwrap_or("general");
+        let style = settings
+            .get("analysisStyle")
+            .and_then(|value| value.as_str())
+            .filter(|value| glossary::STYLES.contains(value))
+            .unwrap_or("standard");
+        let glossary_matches = db.find_glossary_matches(&selection, &context, domain)?;
+        if !glossary_matches.is_empty() {
+            eprintln!(
+                "[lookup_word] glossary_term_applied count={}, domain={domain}",
+                glossary_matches.len()
+            );
+        }
+        let tpl_body = glossary::enrich_template(&tpl_body, domain, style, &glossary_matches);
 
         let base_url_value = provider
             .get("baseUrl")
@@ -505,22 +663,7 @@ async fn lookup_word(
     }
     eprintln!("[lookup_word] selection={selection:?}, kind={kind:?}, model={model:?}, protocol={protocol:?}, timeout={timeout_secs}s, tpl_len={}", template_body.len());
 
-    let normalized = normalize_selection(&selection, &kind);
-    let tpl_hash = {
-        let mut h = Sha256::new();
-        h.update(template_body.as_bytes());
-        let bytes = h.finalize();
-        format!(
-            "{:02x}{:02x}{:02x}{:02x}",
-            bytes[0], bytes[1], bytes[2], bytes[3]
-        )
-    };
-    let cache_key = {
-        let raw = format!("{}|{}|{}|{}", normalized, kind, model, tpl_hash);
-        let mut h = Sha256::new();
-        h.update(raw.as_bytes());
-        format!("{:x}", h.finalize())
-    };
+    let cache_key = lookup_cache_key(&selection, &context, &kind, &model, &template_body);
     if !force_refresh {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         if let Some(mut cached) = db.get_cache(&cache_key, cache_ttl)? {
@@ -645,6 +788,24 @@ async fn lookup_word_stream(
                     .to_string()
             })
             .unwrap_or_default();
+        let domain = settings
+            .get("activeDomainProfile")
+            .and_then(|value| value.as_str())
+            .filter(|value| glossary::DOMAINS.contains(value))
+            .unwrap_or("general");
+        let style = settings
+            .get("analysisStyle")
+            .and_then(|value| value.as_str())
+            .filter(|value| glossary::STYLES.contains(value))
+            .unwrap_or("standard");
+        let glossary_matches = db.find_glossary_matches(&selection, &context, domain)?;
+        if !glossary_matches.is_empty() {
+            eprintln!(
+                "[lookup_stream] glossary_term_applied count={}, domain={domain}",
+                glossary_matches.len()
+            );
+        }
+        let tpl_body = glossary::enrich_template(&tpl_body, domain, style, &glossary_matches);
 
         let base_url_value = provider
             .get("baseUrl")
@@ -718,22 +879,7 @@ async fn lookup_word_stream(
     }
 
     // Check cache
-    let normalized = normalize_selection(&selection, &kind);
-    let tpl_hash = {
-        let mut h = Sha256::new();
-        h.update(template_body.as_bytes());
-        let bytes = h.finalize();
-        format!(
-            "{:02x}{:02x}{:02x}{:02x}",
-            bytes[0], bytes[1], bytes[2], bytes[3]
-        )
-    };
-    let cache_key = {
-        let raw = format!("{}|{}|{}|{}", normalized, kind, model, tpl_hash);
-        let mut h = Sha256::new();
-        h.update(raw.as_bytes());
-        format!("{:x}", h.finalize())
-    };
+    let cache_key = lookup_cache_key(&selection, &context, &kind, &model, &template_body);
     if !force_refresh {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         if let Some(mut cached) = db.get_cache(&cache_key, cache_ttl)? {
@@ -1231,8 +1377,15 @@ pub fn run() {
             get_all_tags,
             get_settings,
             save_settings,
+            save_analysis_preferences,
             get_templates,
             save_template,
+            list_glossary_terms,
+            save_glossary_term,
+            delete_glossary_terms,
+            import_glossary,
+            export_glossary,
+            preview_glossary_matches,
             get_usage,
             increment_usage,
             lookup_word,
@@ -1286,6 +1439,34 @@ mod tests {
             normalize_selection("  Hello\n  World  ", "sentence"),
             "Hello World"
         );
+    }
+
+    #[test]
+    fn cache_key_tracks_context_and_enrichment() {
+        let base = lookup_cache_key("deadlock", "thread A", "word", "model", "standard");
+        assert_ne!(
+            base,
+            lookup_cache_key("deadlock", "thread B", "word", "model", "standard")
+        );
+        assert_ne!(
+            base,
+            lookup_cache_key("deadlock", "thread A", "word", "model", "deep+glossary")
+        );
+        assert_eq!(
+            base,
+            lookup_cache_key(" DEADLOCK ", "thread   A", "word", "model", "standard")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unchanged_api_key_reuses_existing_ciphertext() {
+        let ciphertext = dpapi::encrypt("sk-stable-key").unwrap();
+        assert_eq!(
+            secure_api_key_for_storage("sk-stable-key", &ciphertext).unwrap(),
+            ciphertext
+        );
+        assert_eq!(secure_api_key_for_storage("", &ciphertext).unwrap(), "");
     }
 
     #[cfg(windows)]

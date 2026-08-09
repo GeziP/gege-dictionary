@@ -113,6 +113,33 @@ export interface LookupRequest {
 export type NetworkMode = 'ok' | 'cached' | 'timeout' | 'auth' | 'offline' | 'malformed';
 
 export type ApiProtocol = 'openai' | 'anthropic';
+export type DomainProfile = 'general' | 'computing' | 'medical_ivd' | 'finance' | 'legal';
+export type AnalysisStyle = 'concise' | 'standard' | 'deep';
+
+export interface GlossaryTerm {
+  id: string;
+  term: string;
+  translation: string;
+  domain: DomainProfile;
+  note: string;
+  caseSensitive: boolean;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface GlossaryPage {
+  items: GlossaryTerm[];
+  total: number;
+}
+
+export interface GlossaryImportReport {
+  inserted: number;
+  updated: number;
+  skipped: number;
+  errorCount: number;
+  errors: string[];
+}
 
 export interface ProviderConfig {
   name: string;
@@ -143,6 +170,8 @@ export interface AppSettings {
   reviewLimit?: 0 | 10 | 20 | 50;
   includeLongFormReview?: boolean;
   sessionGapMinutes?: 15 | 30 | 60;
+  activeDomainProfile: DomainProfile;
+  analysisStyle: AnalysisStyle;
   autoCheckUpdates?: boolean;
   skippedUpdateVersion?: string;
   apiKeyError?: string;
