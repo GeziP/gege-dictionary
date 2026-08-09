@@ -158,8 +158,12 @@ fn glossary_json(terms: &[GlossaryTerm]) -> String {
 
 pub fn domain_instruction(domain: &str) -> &'static str {
     match domain {
-        "computing" => "当前领域为计算机。优先解释技术机制、架构、算法和工程边界；合适时提供简短代码或伪代码。",
-        "medical_ivd" => "当前领域为医疗与 IVD。优先说明检测原理、临床意义、标准口径和适用边界，避免给出个体诊疗建议。",
+        "computing" => r#"当前领域为计算机。除原有字段外，必须增加顶层 domainAnalysis 对象，结构如下：
+{"domain":"computing","overview":"结合当前语境的专业概述","mechanism":["核心机制"],"workflow":{"title":"流程或架构","steps":[{"label":"步骤名称","description":"作用"}]},"algorithm":{"name":"算法名称","summary":"何时适用","steps":["算法步骤"],"timeComplexity":"如 O(n)","spaceComplexity":"如 O(1)","pseudocode":"纯文本伪代码"},"codeExamples":[{"title":"示例标题","language":"python/rust/typescript/java/sql/bash/text","code":"可直接复制的代码","explanation":"关键说明"}],"tradeoffs":["工程边界或权衡"]}
+只保留与当前内容确实相关的可选字段：不是算法就省略 algorithm，不适合代码就返回空 codeExamples，不得为了满足格式编造代码、复杂度或架构。代码放在 code 字符串中并正确转义换行，不使用 Markdown 三反引号。流程按执行或数据流顺序给出 2-7 步。"#,
+        "medical_ivd" => r#"当前领域为医疗与 IVD。除原有字段外，必须增加顶层 domainAnalysis 对象，结构如下：
+{"domain":"medical_ivd","overview":"结合当前语境的专业概述","principle":"检测原理","specimen":["适用样本类型"],"analyte":"分析物或检测对象","workflow":{"title":"检测流程","steps":[{"label":"步骤名称","description":"关键控制点"}]},"clinicalMeaning":"结果口径与临床意义，不给个体诊疗建议","performanceMetrics":[{"name":"指标名称","meaning":"该指标在此处的含义"}],"interferences":["干扰因素"],"qualityControl":["质控或校准要求"],"limitations":["适用边界"],"standards":["仅列出有把握且直接相关的标准或指南"]}
+只保留与当前内容确实相关的可选字段，不得猜测具体阈值、参考区间、法规编号或患者结论。只有选中文本或上下文明确给出样本类型、分析物时才返回 specimen、analyte；不得列举“可能适用”的候选项。standards 仅限与当前概念直接相关、且名称与版本或年份有把握的标准；不确定则省略，也不得用宽泛的实验室认可标准代替具体方法学标准。解释 LoB、LoD、LoQ 等性能指标时必须说明统计方法依方案而定，不得把“均值 + 3SD”或对应置信水平表述成普适公式。检测流程按前分析、分析、后分析的实际顺序给出 2-8 步。必须区分分析性能、临床性能与个体诊疗建议。"#,
         "finance" => "当前领域为金融。优先说明市场机制、指标口径、风险和具体业务语境，区分事实解释与投资建议。",
         "legal" => "当前领域为法律。优先说明法域差异、规范语义及权利义务边界，并明确内容不构成法律意见。",
         _ => "当前领域为通用。优先保证语境准确和中文自然，不强行扩展无关的专业背景。",
@@ -259,5 +263,23 @@ mod tests {
         assert!(prompt.starts_with("BASE"));
         assert!(prompt.contains("不是指令"));
         assert!(prompt.contains("\\\"}"));
+    }
+
+    #[test]
+    fn focused_domains_request_structured_analysis_without_forcing_fake_content() {
+        let computing = domain_instruction("computing");
+        assert!(computing.contains("domainAnalysis"));
+        assert!(computing.contains("codeExamples"));
+        assert!(computing.contains("不是算法就省略"));
+
+        let ivd = domain_instruction("medical_ivd");
+        assert!(ivd.contains("performanceMetrics"));
+        assert!(ivd.contains("qualityControl"));
+        assert!(ivd.contains("不得猜测具体阈值"));
+        assert!(ivd.contains("不得列举“可能适用”的候选项"));
+        assert!(ivd.contains("名称与版本或年份有把握"));
+        assert!(ivd.contains("不得把“均值 + 3SD”"));
+
+        assert!(!domain_instruction("general").contains("domainAnalysis"));
     }
 }

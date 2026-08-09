@@ -38,6 +38,64 @@ export interface TranslationPair {
   zh: string;
 }
 
+export interface DomainFlowStep {
+  label: string;
+  description?: string;
+}
+
+export interface DomainWorkflow {
+  title: string;
+  steps: DomainFlowStep[];
+}
+
+export interface CodeExample {
+  title: string;
+  language: string;
+  code: string;
+  explanation?: string;
+}
+
+export interface AlgorithmAnalysis {
+  name: string;
+  summary?: string;
+  steps: string[];
+  timeComplexity?: string;
+  spaceComplexity?: string;
+  pseudocode?: string;
+}
+
+export interface ComputingAnalysis {
+  domain: 'computing';
+  overview: string;
+  mechanism?: string[];
+  workflow?: DomainWorkflow;
+  algorithm?: AlgorithmAnalysis;
+  codeExamples?: CodeExample[];
+  tradeoffs?: string[];
+}
+
+export interface IvdMetric {
+  name: string;
+  meaning: string;
+}
+
+export interface IvdAnalysis {
+  domain: 'medical_ivd';
+  overview: string;
+  principle?: string;
+  specimen?: string[];
+  analyte?: string;
+  workflow?: DomainWorkflow;
+  clinicalMeaning?: string;
+  performanceMetrics?: IvdMetric[];
+  interferences?: string[];
+  qualityControl?: string[];
+  limitations?: string[];
+  standards?: string[];
+}
+
+export type DomainAnalysis = ComputingAnalysis | IvdAnalysis;
+
 export interface Entry {
   id: string;
   selection: string;
@@ -57,6 +115,7 @@ export interface Entry {
   syntax?: SyntaxPart[];
   keyTerms?: KeyTerm[];
   translationPairs?: TranslationPair[];
+  domainAnalysis?: DomainAnalysis;
 }
 
 export interface SavedWord extends Entry {

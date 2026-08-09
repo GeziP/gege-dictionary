@@ -836,6 +836,9 @@ pub fn parse_entry(raw: &str, selection: &str, kind: &str) -> Result<Value, Stri
         if let Some(kt) = obj.remove("key_terms") {
             obj.insert("keyTerms".to_string(), kt);
         }
+        if let Some(domain_analysis) = obj.remove("domain_analysis") {
+            obj.insert("domainAnalysis".to_string(), domain_analysis);
+        }
     }
 
     Ok(entry)
@@ -1092,6 +1095,15 @@ mod tests {
         assert_eq!(entry.get("lemma").unwrap().as_str().unwrap(), "test");
         assert_eq!(entry.get("translation").unwrap().as_str().unwrap(), "测试");
         assert!(entry.get("id").is_some());
+    }
+
+    #[test]
+    fn test_parse_entry_normalizes_domain_analysis_alias() {
+        let raw = r#"{"translation":"死锁","domain_analysis":{"domain":"computing","overview":"并发故障","mechanism":["循环等待"]}}"#;
+        let entry = parse_entry(raw, "deadlock", "word").unwrap();
+        assert_eq!(entry["domainAnalysis"]["domain"], "computing");
+        assert_eq!(entry["domainAnalysis"]["mechanism"][0], "循环等待");
+        assert!(entry.get("domain_analysis").is_none());
     }
 
     #[test]

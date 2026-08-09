@@ -20,6 +20,7 @@ import { Chip } from '../ui/Chip';
 import { SpeakButton } from '../card/SpeakButton';
 import { EditableText } from './EditableText';
 import { RichText } from '../ui/RichText';
+import { DomainAnalysis } from '../domain/DomainAnalysis';
 
 const MASTERY: { value: Mastery; label: string }[] = [
   { value: 'new', label: '新词' },
@@ -300,6 +301,8 @@ export function WordDetail({
             </div>
           </section>
         )}
+
+        <DomainAnalysis analysis={word.domainAnalysis} />
 
         {word.senses && word.senses.length > 0 && (
           <section>

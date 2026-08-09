@@ -302,6 +302,7 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
         ipa_uk: 'ipaUK',
         translation_pairs: 'translationPairs',
         key_terms: 'keyTerms',
+        domain_analysis: 'domainAnalysis',
       };
       const field = aliases[e.field] || e.field as keyof Entry;
       const active = activeLookupRef.current;

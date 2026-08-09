@@ -243,6 +243,10 @@ export async function getClipboardWatchStatus(): Promise<boolean> {
   return invoke<boolean>('get_clipboard_watch_status');
 }
 
+export async function copyText(text: string): Promise<void> {
+  return invoke('copy_text', { text });
+}
+
 export async function testConnection(
   baseUrl: string,
   apiKey: string,

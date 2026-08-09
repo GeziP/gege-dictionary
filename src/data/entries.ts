@@ -70,7 +70,39 @@ export const ENTRIES: Record<string, Entry> = {
     contextMeaning:
     '活锁：进程仍在运行、仍在响应，但因为不断互相让步或重试，系统整体没有任何进展（no progress）。',
     explanation:
-    '与死锁（deadlock）的区别是本词的全部要点：deadlock 中线程被阻塞、状态静止；livelock 中线程忙碌、状态一直在变，只是永远达不到目标。经典比喻是两个人在走廊迎面相遇，各自不断向同一侧闪避。因为进程看起来「活着」，活锁在监控上极难发现——CPU 使用率正常甚至偏高，健康检查全绿，唯独业务吞吐为零。',
+      '与死锁（deadlock）的区别是本词的全部要点：deadlock 中线程被阻塞、状态静止；livelock 中线程忙碌、状态一直在变，只是永远达不到目标。经典比喻是两个人在走廊迎面相遇，各自不断向同一侧闪避。因为进程看起来「活着」，活锁在监控上极难发现——CPU 使用率正常甚至偏高，健康检查全绿，唯独业务吞吐为零。',
+    domainAnalysis: {
+      domain: 'computing',
+      overview: '活锁是并发系统中的**全局无进展**故障：参与者持续改变状态或重试，但没有操作能够提交。',
+      mechanism: [
+        '多个参与者根据对方状态反复让步，局部动作都合法，但组合后形成循环。',
+        '健康检查只能证明线程仍响应，不能证明业务状态机正在推进。',
+      ],
+      workflow: {
+        title: '典型活锁循环',
+        steps: [
+          { label: '检测冲突', description: '两个工作线程同时发现共享资源不可用。' },
+          { label: '主动退让', description: '双方释放资源并立即重试。' },
+          { label: '同步重试', description: '相同调度节奏再次制造同一冲突。' },
+          { label: '循环无进展', description: '线程活跃且 CPU 忙碌，但吞吐量保持为零。' },
+        ],
+      },
+      algorithm: {
+        name: '随机指数退避',
+        summary: '通过打破参与者的同步节奏降低重复碰撞概率。',
+        steps: ['冲突后增加重试次数', '从扩大后的时间窗随机取等待时间', '成功后重置退避状态'],
+        timeComplexity: '期望重试次数随竞争程度变化',
+        spaceComplexity: 'O(1)',
+        pseudocode: 'attempt = 0\nwhile not try_commit():\n    delay = random(0, min(MAX, BASE * 2^attempt))\n    sleep(delay)\n    attempt += 1',
+      },
+      codeExamples: [{
+        title: '带抖动的重试循环',
+        language: 'python',
+        code: 'for attempt in range(max_attempts):\n    if try_commit():\n        break\n    delay = random.uniform(0, min(cap, base * 2 ** attempt))\n    time.sleep(delay)',
+        explanation: '随机抖动比所有线程使用相同的固定等待更容易打破同步重试。',
+      }],
+      tradeoffs: ['退避只能缓解竞争导致的活锁，不能替代状态机进展性证明。', '监控应同时观察吞吐、提交索引或队列消耗速度。'],
+    },
     senses: [
     { pos: 'n.', gloss: 'a state in which processes keep running but make no progress', translation: '活锁：进程持续运行却无进展' },
     { pos: 'v. (rare)', gloss: 'to enter such a state', translation: '陷入活锁（少见的动词用法）' }],

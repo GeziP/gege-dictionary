@@ -5,6 +5,7 @@ import type { Entry } from '../../types/lexnote';
 import { Skeleton } from '../ui/Skeleton';
 import { SpeakButton } from './SpeakButton';
 import { splitOnTerm } from '../../utils/format';
+import { DomainAnalysis } from '../domain/DomainAnalysis';
 
 const ASSOCIATION_ICON = {
   root: GitBranchIcon,
@@ -163,6 +164,12 @@ export function CardDetails({ entry, revealed, streaming }: CardDetailsProps) {
 
           })}
           </ul>
+        </Section> :
+      null}
+
+      {revealed >= 5 && entry.domainAnalysis ?
+      <Section index={4}>
+          <DomainAnalysis analysis={entry.domainAnalysis} />
         </Section> :
       null}
 

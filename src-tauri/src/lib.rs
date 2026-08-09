@@ -1211,6 +1211,14 @@ async fn get_clipboard_watch_status(state: tauri::State<'_, AppState>) -> Result
     Ok(state.clipboard_enabled.load(Ordering::Relaxed))
 }
 
+#[tauri::command]
+async fn copy_text(text: String) -> Result<(), String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("无法访问剪贴板: {e}"))?;
+    clipboard
+        .set_text(text)
+        .map_err(|e| format!("复制失败: {e}"))
+}
+
 fn setup_tray(
     app: &tauri::App,
     clipboard_enabled: Arc<AtomicBool>,
@@ -1406,6 +1414,7 @@ pub fn run() {
             get_last_capture,
             toggle_clipboard_watch,
             get_clipboard_watch_status,
+            copy_text,
         ])
         .setup(move |app| {
             let cb = clipboard_enabled.clone();

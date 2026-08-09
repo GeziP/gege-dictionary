@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  ChevronDownIcon,
+  ClipboardPasteIcon,
   DownloadIcon,
   Edit3Icon,
   FileUpIcon,
@@ -22,10 +24,31 @@ import { SettingsSection } from './SettingsSection';
 
 const PAGE_SIZE = 10;
 
-const DOMAINS: Array<{ id: DomainProfile; name: string; description: string }> = [
+function escapeTsvCell(value: string) {
+  return value.replace(/\\/g, '\\\\').replace(/\t/g, '\\t').replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+}
+
+function pastedTableToTsv(text: string, domain: DomainProfile) {
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (!lines.length) throw new Error('请先从 Excel 或表格中复制两列内容');
+  const rows = lines.map((line, index) => {
+    const cells = line.split('\t').map((cell) => cell.trim());
+    if (index === 0 && /^(term|术语|英文)$/i.test(cells[0] ?? '') && /^(translation|译法|中文)$/i.test(cells[1] ?? '')) {
+      return null;
+    }
+    if (cells.length < 2 || !cells[0] || !cells[1]) {
+      throw new Error(`第 ${index + 1} 行需要“英文术语”和“固定译法”两列`);
+    }
+    return [cells[0], cells[1], domain, cells[2] ?? '', 'false', 'true'].map(escapeTsvCell).join('\t');
+  }).filter((row): row is string => Boolean(row));
+  if (!rows.length) throw new Error('表格中没有可导入的术语');
+  return `term\ttranslation\tdomain\tnote\tcase_sensitive\tenabled\n${rows.join('\n')}`;
+}
+
+const DOMAINS: Array<{ id: DomainProfile; name: string; description: string; focused?: boolean }> = [
   { id: 'general', name: '通用', description: '自然、准确，不强行扩展专业背景' },
-  { id: 'computing', name: '计算机', description: '机制、架构、算法与工程边界' },
-  { id: 'medical_ivd', name: '医疗 / IVD', description: '检测原理、临床意义与标准口径' },
+  { id: 'computing', name: '计算机', description: '机制、架构、算法与工程边界', focused: true },
+  { id: 'medical_ivd', name: '医疗 / IVD', description: '检测原理、临床意义与标准口径', focused: true },
   { id: 'finance', name: '金融', description: '市场机制、指标口径与风险语境' },
   { id: 'legal', name: '法律', description: '法域差异、规范语义与权利义务' },
 ];
@@ -67,6 +90,10 @@ export function GlossarySection() {
   const [status, setStatus] = useState<{ type: 'ok' | 'error'; message: string } | null>(null);
   const [report, setReport] = useState<GlossaryImportReport | null>(null);
   const [conflictPolicy, setConflictPolicy] = useState<'overwrite' | 'skip'>('overwrite');
+  const [showPaste, setShowPaste] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [pasteText, setPasteText] = useState('');
+  const [pasteDomain, setPasteDomain] = useState<DomainProfile>(settings.activeDomainProfile);
   const fileInput = useRef<HTMLInputElement>(null);
 
   const flash = useCallback((type: 'ok' | 'error', message: string) => {
@@ -167,6 +194,24 @@ export function GlossarySection() {
     }
   };
 
+  const importPastedTable = async () => {
+    setLoading(true);
+    try {
+      const content = pastedTableToTsv(pasteText, pasteDomain);
+      const result = await bridge.importGlossary(content, 'tsv', conflictPolicy);
+      setReport(result);
+      setPasteText('');
+      setShowPaste(false);
+      setPage(0);
+      flash('ok', `表格导入完成：新增 ${result.inserted}，覆盖 ${result.updated}，跳过 ${result.skipped}`);
+      await load();
+    } catch (error) {
+      flash('error', `表格导入失败：${error instanceof Error ? error.message : error}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const exportFile = async (format: 'json' | 'tsv') => {
     try {
       const content = await bridge.exportGlossary(format, domainFilter || undefined);
@@ -204,7 +249,14 @@ export function GlossarySection() {
                   : 'border-line bg-raised hover:border-line-strong',
               )}
             >
-              <span className="block text-[12px] font-medium text-ink">{domain.name}</span>
+              <span className="flex items-center gap-1.5 text-[12px] font-medium text-ink">
+                {domain.name}
+                {domain.focused && (
+                  <span className="rounded bg-accent/10 px-1.5 py-0.5 text-[9px] font-medium text-accent">
+                    重点深化
+                  </span>
+                )}
+              </span>
               <span className="mt-0.5 block text-[10px] leading-relaxed text-ink-subtle">
                 {domain.description}
               </span>
@@ -258,10 +310,48 @@ export function GlossarySection() {
             <option value="">全部领域</option>
             {DOMAINS.map((domain) => <option key={domain.id} value={domain.id}>{domain.name}</option>)}
           </select>
+          <Button size="sm" icon={<ClipboardPasteIcon size={12} />} onClick={() => setShowPaste((value) => !value)}>
+            粘贴表格
+          </Button>
           <Button size="sm" variant="primary" icon={<PlusIcon size={12} />} onClick={startAdd}>新增</Button>
         </div>
 
-        <div className="mt-2 flex flex-wrap items-center gap-1">
+        {showPaste ? (
+          <div className="mt-3 rounded-md border border-accent/40 bg-accent-soft p-3">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div>
+                <p className="text-[12px] font-medium text-ink">从 Excel / WPS 粘贴</p>
+                <p className="mt-0.5 text-[10px] text-ink-subtle">复制“英文术语、固定译法”两列；可选第三列作为备注，不需要制作 JSON。</p>
+              </div>
+              <button type="button" aria-label="关闭表格粘贴" onClick={() => setShowPaste(false)} className="text-ink-subtle hover:text-ink"><XIcon size={14} /></button>
+            </div>
+            <textarea
+              value={pasteText}
+              onChange={(event) => setPasteText(event.target.value)}
+              rows={5}
+              placeholder={'deadlock\t死锁\nquorum\t多数派'}
+              className="mt-2 w-full resize-y rounded-md border border-line bg-surface px-2.5 py-2 font-mono text-[11px] text-ink outline-none focus:border-accent"
+            />
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <label className="text-[10px] text-ink-subtle" htmlFor="paste-domain">这些术语属于</label>
+              <select id="paste-domain" value={pasteDomain} onChange={(event) => setPasteDomain(event.target.value as DomainProfile)} className="h-control rounded-md border border-line bg-surface px-2 text-[11px] text-ink">
+                {DOMAINS.map((domain) => <option key={domain.id} value={domain.id}>{domain.name}</option>)}
+              </select>
+              <Button className="ml-auto" size="sm" variant="primary" loading={loading} disabled={!pasteText.trim()} onClick={() => void importPastedTable()}>导入术语</Button>
+            </div>
+          </div>
+        ) : null}
+
+        <button
+          type="button"
+          onClick={() => setShowAdvanced((value) => !value)}
+          className="mt-2 inline-flex items-center gap-1 text-[10px] text-ink-subtle hover:text-accent"
+        >
+          <ChevronDownIcon size={11} className={classNames('transition-transform', showAdvanced && 'rotate-180')} />
+          批量迁移与备份
+        </button>
+
+        {showAdvanced ? <div className="mt-1.5 flex flex-wrap items-center gap-1 rounded-md border border-line bg-raised p-2">
           <input
             ref={fileInput}
             type="file"
@@ -273,7 +363,7 @@ export function GlossarySection() {
             }}
           />
           <Button size="sm" variant="ghost" icon={<FileUpIcon size={12} />} onClick={() => fileInput.current?.click()}>
-            导入 JSON / TSV
+            从文件导入 JSON / TSV
           </Button>
           <select
             value={conflictPolicy}
@@ -290,8 +380,8 @@ export function GlossarySection() {
           <Button size="sm" variant="ghost" icon={<DownloadIcon size={12} />} onClick={() => exportFile('tsv')}>
             导出 TSV
           </Button>
-          <span className="ml-auto text-[10px] text-ink-subtle">共 {total} 条</span>
-        </div>
+        </div> : null}
+        <p className="mt-1 text-right text-[10px] text-ink-subtle">共 {total} 条</p>
 
         {editing ? (
           <div className="mt-3 rounded-md border border-accent/40 bg-accent-soft p-3">

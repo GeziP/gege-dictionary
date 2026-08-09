@@ -19,6 +19,7 @@ import { SpeakButton } from '../components/card/SpeakButton';
 import type { Entry, SavedWord } from '../types/lexnote';
 import { classNames } from '../utils/format';
 import { RichText } from '../components/ui/RichText';
+import { DomainAnalysis } from '../components/domain/DomainAnalysis';
 import * as bridge from '../lib/tauri-bridge';
 
 type EntryMetadata = Entry & { _templateName?: string; fromCache?: boolean };
@@ -309,6 +310,8 @@ export function Lookup() {
                   </div>
                 </div>
               )}
+
+              <DomainAnalysis analysis={entry.domainAnalysis} />
 
               {/* Senses */}
               {entry.senses && entry.senses.length > 0 && (

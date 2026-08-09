@@ -23,6 +23,20 @@
 
 <table>
   <tr>
+    <td align="center"><b>计算机领域 · 算法与流程</b></td>
+    <td align="center"><b>IVD 领域 · 检测流程与性能</b></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/domain-computing-v1.4.png" width="480" alt="Computing domain analysis"></td>
+    <td><img src="docs/screenshots/domain-ivd-v1.4.png" width="480" alt="IVD domain analysis"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><b>代码卡片 · 保留缩进、横向滚动与一键复制</b></td>
+  </tr>
+  <tr>
+    <td colspan="2"><img src="docs/screenshots/domain-computing-code-v1.4.png" width="960" alt="Copyable code card"></td>
+  </tr>
+  <tr>
     <td align="center"><b>首次配置向导</b></td>
     <td align="center"><b>单词深度解析</b></td>
   </tr>
@@ -62,7 +76,9 @@
 | **单词 / 短语 / 句子 / 段落** | 自动识别选中内容类型，匹配不同的解析模板 |
 | **逐句对照翻译** | 段落翻译支持沉浸式逐句对照显示，原文+译文一一对应 |
 | **领域知识扩展** | 自动识别专业领域（计算机/IVD医疗/金融等），补充深度知识、代码示例 |
-| **个人术语与领域 Profile** | 按需应用本地固定译法，可切换通用、计算机、医疗/IVD、金融与法律领域及三种解析风格 |
+| **计算机领域深化** | 按相关性展示技术机制、算法步骤与复杂度、可复制代码/伪代码、流程和工程权衡 |
+| **IVD 领域深化** | 结构化展示检测原理、明确上下文中的样本与分析物、前中后分析流程、性能指标、干扰、质控和适用边界 |
+| **低门槛个人术语表** | 界面逐条新增或直接粘贴 Excel 两列表格；JSON / TSV 仅作为高级迁移与备份入口 |
 | **Markdown 富文本** | 解析结果中的 **加粗**、`代码`、列表等自动渲染 |
 | **TTS 朗读** | 调用 Windows 语音引擎朗读单词和例句 |
 | **生词库管理** | 支持搜索、筛选、标签、批量操作、导入/导出（CSV/Markdown/Anki） |
@@ -173,6 +189,7 @@ gege-dictionary/
 | [v1.1 开发规格](docs/PRD-v1.1-spec.md) | 下一版五项改动的详细实现要求、事件契约与验收标准 | 想参与开发 |
 | [v1.2 开发规格](docs/PRD-v1.2-spec.md) | schema 迁移、轻量复习、阅读会话与自动更新的实现和验收标准 | 想参与开发 |
 | [v1.3 开发规格](docs/PRD-v1.3-spec.md) | 个人术语表、领域 Profile、解析风格与安全按需 Prompt 注入 | 想参与开发 |
+| [v1.4 开发规格](docs/PRD-v1.4-spec.md) | 计算机 / IVD 结构化专业解析、代码与流程展示、低门槛术语维护 | 想了解领域深化设计 |
 | [发布说明](docs/RELEASE.md) | updater 私钥保管、GitHub Secrets 与签名发布流程 | 版本维护者 |
 
 开发任务已拆解为 [Issues](https://github.com/GeziP/gege-dictionary/issues)，每个都附带验收清单，欢迎认领。
