@@ -5,6 +5,8 @@ import { CaptureSection } from '../components/settings/CaptureSection';
 import { PromptSection } from '../components/settings/PromptSection';
 import { AppearanceSection } from '../components/settings/AppearanceSection';
 import { DataSection } from '../components/settings/DataSection';
+import { ReviewSection } from '../components/settings/ReviewSection';
+import { UpdateSection } from '../components/settings/UpdateSection';
 import { classNames } from '../utils/format';
 
 const TABS = [
@@ -12,6 +14,8 @@ const TABS = [
 { id: 'capture', label: '热键与取词' },
 { id: 'prompt', label: 'Prompt 模板' },
 { id: 'appearance', label: '外观与朗读' },
+{ id: 'review', label: '复习与会话' },
+{ id: 'update', label: '应用更新' },
 { id: 'data', label: '数据与隐私' }];
 
 
@@ -20,14 +24,14 @@ export function Settings() {
 
   return (
     <WindowFrame title="设置">
-      <div className="flex h-10 shrink-0 items-center gap-1 border-b border-line bg-surface px-3">
+      <div className="thin-scroll flex h-10 shrink-0 items-center gap-1 overflow-x-auto border-b border-line bg-surface px-3">
         {TABS.map((item) =>
         <button
           key={item.id}
           type="button"
           onClick={() => setTab(item.id)}
           className={classNames(
-            'relative h-full px-3 text-[12px] transition-colors',
+            'relative h-full shrink-0 whitespace-nowrap px-3 text-[12px] transition-colors',
             tab === item.id ? 'text-accent' : 'text-ink-muted hover:text-ink'
           )}>
           
@@ -48,6 +52,8 @@ export function Settings() {
           {tab === 'capture' ? <CaptureSection /> : null}
           {tab === 'prompt' ? <PromptSection /> : null}
           {tab === 'appearance' ? <AppearanceSection /> : null}
+          {tab === 'review' ? <ReviewSection /> : null}
+          {tab === 'update' ? <UpdateSection /> : null}
           {tab === 'data' ? <DataSection /> : null}
         </div>
       </div>

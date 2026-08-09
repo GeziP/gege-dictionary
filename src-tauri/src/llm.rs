@@ -450,7 +450,9 @@ async fn call_openai_streaming<F: FnMut(&str)>(
         for ch in text.chars() {
             if ch == '\n' {
                 let (delta, finish) = parse_openai_sse_event(&line_buf);
-                if finish.is_some() { finish_reason = finish; }
+                if finish.is_some() {
+                    finish_reason = finish;
+                }
                 if let Some(delta) = delta {
                     full_text.push_str(&delta);
                     on_delta(&delta);
@@ -464,7 +466,9 @@ async fn call_openai_streaming<F: FnMut(&str)>(
     // Process last line
     if !line_buf.is_empty() {
         let (delta, finish) = parse_openai_sse_event(&line_buf);
-        if finish.is_some() { finish_reason = finish; }
+        if finish.is_some() {
+            finish_reason = finish;
+        }
         if let Some(delta) = delta {
             full_text.push_str(&delta);
             on_delta(&delta);
@@ -489,11 +493,15 @@ fn parse_openai_sse_line(line: &str) -> Option<String> {
 
 fn parse_openai_sse_event(line: &str) -> (Option<String>, Option<String>) {
     let line = line.trim_end_matches('\r');
-    let Some(data) = line.strip_prefix("data: ") else { return (None, None); };
+    let Some(data) = line.strip_prefix("data: ") else {
+        return (None, None);
+    };
     if data == "[DONE]" || data.is_empty() {
         return (None, None);
     }
-    let Some(json) = serde_json::from_str::<Value>(data).ok() else { return (None, None); };
+    let Some(json) = serde_json::from_str::<Value>(data).ok() else {
+        return (None, None);
+    };
     let choice = json.get("choices").and_then(|c| c.get(0));
     let delta = choice
         .and_then(|c| c.get("delta"))

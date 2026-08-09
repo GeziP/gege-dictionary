@@ -6,6 +6,7 @@ import {
   MinusIcon,
   MonitorIcon,
   MoonIcon,
+  BrainIcon,
   SettingsIcon,
   SquareIcon,
   SunIcon,
@@ -18,6 +19,7 @@ import { isTauri } from '../../lib/tauri-bridge';
 
 const NAV = [
   { to: '/library', label: '生词库', icon: LibraryBigIcon },
+  { to: '/review', label: '今日回顾', icon: BrainIcon },
   { to: '/settings', label: '设置', icon: SettingsIcon },
 ];
 

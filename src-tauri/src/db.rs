@@ -89,6 +89,14 @@ impl Database {
     }
 
     pub fn initialize(&self) -> Result<(), String> {
+        let existing_database: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='words')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("检查数据库状态失败: {e}"))?;
         self.conn
             .execute_batch(
                 "
@@ -170,12 +178,49 @@ impl Database {
             )
             .map_err(|e| format!("DB init error: {e}"))?;
 
+        if existing_database {
+            crate::migrations::migrate(&self.conn, &self.path)?;
+        } else {
+            crate::migrations::initialize_latest(&self.conn)?;
+        }
+
         self.ensure_default_settings()?;
         self.ensure_default_templates()?;
         Ok(())
     }
 
     fn ensure_default_settings(&self) -> Result<(), String> {
+        let defaults = serde_json::json!({
+            "provider": {
+                "name": "",
+                "protocol": "openai",
+                "baseUrl": "",
+                "apiKey": "",
+                "model": "",
+                "temperature": 0.3,
+                "maxTokens": 1200,
+                "timeoutSeconds": 60
+            },
+            "clipboardWatch": true,
+            "clipboardMode": "smart",
+            "clipboardBlacklist": [],
+            "streamingEnabled": true,
+            "cacheTtlDays": 30,
+            "reviewLimit": 20,
+            "includeLongFormReview": false,
+            "sessionGapMinutes": 30,
+            "autoCheckUpdates": true,
+            "skippedUpdateVersion": "",
+            "theme": "system",
+            "cardScale": "default",
+            "captureContext": true,
+            "launchAtLogin": false,
+            "dataDir": self.path.replace("gege.db", ""),
+            "autoBackup": true,
+            "anonymousStats": false,
+            "ttsVoice": "Microsoft Zira",
+            "ttsRate": 1.0
+        });
         let count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM settings WHERE key='app'", [], |row| {
@@ -184,38 +229,22 @@ impl Database {
             .map_err(|e| e.to_string())?;
 
         if count == 0 {
-            let defaults = serde_json::json!({
-                "provider": {
-                    "name": "",
-                    "protocol": "openai",
-                    "baseUrl": "",
-                    "apiKey": "",
-                    "model": "",
-                    "temperature": 0.3,
-                    "maxTokens": 1200,
-                    "timeoutSeconds": 60
-                },
-                "clipboardWatch": true,
-                "clipboardMode": "smart",
-                "clipboardBlacklist": [],
-                "streamingEnabled": true,
-                "cacheTtlDays": 30,
-                "theme": "system",
-                "cardScale": "default",
-                "captureContext": true,
-                "launchAtLogin": false,
-                "dataDir": self.path.replace("gege.db", ""),
-                "autoBackup": true,
-                "anonymousStats": false,
-                "ttsVoice": "Microsoft Zira",
-                "ttsRate": 1.0
-            });
             self.conn
                 .execute(
                     "INSERT INTO settings (key, value) VALUES ('app', ?1)",
                     params![defaults.to_string()],
                 )
                 .map_err(|e| e.to_string())?;
+        } else {
+            let mut settings = self.get_settings()?;
+            if let (Some(current), Some(default_values)) =
+                (settings.as_object_mut(), defaults.as_object())
+            {
+                for (key, value) in default_values {
+                    current.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
+            self.save_settings(&settings)?;
         }
         Ok(())
     }
@@ -429,8 +458,14 @@ impl Database {
 
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO words (id, lemma, translation, pos, context_meaning, explanation, source_app, source_title, mastery, kind, saved_at, updated_at, lookups, data)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                "INSERT INTO words (id, lemma, translation, pos, context_meaning, explanation, source_app, source_title, mastery, kind, saved_at, updated_at, lookups, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 ON CONFLICT(id) DO UPDATE SET
+                   lemma=excluded.lemma, translation=excluded.translation, pos=excluded.pos,
+                   context_meaning=excluded.context_meaning, explanation=excluded.explanation,
+                   source_app=excluded.source_app, source_title=excluded.source_title,
+                   mastery=excluded.mastery, kind=excluded.kind, updated_at=excluded.updated_at,
+                   lookups=excluded.lookups, data=excluded.data",
                 params![
                     id,
                     lemma,
@@ -467,7 +502,390 @@ impl Database {
             }
         }
 
+        let include_long_form = self
+            .get_settings()
+            .ok()
+            .and_then(|settings| {
+                settings
+                    .get("includeLongFormReview")
+                    .and_then(|value| value.as_bool())
+            })
+            .unwrap_or(false);
+        if matches!(kind, "word" | "phrase") || include_long_form {
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO review_state (word_id, box, due_at, created_at)
+                     VALUES (?1, 1, date('now', 'localtime', '+1 day'), datetime('now'))",
+                    params![id],
+                )
+                .map_err(|e| format!("创建复习记录失败: {e}"))?;
+        }
+
         Ok(())
+    }
+
+    pub fn get_review_queue(&self, limit: Option<u32>) -> Result<Vec<Value>, String> {
+        let requested = limit.unwrap_or_else(|| {
+            self.get_settings()
+                .ok()
+                .and_then(|settings| settings.get("reviewLimit").and_then(|v| v.as_u64()))
+                .unwrap_or(20) as u32
+        });
+        let sql = if requested == 0 {
+            "SELECT w.data, r.word_id, r.box, r.due_at, r.last_result,
+                    r.correct_count, r.wrong_count, r.reviewed_at
+             FROM review_state r JOIN words w ON w.id = r.word_id
+             WHERE date(r.due_at) <= date('now', 'localtime')
+             ORDER BY date(r.due_at) ASC, r.box ASC, datetime(w.saved_at) ASC"
+                .to_string()
+        } else {
+            format!(
+                "SELECT w.data, r.word_id, r.box, r.due_at, r.last_result,
+                        r.correct_count, r.wrong_count, r.reviewed_at
+                 FROM review_state r JOIN words w ON w.id = r.word_id
+                 WHERE date(r.due_at) <= date('now', 'localtime')
+                 ORDER BY date(r.due_at) ASC, r.box ASC, datetime(w.saved_at) ASC LIMIT {}",
+                requested
+            )
+        };
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    serde_json::json!({
+                        "wordId": row.get::<_, String>(1)?,
+                        "box": row.get::<_, i64>(2)?,
+                        "dueAt": row.get::<_, String>(3)?,
+                        "lastResult": row.get::<_, Option<String>>(4)?,
+                        "correctCount": row.get::<_, i64>(5)?,
+                        "wrongCount": row.get::<_, i64>(6)?,
+                        "reviewedAt": row.get::<_, Option<String>>(7)?,
+                    }),
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut queue = Vec::new();
+        for row in rows {
+            let (raw, state) = row.map_err(|e| e.to_string())?;
+            let mut word: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            if let Some(object) = word.as_object_mut() {
+                object.insert("reviewState".into(), state);
+            }
+            queue.push(word);
+        }
+        Ok(queue)
+    }
+
+    pub fn submit_review(&self, word_id: &str, correct: bool) -> Result<Value, String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let (current_box, correct_count, wrong_count): (i64, i64, i64) = tx
+            .query_row(
+                "SELECT box, correct_count, wrong_count FROM review_state WHERE word_id=?1",
+                params![word_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|e| format!("复习记录不存在: {e}"))?;
+        let next_box = if correct { (current_box + 1).min(3) } else { 1 };
+        let days = match next_box {
+            1 => 1,
+            2 => 3,
+            _ => 7,
+        };
+        let mastery = match next_box {
+            1 => "new",
+            2 => "learning",
+            _ => "mastered",
+        };
+        let result = if correct { "correct" } else { "wrong" };
+        tx.execute(
+            "UPDATE review_state SET box=?2, due_at=date('now','localtime',?3),
+                    last_result=?4, correct_count=?5, wrong_count=?6,
+                    reviewed_at=datetime('now','localtime') WHERE word_id=?1",
+            params![
+                word_id,
+                next_box,
+                format!("+{days} days"),
+                result,
+                correct_count + i64::from(correct),
+                wrong_count + i64::from(!correct)
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        let raw: String = tx
+            .query_row(
+                "SELECT data FROM words WHERE id=?1",
+                params![word_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("生词已被删除: {e}"))?;
+        let mut word: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        if let Some(object) = word.as_object_mut() {
+            object.insert("mastery".into(), Value::String(mastery.into()));
+        }
+        tx.execute(
+            "UPDATE words SET mastery=?2, data=?3, updated_at=datetime('now') WHERE id=?1",
+            params![word_id, mastery, word.to_string()],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
+            "wordId": word_id,
+            "box": next_box,
+            "dueAt": chrono::Local::now()
+                .date_naive()
+                .checked_add_days(chrono::Days::new(days as u64))
+                .map(|date| date.format("%Y-%m-%d").to_string()),
+            "lastResult": result,
+            "correctCount": correct_count + i64::from(correct),
+            "wrongCount": wrong_count + i64::from(!correct),
+            "previousBox": current_box,
+        }))
+    }
+
+    pub fn get_review_stats(&self) -> Result<Value, String> {
+        let due: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM review_state WHERE date(due_at) <= date('now','localtime')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let mut boxes = [0_i64; 3];
+        let mut stmt = self
+            .conn
+            .prepare("SELECT box, COUNT(*) FROM review_state GROUP BY box")
+            .map_err(|e| e.to_string())?;
+        for row in stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, usize>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+        {
+            let (box_no, count) = row.map_err(|e| e.to_string())?;
+            if (1..=3).contains(&box_no) {
+                boxes[box_no - 1] = count;
+            }
+        }
+        let next_due: Option<String> = self.conn.query_row(
+            "SELECT MIN(date(due_at)) FROM review_state WHERE date(due_at) > date('now','localtime')",
+            [], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
+            "dueCount": due,
+            "boxCounts": boxes,
+            "nextDueAt": next_due,
+            "total": boxes.iter().sum::<i64>(),
+        }))
+    }
+
+    pub fn reset_review_state(&self, word_id: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO review_state (word_id, box, due_at, created_at)
+             VALUES (?1,1,date('now','localtime','+1 day'),datetime('now'))
+             ON CONFLICT(word_id) DO UPDATE SET box=1,due_at=excluded.due_at,last_result=NULL,
+               correct_count=0,wrong_count=0,reviewed_at=NULL",
+                params![word_id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn add_words_to_review(&self, ids: &[String]) -> Result<u32, String> {
+        let mut count = 0;
+        for id in ids {
+            count += self
+                .conn
+                .execute(
+                    "INSERT OR IGNORE INTO review_state (word_id,box,due_at,created_at)
+                 SELECT id,1,date('now','localtime'),datetime('now') FROM words WHERE id=?1",
+                    params![id],
+                )
+                .map_err(|e| e.to_string())? as u32;
+        }
+        Ok(count)
+    }
+
+    fn reading_sessions(&self, gap_minutes: u32) -> Result<Vec<Value>, String> {
+        let gap_seconds = i64::from(gap_minutes.clamp(1, 24 * 60)) * 60;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, source_app, source_title, saved_at, data
+             FROM words ORDER BY datetime(saved_at) ASC, rowid ASC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut sessions: Vec<Value> = Vec::new();
+        let mut current_ids: Vec<String> = Vec::new();
+        let mut current_preview: Vec<String> = Vec::new();
+        let mut current_source = String::new();
+        let mut current_title = String::new();
+        let mut current_start = String::new();
+        let mut current_end = String::new();
+        let mut previous_ts: Option<i64> = None;
+
+        let flush = |sessions: &mut Vec<Value>,
+                     ids: &mut Vec<String>,
+                     preview: &mut Vec<String>,
+                     source: &str,
+                     title: &str,
+                     start: &str,
+                     end: &str| {
+            if ids.is_empty() {
+                return;
+            }
+            sessions.push(serde_json::json!({
+                "id": format!("session:{}", ids[0]),
+                "sourceApp": source,
+                "sourceTitle": title,
+                "startAt": start,
+                "endAt": end,
+                "wordCount": ids.len(),
+                "preview": preview,
+                "wordIds": ids,
+            }));
+            ids.clear();
+            preview.clear();
+        };
+
+        for row in rows {
+            let (id, source, title, saved_at, raw) = row.map_err(|e| e.to_string())?;
+            let timestamp = chrono::DateTime::parse_from_rfc3339(&saved_at)
+                .map(|dt| dt.timestamp())
+                .or_else(|_| {
+                    chrono::NaiveDateTime::parse_from_str(&saved_at, "%Y-%m-%d %H:%M:%S")
+                        .map(|dt| dt.and_utc().timestamp())
+                })
+                .unwrap_or(0);
+            let split = !current_ids.is_empty()
+                && (source != current_source
+                    || previous_ts.is_some_and(|previous| timestamp - previous >= gap_seconds));
+            if split {
+                flush(
+                    &mut sessions,
+                    &mut current_ids,
+                    &mut current_preview,
+                    &current_source,
+                    &current_title,
+                    &current_start,
+                    &current_end,
+                );
+            }
+            if current_ids.is_empty() {
+                current_source = source.clone();
+                current_title = title.clone();
+                current_start = saved_at.clone();
+            }
+            current_end = saved_at;
+            current_ids.push(id);
+            if current_preview.len() < 5 {
+                let word: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+                current_preview.push(
+                    word.get("lemma")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("—")
+                        .to_string(),
+                );
+            }
+            previous_ts = Some(timestamp);
+        }
+        flush(
+            &mut sessions,
+            &mut current_ids,
+            &mut current_preview,
+            &current_source,
+            &current_title,
+            &current_start,
+            &current_end,
+        );
+        sessions.reverse();
+        Ok(sessions)
+    }
+
+    pub fn get_reading_sessions(
+        &self,
+        gap_minutes: u32,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<Value>, String> {
+        let sessions = self.reading_sessions(gap_minutes)?;
+        Ok(sessions
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit.clamp(1, 200) as usize)
+            .collect())
+    }
+
+    fn session_word_ids(&self, session_id: &str) -> Result<Vec<String>, String> {
+        let gap = self
+            .get_settings()?
+            .get("sessionGapMinutes")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(30) as u32;
+        self.reading_sessions(gap)?
+            .into_iter()
+            .find(|session| session.get("id").and_then(|v| v.as_str()) == Some(session_id))
+            .and_then(|session| session.get("wordIds").and_then(|v| v.as_array()).cloned())
+            .map(|ids| {
+                ids.into_iter()
+                    .filter_map(|id| id.as_str().map(str::to_string))
+                    .collect()
+            })
+            .ok_or_else(|| "阅读会话不存在或已因设置变更重新分组".to_string())
+    }
+
+    pub fn get_session_words(&self, session_id: &str) -> Result<Vec<Value>, String> {
+        let ids = self.session_word_ids(session_id)?;
+        self.get_words_by_ids(&ids)
+    }
+
+    pub fn tag_session(&self, session_id: &str, tags: &[String]) -> Result<u32, String> {
+        let ids = self.session_word_ids(session_id)?;
+        for id in &ids {
+            let raw: String = self
+                .conn
+                .query_row("SELECT data FROM words WHERE id=?1", params![id], |row| {
+                    row.get(0)
+                })
+                .map_err(|e| e.to_string())?;
+            let mut word: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            let mut merged = word
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for tag in tags {
+                if !merged.iter().any(|value| value.as_str() == Some(tag)) {
+                    merged.push(Value::String(tag.clone()));
+                }
+            }
+            word.as_object_mut()
+                .map(|object| object.insert("tags".into(), Value::Array(merged)));
+            self.save_word(&word)?;
+        }
+        Ok(ids.len() as u32)
+    }
+
+    pub fn add_session_to_review(&self, session_id: &str) -> Result<u32, String> {
+        let ids = self.session_word_ids(session_id)?;
+        self.add_words_to_review(&ids)
     }
 
     pub fn update_word(&self, id: &str, patch: &Value) -> Result<(), String> {
@@ -1038,5 +1456,247 @@ mod tests {
         assert!(db.get_cache("old", 30).unwrap().is_none());
         assert!(db.get_cache("old", 0).unwrap().is_some());
         assert_eq!(db.clear_cache().unwrap(), 1);
+    }
+
+    #[test]
+    fn existing_settings_receive_new_defaults() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        db.save_settings(&serde_json::json!({"provider": {"apiKey": ""}, "theme": "dark"}))
+            .unwrap();
+        db.initialize().unwrap();
+        let settings = db.get_settings().unwrap();
+        assert_eq!(settings["theme"], "dark");
+        assert_eq!(settings["reviewLimit"], 20);
+        assert_eq!(settings["sessionGapMinutes"], 30);
+        assert_eq!(settings["autoCheckUpdates"], true);
+    }
+
+    fn sample_word(id: &str, source: &str, saved_at: &str) -> Value {
+        serde_json::json!({
+            "id": id,
+            "selection": id,
+            "lemma": id,
+            "translation": format!("{id}-中文"),
+            "pos": "n.",
+            "contextMeaning": "test",
+            "explanation": "test",
+            "sourceApp": source,
+            "sourceTitle": "Document",
+            "kind": "word",
+            "savedAt": saved_at,
+            "mastery": "new",
+            "lookups": 1,
+            "tags": [],
+            "examples": [],
+            "associations": [],
+            "senses": [],
+            "collocations": [],
+            "context": "",
+            "note": "",
+            "ipaUS": "",
+            "ipaUK": "",
+            "register": "neutral"
+        })
+    }
+
+    #[test]
+    fn review_state_survives_word_upsert_and_transitions() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        let mut word = sample_word("alpha", "Reader", "2026-08-01T10:00:00+08:00");
+        db.save_word(&word).unwrap();
+        db.conn
+            .execute(
+                "UPDATE review_state SET due_at=date('now','localtime') WHERE word_id='alpha'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.get_review_queue(Some(20)).unwrap().len(), 1);
+
+        word["translation"] = Value::String("已编辑".into());
+        db.save_word(&word).unwrap();
+        let state = db.submit_review("alpha", true).unwrap();
+        assert_eq!(state["box"], 2);
+        assert_eq!(state["lastResult"], "correct");
+        db.conn
+            .execute(
+                "UPDATE review_state SET due_at=date('now','localtime') WHERE word_id='alpha'",
+                [],
+            )
+            .unwrap();
+        let state = db.submit_review("alpha", false).unwrap();
+        assert_eq!(state["box"], 1);
+        let mastery: String = db
+            .conn
+            .query_row("SELECT mastery FROM words WHERE id='alpha'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(mastery, "new");
+    }
+
+    #[test]
+    fn review_queue_priority_box_three_and_long_form_setting_work() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        for id in ["old", "box-one", "box-two"] {
+            db.save_word(&sample_word(id, "Reader", "2026-08-01T10:00:00+08:00"))
+                .unwrap();
+        }
+        db.conn
+            .execute(
+                "UPDATE review_state SET due_at=date('now','-2 day'),box=3 WHERE word_id='old'",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE review_state SET due_at=date('now'),box=1 WHERE word_id='box-one'",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE review_state SET due_at=date('now'),box=2 WHERE word_id='box-two'",
+                [],
+            )
+            .unwrap();
+        let queue = db.get_review_queue(Some(10)).unwrap();
+        let ids = queue
+            .iter()
+            .filter_map(|word| word.get("id").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["old", "box-one", "box-two"]);
+        let state = db.submit_review("old", true).unwrap();
+        assert_eq!(state["box"], 3);
+
+        let mut paragraph = sample_word("paragraph-off", "Reader", "2026-08-01T12:00:00+08:00");
+        paragraph["kind"] = Value::String("paragraph".into());
+        db.save_word(&paragraph).unwrap();
+        let off: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM review_state WHERE word_id='paragraph-off'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(off, 0);
+        let mut settings = db.get_settings().unwrap();
+        settings["includeLongFormReview"] = Value::Bool(true);
+        db.save_settings(&settings).unwrap();
+        paragraph["id"] = Value::String("paragraph-on".into());
+        db.save_word(&paragraph).unwrap();
+        let on: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM review_state WHERE word_id='paragraph-on'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(on, 1);
+    }
+
+    #[test]
+    fn deleting_word_cascades_review_state() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        db.save_word(&sample_word("gone", "Reader", "2026-08-01T10:00:00+08:00"))
+            .unwrap();
+        db.delete_words(&["gone".into()]).unwrap();
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM review_state WHERE word_id='gone'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn reading_sessions_split_by_gap_and_source() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        for word in [
+            sample_word("a", "Reader", "2026-08-01T10:00:00+08:00"),
+            sample_word("b", "Reader", "2026-08-01T10:20:00+08:00"),
+            sample_word("c", "Reader", "2026-08-01T11:00:00+08:00"),
+            sample_word("d", "Browser", "2026-08-01T11:05:00+08:00"),
+        ] {
+            db.save_word(&word).unwrap();
+        }
+        let sessions = db.get_reading_sessions(30, 20, 0).unwrap();
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(sessions[2]["wordCount"], 2);
+        assert_eq!(sessions[0]["sourceApp"], "Browser");
+
+        let reader_session = sessions[2]["id"].as_str().unwrap();
+        assert_eq!(db.get_session_words(reader_session).unwrap().len(), 2);
+        assert_eq!(db.get_reading_sessions(30, 1, 1).unwrap().len(), 1);
+        assert_eq!(
+            db.tag_session(reader_session, &["project-a".into()])
+                .unwrap(),
+            2
+        );
+        let tagged = db.get_session_words(reader_session).unwrap();
+        assert!(tagged.iter().all(|word| word["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tag| tag == "project-a")));
+        assert!(export_words(&tagged, "markdown").unwrap().contains("## a"));
+        db.conn
+            .execute("DELETE FROM review_state WHERE word_id IN ('a','b')", [])
+            .unwrap();
+        assert_eq!(db.add_session_to_review(reader_session).unwrap(), 2);
+    }
+
+    #[test]
+    fn ten_thousand_words_meet_queue_and_session_budgets() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        let tx = db.conn.unchecked_transaction().unwrap();
+        {
+            let mut insert_word = tx
+                .prepare(
+                    "INSERT INTO words (id,lemma,translation,pos,context_meaning,explanation,
+                 source_app,source_title,mastery,kind,saved_at,updated_at,lookups,data)
+                 VALUES (?1,?1,'','','','','Reader','Document','new','word',?2,?2,1,?3)",
+                )
+                .unwrap();
+            let mut insert_review = tx
+                .prepare(
+                    "INSERT INTO review_state (word_id,box,due_at,created_at)
+                 VALUES (?1,1,date('now','localtime'),datetime('now'))",
+                )
+                .unwrap();
+            let base = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+08:00").unwrap();
+            for index in 0..10_000 {
+                let id = format!("perf-{index}");
+                let saved = (base + chrono::Duration::minutes(index)).to_rfc3339();
+                let data = serde_json::json!({"id": id, "lemma": id}).to_string();
+                insert_word.execute(params![id, saved, data]).unwrap();
+                insert_review.execute(params![id]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        let queue_started = std::time::Instant::now();
+        assert_eq!(db.get_review_queue(Some(20)).unwrap().len(), 20);
+        assert!(
+            queue_started.elapsed().as_millis() < 200,
+            "review queue exceeded 200ms"
+        );
+
+        let sessions_started = std::time::Instant::now();
+        assert!(!db.get_reading_sessions(30, 50, 0).unwrap().is_empty());
+        assert!(
+            sessions_started.elapsed().as_millis() < 500,
+            "session aggregation exceeded 500ms"
+        );
     }
 }

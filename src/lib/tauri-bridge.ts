@@ -2,6 +2,9 @@ import type {
   AppSettings,
   Entry,
   PromptTemplate,
+  ReadingSession,
+  ReviewState,
+  ReviewStats,
   SavedWord,
 } from '../types/lexnote';
 import { emit as tauriEmit, listen as tauriListen } from '@tauri-apps/api/event';
@@ -53,6 +56,46 @@ export async function updateWord(id: string, patch: Partial<SavedWord>): Promise
 
 export async function deleteWords(ids: string[]): Promise<void> {
   return invoke('delete_words', { ids });
+}
+
+export async function getReviewQueue(limit?: number): Promise<SavedWord[]> {
+  return invoke<SavedWord[]>('get_review_queue', { limit });
+}
+
+export async function submitReview(wordId: string, correct: boolean): Promise<ReviewState> {
+  return invoke<ReviewState>('submit_review', { wordId, correct });
+}
+
+export async function getReviewStats(): Promise<ReviewStats> {
+  return invoke<ReviewStats>('get_review_stats');
+}
+
+export async function resetReviewState(wordId: string): Promise<void> {
+  return invoke('reset_review_state', { wordId });
+}
+
+export async function addWordsToReview(ids: string[]): Promise<number> {
+  return invoke<number>('add_words_to_review', { ids });
+}
+
+export async function getReadingSessions(
+  gapMinutes: number,
+  limit = 50,
+  offset = 0,
+): Promise<ReadingSession[]> {
+  return invoke<ReadingSession[]>('get_reading_sessions', { gapMinutes, limit, offset });
+}
+
+export async function getSessionWords(sessionId: string): Promise<SavedWord[]> {
+  return invoke<SavedWord[]>('get_session_words', { sessionId });
+}
+
+export async function tagSession(sessionId: string, tags: string[]): Promise<number> {
+  return invoke<number>('tag_session', { sessionId, tags });
+}
+
+export async function addSessionToReview(sessionId: string): Promise<number> {
+  return invoke<number>('add_session_to_review', { sessionId });
 }
 
 export async function getAllTags(): Promise<string[]> {

@@ -4,6 +4,7 @@ mod db;
 #[cfg(windows)]
 mod dpapi;
 mod llm;
+mod migrations;
 mod tts;
 
 use sha2::{Digest, Sha256};
@@ -157,6 +158,88 @@ async fn update_word(
 async fn delete_words(state: tauri::State<'_, AppState>, ids: Vec<String>) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.delete_words(&ids)
+}
+
+#[tauri::command]
+async fn get_review_queue(
+    state: tauri::State<'_, AppState>,
+    limit: Option<u32>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.get_review_queue(limit)
+}
+
+#[tauri::command]
+async fn submit_review(
+    state: tauri::State<'_, AppState>,
+    word_id: String,
+    correct: bool,
+) -> Result<serde_json::Value, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.submit_review(&word_id, correct)
+}
+
+#[tauri::command]
+async fn get_review_stats(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.get_review_stats()
+}
+
+#[tauri::command]
+async fn reset_review_state(
+    state: tauri::State<'_, AppState>,
+    word_id: String,
+) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.reset_review_state(&word_id)
+}
+
+#[tauri::command]
+async fn add_words_to_review(
+    state: tauri::State<'_, AppState>,
+    ids: Vec<String>,
+) -> Result<u32, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.add_words_to_review(&ids)
+}
+
+#[tauri::command]
+async fn get_reading_sessions(
+    state: tauri::State<'_, AppState>,
+    gap_minutes: u32,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<serde_json::Value>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.get_reading_sessions(gap_minutes, limit, offset)
+}
+
+#[tauri::command]
+async fn get_session_words(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.get_session_words(&session_id)
+}
+
+#[tauri::command]
+async fn tag_session(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    tags: Vec<String>,
+) -> Result<u32, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.tag_session(&session_id, &tags)
+}
+
+#[tauri::command]
+async fn add_session_to_review(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<u32, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.add_session_to_review(&session_id)
 }
 
 #[tauri::command]
@@ -1123,6 +1206,7 @@ pub fn run() {
     let clipboard_enabled = Arc::new(AtomicBool::new(clipboard_watch_enabled));
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState {
             db: Mutex::new(database),
             last_capture: Mutex::new(None),
@@ -1135,6 +1219,15 @@ pub fn run() {
             save_word,
             update_word,
             delete_words,
+            get_review_queue,
+            submit_review,
+            get_review_stats,
+            reset_review_state,
+            add_words_to_review,
+            get_reading_sessions,
+            get_session_words,
+            tag_session,
+            add_session_to_review,
             get_all_tags,
             get_settings,
             save_settings,
@@ -1185,8 +1278,14 @@ mod tests {
 
     #[test]
     fn cache_normalization_preserves_sentence_case() {
-        assert_eq!(normalize_selection("  Hello\n  World  ", "word"), "hello world");
-        assert_eq!(normalize_selection("  Hello\n  World  ", "sentence"), "Hello World");
+        assert_eq!(
+            normalize_selection("  Hello\n  World  ", "word"),
+            "hello world"
+        );
+        assert_eq!(
+            normalize_selection("  Hello\n  World  ", "sentence"),
+            "Hello World"
+        );
     }
 
     #[cfg(windows)]

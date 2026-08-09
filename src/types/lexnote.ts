@@ -2,7 +2,7 @@ export type SelectionKind = 'word' | 'phrase' | 'sentence' | 'paragraph';
 
 export type Register = 'formal' | 'neutral' | 'spoken' | 'slang' | 'technical';
 
-export type Mastery = 'new' | 'familiar' | 'mastered';
+export type Mastery = 'new' | 'learning' | 'familiar' | 'mastered';
 
 export type CaptureMethod = 'uia' | 'clipboard' | 'manual';
 
@@ -68,6 +68,36 @@ export interface SavedWord extends Entry {
   mastery: Mastery;
   lookups: number;
   note: string;
+  reviewState?: ReviewState;
+}
+
+export interface ReviewState {
+  wordId: string;
+  box: 1 | 2 | 3;
+  dueAt: string;
+  lastResult?: 'correct' | 'wrong' | null;
+  correctCount: number;
+  wrongCount: number;
+  reviewedAt?: string | null;
+  previousBox?: number;
+}
+
+export interface ReviewStats {
+  dueCount: number;
+  boxCounts: [number, number, number];
+  nextDueAt?: string | null;
+  total: number;
+}
+
+export interface ReadingSession {
+  id: string;
+  sourceApp: string;
+  sourceTitle: string;
+  startAt: string;
+  endAt: string;
+  wordCount: number;
+  preview: string[];
+  wordIds: string[];
 }
 
 export interface LookupRequest {
@@ -110,6 +140,11 @@ export interface AppSettings {
   clipboardBlacklist?: string[];
   streamingEnabled?: boolean;
   cacheTtlDays?: 0 | 7 | 30 | 90;
+  reviewLimit?: 0 | 10 | 20 | 50;
+  includeLongFormReview?: boolean;
+  sessionGapMinutes?: 15 | 30 | 60;
+  autoCheckUpdates?: boolean;
+  skippedUpdateVersion?: string;
   apiKeyError?: string;
   theme: 'light' | 'dark' | 'system';
   cardScale: 'compact' | 'default' | 'large';

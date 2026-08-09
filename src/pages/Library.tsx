@@ -13,6 +13,8 @@ import { ImportDialog } from '../components/library/ImportDialog';
 import { Toast, type ToastMessage } from '../components/ui/Toast';
 import type { Mastery } from '../types/lexnote';
 import { classNames } from '../utils/format';
+import { ReviewOverview } from '../components/review/ReviewOverview';
+import { ReadingSessions } from '../components/library/ReadingSessions';
 
 export function Library() {
   const { words, removeWords, tagWords, refreshWords, settings, updateSettings } = useLexNote();
@@ -29,6 +31,7 @@ export function Library() {
   const [importOpen, setImportOpen] = useState(false);
   const [batchTag, setBatchTag] = useState('');
   const [toast, setToast] = useState<ToastMessage | null>(null);
+  const [viewMode, setViewMode] = useState<'words' | 'sessions'>('words');
   const toastId = useRef(0);
 
   useEffect(() => {
@@ -92,6 +95,11 @@ export function Library() {
 
   return (
     <WindowFrame title="生词库">
+      <div className="flex h-10 shrink-0 items-center gap-1 border-b border-line bg-surface px-3">
+        <button type="button" onClick={() => setViewMode('words')} className={classNames('h-full border-b-2 px-3 text-xs', viewMode === 'words' ? 'border-accent text-accent' : 'border-transparent text-ink-muted')}>词条</button>
+        <button type="button" onClick={() => setViewMode('sessions')} className={classNames('h-full border-b-2 px-3 text-xs', viewMode === 'sessions' ? 'border-accent text-accent' : 'border-transparent text-ink-muted')}>会话</button>
+      </div>
+      {viewMode === 'words' ? (
       <div className="relative flex min-h-0 flex-1">
         <FilterPanel
           words={words}
@@ -112,6 +120,7 @@ export function Library() {
         
 
         <div className="flex min-w-0 flex-1 flex-col">
+          <ReviewOverview />
           <LibraryToolbar
             query={query}
             onQueryChange={setQuery}
@@ -190,6 +199,7 @@ export function Library() {
 
         <Toast message={toast} />
       </div>
+      ) : <ReadingSessions />}
     </WindowFrame>);
 
 }

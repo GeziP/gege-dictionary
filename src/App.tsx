@@ -5,6 +5,8 @@ import { Library } from './pages/Library';
 import { Settings } from './pages/Settings';
 import { Onboarding } from './pages/Onboarding';
 import { Lookup } from './pages/Lookup';
+import { Review } from './pages/Review';
+import { UpdateBanner } from './components/updater/UpdateBanner';
 
 function MainRouter() {
   const { onboarded, initState } = useLexNote();
@@ -37,6 +39,7 @@ function MainRouter() {
       <Route path="/" element={<Navigate to="/library" replace />} />
       <Route path="/library" element={<Library />} />
       <Route path="/settings" element={<Settings />} />
+      <Route path="/review" element={<Review />} />
       <Route path="/onboarding" element={<Navigate to="/library" replace />} />
       <Route path="/lookup" element={<Lookup />} />
       <Route path="*" element={<Navigate to="/library" replace />} />
@@ -49,6 +52,7 @@ export function App() {
     <LexNoteProvider>
       <BrowserRouter>
         <div className="h-full w-full bg-canvas text-ink">
+          <UpdateBanner />
           <MainRouter />
         </div>
       </BrowserRouter>

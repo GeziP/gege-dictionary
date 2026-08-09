@@ -28,6 +28,11 @@ const DEFAULT_SETTINGS: AppSettings = {
   clipboardBlacklist: [],
   streamingEnabled: true,
   cacheTtlDays: 30,
+  reviewLimit: 20,
+  includeLongFormReview: false,
+  sessionGapMinutes: 30,
+  autoCheckUpdates: true,
+  skippedUpdateVersion: '',
 };
 
 interface Usage {

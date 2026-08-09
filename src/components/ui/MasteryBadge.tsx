@@ -7,10 +7,11 @@ import type { Mastery } from '../../types/lexnote';
 export const MASTERY_META: Record<Mastery, { label: string; icon: typeof CircleDashedIcon; tone: string }> = {
   new: { label: '新词', icon: CircleDashedIcon, tone: 'text-danger' },
   familiar: { label: '熟悉', icon: CircleDotIcon, tone: 'text-warn' },
+  learning: { label: '巩固中', icon: CircleDotIcon, tone: 'text-warn' },
   mastered: { label: '已掌握', icon: CheckCircle2Icon, tone: 'text-positive' },
 };
 
-export const MASTERY_ORDER: Mastery[] = ['new', 'familiar', 'mastered'];
+export const MASTERY_ORDER: Mastery[] = ['new', 'learning', 'mastered'];
 
 interface MasteryBadgeProps {
   mastery: Mastery;
