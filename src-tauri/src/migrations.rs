@@ -119,10 +119,22 @@ fn create_premigration_backup(db_path: &str, from_version: i64) -> Result<PathBu
     }
     let db_path = Path::new(db_path);
     let dir = db_path.parent().ok_or("无法定位数据库目录")?;
-    let stamp = Local::now().format("%Y%m%d-%H%M%S");
-    let backup = dir.join(format!("gege-premigrate-v{from_version}-{stamp}.db"));
-    std::fs::copy(db_path, &backup)
-        .map_err(|e| format!("创建迁移前备份失败（{}）: {e}", backup.display()))?;
+    let stamp = Local::now().format("%Y%m%d-%H%M%S-%3f");
+    let mut backup = dir.join(format!("gege-premigrate-v{from_version}-{stamp}.db"));
+    let mut suffix = 1_u32;
+    while backup.exists() {
+        backup = dir.join(format!(
+            "gege-premigrate-v{from_version}-{stamp}-{suffix:03}.db"
+        ));
+        suffix += 1;
+    }
+    crate::db::snapshot_connection(
+        &Connection::open(db_path)
+            .map_err(|e| format!("打开迁移前数据库失败（{}）: {e}", db_path.display()))?,
+        &backup,
+        false,
+    )
+    .map_err(|e| format!("创建迁移前备份失败（{}）: {e}", backup.display()))?;
     prune_premigration_backups(dir)?;
     Ok(backup)
 }

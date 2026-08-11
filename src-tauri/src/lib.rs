@@ -7,8 +7,10 @@ mod glossary;
 mod llm;
 mod migrations;
 mod tts;
+mod word_import;
 
 use sha2::{Digest, Sha256};
+use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,14 +18,15 @@ use tauri::{
     image::Image,
     menu::{CheckMenuItem, Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Manager,
+    AppHandle, Emitter, Manager,
 };
 
 pub struct AppState {
     pub db: Mutex<db::Database>,
     pub last_capture: Mutex<Option<serde_json::Value>>,
     pub clipboard_enabled: Arc<AtomicBool>,
-    pub last_looked_up: Mutex<String>,
+    pub last_looked_up: Mutex<Option<clipboard_watcher::ClipboardFingerprint>>,
+    pub startup_warnings: Mutex<Vec<db::StartupWarning>>,
 }
 
 fn normalize_selection(selection: &str, kind: &str) -> String {
@@ -62,6 +65,10 @@ fn lookup_cache_key(
     let mut hasher = Sha256::new();
     hasher.update(raw.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn should_fallback_stream(saw_content: bool) -> bool {
+    !saw_content
 }
 
 #[cfg(windows)]
@@ -468,6 +475,25 @@ async fn import_glossary(
 ) -> Result<serde_json::Value, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.import_glossary(&content, &format, &conflict_policy)
+}
+
+#[tauri::command]
+async fn preview_word_import(
+    content: String,
+    format: String,
+) -> Result<word_import::WordImportPreview, String> {
+    word_import::preview_word_import(&content, &format)
+}
+
+#[tauri::command]
+async fn import_words(
+    state: tauri::State<'_, AppState>,
+    content: String,
+    format: String,
+    mapping: std::collections::HashMap<String, String>,
+) -> Result<word_import::WordImportResult, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.import_words(&content, &format, &mapping)
 }
 
 #[tauri::command]
@@ -910,6 +936,7 @@ async fn lookup_word_stream(
     let rid = request_id.clone();
     let app_clone = app.clone();
     let mut extractor = llm::IncrementalJsonExtractor::new();
+    let mut saw_stream_content = false;
 
     let result = llm::stream_lookup_sse(
         &base_url,
@@ -924,6 +951,9 @@ async fn lookup_word_stream(
         &kind,
         &template_body,
         |delta| {
+            if !delta.is_empty() {
+                saw_stream_content = true;
+            }
             for (field, value) in extractor.push(delta) {
                 let _ = app_clone.emit(
                     "lookup://delta",
@@ -981,6 +1011,59 @@ async fn lookup_word_stream(
         },
         Err(e) => {
             eprintln!("[lookup_stream] SSE failed: {e}");
+            if should_fallback_stream(saw_stream_content) {
+                eprintln!("[lookup_stream] falling back to one non-streaming request");
+                match llm::stream_lookup(
+                    &base_url,
+                    &api_key,
+                    &model,
+                    &protocol,
+                    temperature,
+                    max_tokens,
+                    timeout_secs,
+                    &selection,
+                    &context,
+                    &kind,
+                    &template_body,
+                )
+                .await
+                {
+                    Ok(full_text) => match llm::parse_entry(&full_text, &selection, &kind) {
+                        Ok(mut entry) => {
+                            if let Some(obj) = entry.as_object_mut() {
+                                obj.insert(
+                                    "_templateName".to_string(),
+                                    serde_json::Value::String(template_name),
+                                );
+                            }
+                            let db_path = {
+                                let db = state.db.lock().map_err(|e| e.to_string())?;
+                                db.path().to_string()
+                            };
+                            if let Ok(db) = db::Database::open(&db_path) {
+                                let _ = db.set_cache(&cache_key, &model, &entry);
+                            }
+                            let _ = app.emit(
+                                "lookup://done",
+                                serde_json::json!({
+                                    "requestId": request_id,
+                                    "entry": entry,
+                                    "raw": full_text,
+                                    "fromCache": false,
+                                    "fallback": true,
+                                }),
+                            );
+                            return Ok(());
+                        }
+                        Err(parse_error) => {
+                            eprintln!("[lookup_stream] fallback parse failed: {parse_error}");
+                        }
+                    },
+                    Err(fallback_error) => {
+                        eprintln!("[lookup_stream] fallback failed: {fallback_error}");
+                    }
+                }
+            }
             let _ = app.emit(
                 "lookup://error",
                 serde_json::json!({
@@ -1032,6 +1115,38 @@ async fn export_words_data(
 }
 
 #[tauri::command]
+async fn export_database_snapshot(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let default_name = format!(
+        "gege-export-{}.db",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    let selected = rfd::AsyncFileDialog::new()
+        .set_title("导出完整数据库快照")
+        .set_file_name(&default_name)
+        .add_filter("SQLite 数据库", &["db"])
+        .save_file()
+        .await;
+    let Some(file) = selected else {
+        return Ok(None);
+    };
+    let destination = file.path().to_path_buf();
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let current = std::path::Path::new(db.path())
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(db.path()));
+    let requested = destination
+        .canonicalize()
+        .unwrap_or_else(|_| destination.clone());
+    if current == requested {
+        return Err("导出目标不能是当前数据库文件".into());
+    }
+    db.snapshot_to(&destination)?;
+    Ok(Some(destination.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
 async fn get_db_stats(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let stats = db.get_stats()?;
@@ -1047,6 +1162,14 @@ async fn get_db_stats(state: tauri::State<'_, AppState>) -> Result<serde_json::V
 }
 
 #[tauri::command]
+async fn get_startup_warnings(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<db::StartupWarning>, String> {
+    let warnings = state.startup_warnings.lock().map_err(|e| e.to_string())?;
+    Ok(warnings.clone())
+}
+
+#[tauri::command]
 async fn clear_cache(state: tauri::State<'_, AppState>) -> Result<u64, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.clear_cache()
@@ -1055,9 +1178,7 @@ async fn clear_cache(state: tauri::State<'_, AppState>) -> Result<u64, String> {
 #[tauri::command]
 async fn backup_database(state: tauri::State<'_, AppState>) -> Result<String, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    let db_path = db.path().to_string();
-    drop(db);
-    db::backup_database(&db_path)
+    db::backup_database(&db)
 }
 
 #[tauri::command]
@@ -1073,67 +1194,61 @@ async fn restore_backup(
     state: tauri::State<'_, AppState>,
     backup_name: String,
 ) -> Result<(), String> {
-    let db_path = {
-        let mut db = state.db.lock().map_err(|e| e.to_string())?;
-        let path = db.path().to_string();
-        *db = db::Database::open_memory().map_err(|e| format!("创建临时数据库失败: {e}"))?;
-        path
-    };
-    db::restore_backup(&db_path, &backup_name)?;
-    let new_db = db::Database::open(&db_path).map_err(|e| format!("重新打开数据库失败: {e}"))?;
     let mut db = state.db.lock().map_err(|e| e.to_string())?;
-    *db = new_db;
-    Ok(())
+    db::restore_backup(&mut db, &backup_name)
 }
 
 #[tauri::command]
 async fn change_data_dir(
     state: tauri::State<'_, AppState>,
     new_dir: String,
-) -> Result<String, String> {
-    let old_path = {
-        let mut db = state.db.lock().map_err(|e| e.to_string())?;
-        let path = db.path().to_string();
-        *db = db::Database::open_memory().map_err(|e| format!("创建临时数据库失败: {e}"))?;
-        path
-    };
-    match db::change_data_dir(&old_path, &new_dir) {
-        Ok(new_db_path) => {
-            let activate = (|| -> Result<db::Database, String> {
-                let new_db = db::Database::open(&new_db_path)
-                    .map_err(|e| format!("打开新数据库失败: {e}"))?;
-                let mut settings = new_db.get_settings()?;
-                if let Some(root) = settings.as_object_mut() {
-                    root.insert("dataDir".into(), serde_json::Value::String(new_dir.clone()));
-                }
-                new_db.save_settings(&settings)?;
-                let default_dir = dirs::data_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join("GegeDic");
-                db::persist_configured_data_dir(&default_dir, std::path::Path::new(&new_dir))?;
-                Ok(new_db)
-            })();
-            match activate {
-                Ok(new_db) => {
-                    let mut db = state.db.lock().map_err(|e| e.to_string())?;
-                    *db = new_db;
-                    Ok(new_db_path)
-                }
-                Err(e) => {
-                    let fallback = db::Database::open(&old_path)
-                        .map_err(|e2| format!("迁移启用失败且无法恢复原数据库: {e} / {e2}"))?;
-                    let mut db = state.db.lock().map_err(|e| e.to_string())?;
-                    *db = fallback;
-                    Err(e)
+) -> Result<db::DataDirChangeResult, String> {
+    let mut db = state.db.lock().map_err(|e| e.to_string())?;
+    let result = db::change_data_dir(&db, &new_dir)?;
+    let activate = (|| -> Result<db::Database, String> {
+        let new_db = db::Database::open(&result.new_db_path)
+            .map_err(|e| format!("打开新数据库失败: {e}"))?;
+        let mut settings = new_db.get_settings()?;
+        if let Some(root) = settings.as_object_mut() {
+            root.insert(
+                "dataDir".into(),
+                serde_json::Value::String(
+                    std::path::Path::new(&result.new_db_path)
+                        .parent()
+                        .unwrap_or(std::path::Path::new(&new_dir))
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+            );
+        }
+        new_db.save_settings(&settings)?;
+        let default_dir = dirs::data_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("GegeDic");
+        let normalized_new_dir = std::path::Path::new(&result.new_db_path)
+            .parent()
+            .ok_or("无法解析新数据目录")?;
+        db::persist_configured_data_dir(&default_dir, normalized_new_dir)?;
+        Ok(new_db)
+    })();
+    match activate {
+        Ok(new_db) => {
+            if !result.warnings.is_empty() {
+                if let Ok(mut warnings) = state.startup_warnings.lock() {
+                    warnings.extend(result.warnings.iter().cloned().map(|message| {
+                        db::StartupWarning {
+                            kind: "migration-backup".into(),
+                            message,
+                        }
+                    }));
                 }
             }
+            *db = new_db;
+            Ok(result)
         }
-        Err(e) => {
-            let fallback = db::Database::open(&old_path)
-                .map_err(|e2| format!("迁移失败且无法恢复原数据库: {e} / {e2}"))?;
-            let mut db = state.db.lock().map_err(|e| e.to_string())?;
-            *db = fallback;
-            Err(e)
+        Err(error) => {
+            db::cleanup_migration_target(&result);
+            Err(error)
         }
     }
 }
@@ -1322,13 +1437,149 @@ fn setup_tray(
     Ok(())
 }
 
+fn push_startup_warning(app: &AppHandle, kind: impl Into<String>, message: impl Into<String>) {
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(mut warnings) = state.startup_warnings.lock() {
+            warnings.push(db::StartupWarning {
+                kind: kind.into(),
+                message: message.into(),
+            });
+        }
+    }
+}
+
+fn check_auto_backup(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let enabled = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|database| database.get_settings().ok())
+        .and_then(|settings| settings.get("autoBackup").and_then(|value| value.as_bool()))
+        .unwrap_or(true);
+    if !enabled {
+        return;
+    }
+    let Ok(database) = state.db.lock() else {
+        push_startup_warning(app, "auto-backup", "自动备份无法获取数据库锁");
+        return;
+    };
+    let path = database.path().to_string();
+    match db::has_auto_backup_today(&path) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            push_startup_warning(app, "auto-backup", format!("检查自动备份失败: {error}"));
+            return;
+        }
+    }
+    if let Err(error) = db::backup_database(&database) {
+        push_startup_warning(app, "auto-backup", format!("自动备份失败: {error}"));
+    }
+}
+
+fn validate_relocated_database(path: &std::path::Path) -> Result<(), String> {
+    let database = rusqlite::Connection::open(path).map_err(|e| format!("打开数据库失败: {e}"))?;
+    let integrity: String = database
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|e| format!("完整性检查失败: {e}"))?;
+    if integrity != "ok" {
+        return Err(format!("完整性检查未通过: {integrity}"));
+    }
+    let schema: i64 = database
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|e| format!("读取 schema 版本失败: {e}"))?;
+    if schema != migrations::LATEST_SCHEMA_VERSION {
+        return Err(format!("schema 版本不匹配: {schema}"));
+    }
+    Ok(())
+}
+
+fn resolve_startup_data_dir(
+    default_dir: &std::path::Path,
+) -> Result<(std::path::PathBuf, Vec<db::StartupWarning>), String> {
+    let configured = db::read_configured_data_dir(default_dir)?;
+    let Some(configured_dir) = configured else {
+        return Ok((default_dir.to_path_buf(), Vec::new()));
+    };
+    if configured_dir.is_dir() {
+        return Ok((configured_dir, Vec::new()));
+    }
+
+    loop {
+        let choice = rfd::MessageDialog::new()
+            .set_title("鸽鸽词典数据目录不可用")
+            .set_description(format!(
+                "已配置的数据目录不存在或无法访问：{}\n\n选择“是”重试，“否”重新定位已有 gege.db，“取消”退出或重置到默认目录。",
+                configured_dir.display()
+            ))
+            .set_buttons(rfd::MessageButtons::YesNoCancel)
+            .show();
+        match choice {
+            rfd::MessageDialogResult::Yes => {
+                if configured_dir.is_dir() {
+                    return Ok((configured_dir, Vec::new()));
+                }
+            }
+            rfd::MessageDialogResult::No => {
+                if let Some(selected) = rfd::FileDialog::new()
+                    .set_title("重新定位已有 gege.db")
+                    .pick_folder()
+                {
+                    let candidate = selected.join(db::DB_FILENAME);
+                    match validate_relocated_database(&candidate) {
+                        Ok(()) => {
+                            db::persist_configured_data_dir(default_dir, &selected)?;
+                            return Ok((selected, Vec::new()));
+                        }
+                        Err(error) => {
+                            rfd::MessageDialog::new()
+                                .set_title("无法使用该数据库")
+                                .set_description(error)
+                                .set_level(rfd::MessageLevel::Error)
+                                .show();
+                        }
+                    }
+                }
+            }
+            rfd::MessageDialogResult::Cancel => {
+                let reset = rfd::MessageDialog::new()
+                    .set_title("重置到默认数据目录？")
+                    .set_description(format!(
+                        "默认目录可能比原目录旧：{}\n确认后只切换指针，不删除原目录。",
+                        default_dir.display()
+                    ))
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show();
+                if reset == rfd::MessageDialogResult::Yes {
+                    fs::create_dir_all(default_dir)
+                        .map_err(|e| format!("创建默认数据目录失败: {e}"))?;
+                    db::persist_configured_data_dir(default_dir, default_dir)?;
+                    return Ok((
+                        default_dir.to_path_buf(),
+                        vec![db::StartupWarning {
+                            kind: "data-dir-reset".into(),
+                            message: "已明确重置到默认数据目录，默认库可能较旧".into(),
+                        }],
+                    ));
+                }
+                return Err("用户取消数据目录恢复".into());
+            }
+            rfd::MessageDialogResult::Ok | rfd::MessageDialogResult::Custom(_) => {}
+        }
+    }
+}
+
 pub fn run() {
     let default_data_dir = dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("GegeDic");
 
     std::fs::create_dir_all(&default_data_dir).expect("Failed to create data directory");
-    let data_dir = db::resolve_configured_data_dir(&default_data_dir);
+    let (data_dir, startup_warnings) = resolve_startup_data_dir(&default_data_dir)
+        .expect("Failed to resolve configured data directory");
     std::fs::create_dir_all(&data_dir).expect("Failed to create configured data directory");
 
     let db_path = db::resolve_db_path(&data_dir);
@@ -1360,12 +1611,17 @@ pub fn run() {
     let clipboard_enabled = Arc::new(AtomicBool::new(clipboard_watch_enabled));
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--minimized"]),
+        ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState {
             db: Mutex::new(database),
             last_capture: Mutex::new(None),
             clipboard_enabled: clipboard_enabled.clone(),
-            last_looked_up: Mutex::new(String::new()),
+            last_looked_up: Mutex::new(None),
+            startup_warnings: Mutex::new(startup_warnings),
         })
         .invoke_handler(tauri::generate_handler![
             get_all_words,
@@ -1392,6 +1648,8 @@ pub fn run() {
             save_glossary_term,
             delete_glossary_terms,
             import_glossary,
+            preview_word_import,
+            import_words,
             export_glossary,
             preview_glossary_matches,
             get_usage,
@@ -1402,7 +1660,9 @@ pub fn run() {
             speak_text,
             list_voices,
             export_words_data,
+            export_database_snapshot,
             get_db_stats,
+            get_startup_warnings,
             clear_cache,
             backup_database,
             list_backups,
@@ -1419,6 +1679,21 @@ pub fn run() {
         .setup(move |app| {
             let cb = clipboard_enabled.clone();
             setup_tray(app, cb.clone())?;
+            if std::env::args().any(|arg| arg == "--minimized") {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
+            check_auto_backup(app.app_handle());
+            let backup_handle = app.app_handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    check_auto_backup(&backup_handle);
+                }
+            });
             clipboard_watcher::start(app.app_handle().clone(), cb);
             Ok(())
         })
@@ -1465,6 +1740,12 @@ mod tests {
             base,
             lookup_cache_key(" DEADLOCK ", "thread   A", "word", "model", "standard")
         );
+    }
+
+    #[test]
+    fn streaming_fallback_only_applies_before_first_content() {
+        assert!(should_fallback_stream(false));
+        assert!(!should_fallback_stream(true));
     }
 
     #[cfg(windows)]
