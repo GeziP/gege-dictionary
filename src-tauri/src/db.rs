@@ -158,7 +158,8 @@ fn atomic_replace(source: &Path, destination: &Path) -> Result<(), String> {
 
 /// Resolve the database file path with legacy compatibility.
 /// 1. If `gege.db` exists in dir, return it.
-/// 2. If only `lexnote.db` exists, rename it to `gege.db` and return.
+/// 2. If only `lexnote.db` exists, snapshot it to `gege.db` and keep the
+///    legacy file untouched.
 /// 3. Otherwise return `gege.db` (will be created).
 pub fn resolve_db_path(data_dir: &Path) -> PathBuf {
     let primary = data_dir.join(DB_FILENAME);
@@ -168,17 +169,18 @@ pub fn resolve_db_path(data_dir: &Path) -> PathBuf {
     let legacy = data_dir.join(LEGACY_DB_FILENAME);
     if legacy.exists() {
         eprintln!(
-            "[db] Migrating legacy database: {} -> {}",
+            "[db] Migrating legacy database via SQLite backup: {} -> {}",
             legacy.display(),
             primary.display()
         );
-        if let Err(e) = std::fs::rename(&legacy, &primary) {
-            // Do not copy a live SQLite file directly: a WAL sidecar could
-            // still contain pages that are not present in the main file.
-            // Keeping the legacy path is safer than creating a partial copy;
-            // the opened database can then be snapshotted through the online
-            // backup API by an explicit migration operation.
-            eprintln!("[db] Rename failed: {e}; keeping legacy database path");
+        let result = (|| -> Result<(), String> {
+            let source = Connection::open(&legacy).map_err(|e| format!("打开旧数据库失败: {e}"))?;
+            snapshot_connection(&source, &primary, false)
+        })();
+        if let Err(e) = result {
+            // Do not create a partial copy when the legacy file is invalid or
+            // inaccessible. The caller can continue using the legacy path.
+            eprintln!("[db] Legacy snapshot failed: {e}; keeping legacy database path");
             return legacy;
         }
         return primary;
@@ -2338,11 +2340,12 @@ mod tests {
     #[test]
     fn resolves_and_renames_legacy_database() {
         let dir = TestDir::new("legacy");
-        std::fs::write(dir.0.join(LEGACY_DB_FILENAME), b"legacy").unwrap();
+        let legacy = Connection::open(dir.0.join(LEGACY_DB_FILENAME)).unwrap();
+        drop(legacy);
         let resolved = resolve_db_path(&dir.0);
         assert_eq!(resolved, dir.0.join(DB_FILENAME));
         assert!(resolved.exists());
-        assert!(!dir.0.join(LEGACY_DB_FILENAME).exists());
+        assert!(dir.0.join(LEGACY_DB_FILENAME).exists());
     }
 
     #[test]
