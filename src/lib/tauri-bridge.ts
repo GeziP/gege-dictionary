@@ -153,6 +153,33 @@ export async function importGlossary(
   return invoke<GlossaryImportReport>('import_glossary', { content, format, conflictPolicy });
 }
 
+export interface WordImportPreview {
+  columns: string[];
+  rows: string[][];
+  totalRows: number;
+  errors: Array<{ row: number; message: string }>;
+  format: string;
+}
+
+export interface WordImportResult {
+  inserted: number;
+  merged: number;
+  skipped: number;
+  errors: Array<{ row: number; message: string }>;
+}
+
+export async function previewWordImport(content: string, format: string): Promise<WordImportPreview> {
+  return invoke<WordImportPreview>('preview_word_import', { content, format });
+}
+
+export async function importWords(
+  content: string,
+  format: string,
+  mapping: Record<string, string>,
+): Promise<WordImportResult> {
+  return invoke<WordImportResult>('import_words', { content, format, mapping });
+}
+
 export async function exportGlossary(
   format: 'json' | 'tsv',
   domain?: string,
@@ -276,6 +303,8 @@ export async function getDbStats(): Promise<{
   tagCount: number;
   cacheCount: number;
   cacheSizeBytes: number;
+  sizeBytes: number;
+  dataDir: string;
 }> {
   return invoke('get_db_stats');
 }
@@ -301,8 +330,45 @@ export async function restoreBackup(backupName: string): Promise<void> {
   return invoke('restore_backup', { backupName });
 }
 
-export async function changeDataDir(newDir: string): Promise<string> {
-  return invoke<string>('change_data_dir', { newDir });
+export interface StartupWarning {
+  kind: string;
+  message: string;
+}
+
+export interface DataDirChangeResult {
+  oldDbPath: string;
+  newDbPath: string;
+  backupsCopied: number;
+  warnings: string[];
+}
+
+export async function changeDataDir(newDir: string): Promise<DataDirChangeResult> {
+  return invoke<DataDirChangeResult>('change_data_dir', { newDir });
+}
+
+export async function getStartupWarnings(): Promise<StartupWarning[]> {
+  return invoke<StartupWarning[]>('get_startup_warnings');
+}
+
+export async function exportDatabaseSnapshot(): Promise<string | null> {
+  return invoke<string | null>('export_database_snapshot');
+}
+
+export async function getAutostartStatus(): Promise<boolean> {
+  if (!isTauri()) return false;
+  const plugin = await import('@tauri-apps/plugin-autostart');
+  return plugin.isEnabled();
+}
+
+export async function setAutostart(enabled: boolean): Promise<boolean> {
+  if (!isTauri()) return false;
+  const plugin = await import('@tauri-apps/plugin-autostart');
+  if (enabled) {
+    await plugin.enable();
+  } else {
+    await plugin.disable();
+  }
+  return plugin.isEnabled();
 }
 
 export async function openDataFolder(): Promise<void> {

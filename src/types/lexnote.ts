@@ -240,7 +240,6 @@ export interface AppSettings {
   launchAtLogin: boolean;
   dataDir: string;
   autoBackup: boolean;
-  anonymousStats: boolean;
   ttsVoice: string;
   ttsRate: number;
   fontSize: number;

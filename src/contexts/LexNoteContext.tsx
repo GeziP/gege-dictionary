@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { DEFAULT_PROVIDER, DEFAULT_TEMPLATES } from '../data/providers';
 import type {
   AppSettings,
@@ -20,7 +20,6 @@ const DEFAULT_SETTINGS: AppSettings = {
   launchAtLogin: false,
   dataDir: '',
   autoBackup: true,
-  anonymousStats: false,
   ttsVoice: 'Microsoft Zira',
   ttsRate: 1,
   fontSize: 13,
@@ -45,11 +44,14 @@ interface Usage {
 
 export type LookupStatus = 'idle' | 'loading' | 'streaming' | 'done' | 'error';
 export type InitState = 'loading' | 'ready';
+export type SettingsSaveStatus = 'idle' | 'saving' | 'error';
 
 interface LexNoteValue {
   words: SavedWord[];
   tags: string[];
   settings: AppSettings;
+  settingsSaveStatus: SettingsSaveStatus;
+  settingsSaveError: string | null;
   templates: PromptTemplate[];
   usage: Usage;
   network: NetworkMode;
@@ -87,6 +89,11 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
 
   const [words, setWords] = useState<SavedWord[]>([]);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const settingsRef = useRef(DEFAULT_SETTINGS);
+  const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const settingsVersionRef = useRef(0);
+  const [settingsSaveStatus, setSettingsSaveStatus] = useState<SettingsSaveStatus>('idle');
+  const [settingsSaveError, setSettingsSaveError] = useState<string | null>(null);
   const [templates, setTemplates] = useState<PromptTemplate[]>([]);
   const [network, setNetwork] = useState<NetworkMode>('ok');
   const [captureMethod, setCaptureMethod] = useState<CaptureMethod>('uia');
@@ -159,6 +166,10 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
   }, [isTauri]);
 
   useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+
+  useEffect(() => {
     const root = document.documentElement;
     const prefersDark =
       settings.theme === 'dark' ||
@@ -169,20 +180,35 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
 
   const updateSettings = useCallback(
     (patch: Partial<AppSettings>) => {
-      setSettings((prev) => {
-        const next = { ...prev, ...patch };
-        if (isTauri) {
-          const keys = Object.keys(patch);
-          const analysisOnly = keys.length > 0 && keys.every((key) =>
-            key === 'activeDomainProfile' || key === 'analysisStyle'
-          );
-          const save = analysisOnly
-            ? bridge.saveAnalysisPreferences(next.activeDomainProfile, next.analysisStyle)
-            : bridge.saveSettings(next);
-          save.catch(console.error);
-        }
-        return next;
-      });
+      const previous = settingsRef.current;
+      const next = { ...previous, ...patch };
+      settingsRef.current = next;
+      setSettings(next);
+      if (!isTauri) return;
+      const version = ++settingsVersionRef.current;
+      const keys = Object.keys(patch);
+      const analysisOnly = keys.length > 0 && keys.every((key) =>
+        key === 'activeDomainProfile' || key === 'analysisStyle'
+      );
+      setSettingsSaveStatus('saving');
+      setSettingsSaveError(null);
+      const save = () => analysisOnly
+        ? bridge.saveAnalysisPreferences(next.activeDomainProfile, next.analysisStyle)
+        : bridge.saveSettings(next);
+      saveQueueRef.current = saveQueueRef.current
+        .catch(() => undefined)
+        .then(save)
+        .then(() => {
+          if (version === settingsVersionRef.current) setSettingsSaveStatus('idle');
+        })
+        .catch((error) => {
+          if (version === settingsVersionRef.current) {
+            settingsRef.current = previous;
+            setSettings(previous);
+            setSettingsSaveStatus('error');
+            setSettingsSaveError(String(error));
+          }
+        });
     },
     [isTauri]
   );
@@ -411,6 +437,8 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
     words,
     tags,
     settings,
+    settingsSaveStatus,
+    settingsSaveError,
     templates,
     usage,
     network,
