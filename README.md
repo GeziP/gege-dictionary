@@ -81,7 +81,7 @@
 | **低门槛个人术语表** | 界面逐条新增或直接粘贴 Excel 两列表格；JSON / TSV 仅作为高级迁移与备份入口 |
 | **Markdown 富文本** | 解析结果中的 **加粗**、`代码`、列表等自动渲染 |
 | **TTS 朗读** | 调用 Windows 语音引擎朗读单词和例句 |
-| **生词库管理** | 支持搜索、筛选、标签、批量操作、导入/导出（CSV/Markdown/Anki） |
+| **生词库管理** | 支持搜索、筛选、标签、批量操作、CSV/TSV 预览导入与完整 SQLite 快照导出 |
 | **三档轻量复习** | 每日限量回顾，答对按 1 / 3 / 7 天升档，答错回到第一档 |
 | **阅读会话** | 按来源应用和时间间隔聚合查词记录，支持批量标签、导出与加入复习 |
 | **安全自动更新** | 通过 GitHub Releases 检查并安装签名更新，不上传用户数据 |
@@ -101,10 +101,10 @@
 ### 从源码构建
 
 ```bash
-# 前置条件：Node.js 18+、Rust 1.75+、Visual Studio Build Tools
+# 前置条件：Node.js >=20.19 或 >=22.12、Rust 1.75+、Visual Studio Build Tools
 git clone https://github.com/GeziP/gege-dictionary.git
 cd gege-dictionary
-npm install
+npm ci
 npx tauri build
 ```
 
@@ -199,6 +199,13 @@ gege-dictionary/
 - 鸽鸽词典 **没有服务端**，不收集任何用户数据
 - 只有「选中的文本 + 上下文 + Prompt」会发送到你自己配置的 LLM 服务
 - 所有数据（生词库、设置、使用记录）保存在本机 `%APPDATA%/GegeDic/` 目录下
+
+### 数据安全与迁移
+
+- `gege.db` 使用 SQLite Online Backup 快照，迁移、备份和完整导出都会包含仍在 WAL 中的数据；原数据目录不会被自动删除。
+- 启用每日自动备份后，`backups/gege-backup-*.db` 每个本地自然日最多一份，最多保留最近 10 份；迁移前和 schema 备份不会被这项清理删除。
+- 设置页的「导出全部数据」导出完整 SQLite 快照。API Key 以当前 Windows 用户的 DPAPI 密文保存，换机器后需要重新配置。
+- 自定义数据目录失联时不会静默创建第二份数据库；启动时可重试、重新定位已有 `gege.db`、明确重置到默认目录或退出。
 
 > v1.1 已增加敏感内容自动过滤（复制密码、密钥、代码、文件路径时不触发查词）、应用黑名单，并使用 Windows DPAPI 加密存储 API Key。被过滤的内容不会写入缓存或发送给模型。详见 [v1.1 开发规格](docs/PRD-v1.1-spec.md)。
 
