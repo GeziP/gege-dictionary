@@ -16,6 +16,8 @@ const CLIPBOARD_MODES = [
 export function CaptureSection() {
   const { settings, updateSettings } = useLexNote();
   const [watchEnabled, setWatchEnabled] = useState(true);
+  const [autostartEnabled, setAutostartEnabled] = useState(false);
+  const [autostartError, setAutostartError] = useState<string | null>(null);
   const [blacklistInput, setBlacklistInput] = useState(
     (settings.clipboardBlacklist || []).join(', ')
   );
@@ -25,6 +27,23 @@ export function CaptureSection() {
       console.error('Failed to read clipboard watch status:', error);
     });
   }, []);
+
+  useEffect(() => {
+    bridge.getAutostartStatus().then(setAutostartEnabled).catch((error) => {
+      setAutostartError(String(error));
+    });
+  }, []);
+
+  const handleAutostart = useCallback(async (enabled: boolean) => {
+    setAutostartError(null);
+    try {
+      const actual = await bridge.setAutostart(enabled);
+      setAutostartEnabled(actual);
+      updateSettings({ launchAtLogin: actual });
+    } catch (error) {
+      setAutostartError(String(error));
+    }
+  }, [updateSettings]);
 
   const handleToggle = useCallback(async () => {
     try {
@@ -112,10 +131,12 @@ export function CaptureSection() {
 
       <SettingsSection title="常驻行为">
         <Toggle
-          checked={settings.launchAtLogin}
-          onChange={(value) => updateSettings({ launchAtLogin: value })}
+          checked={autostartEnabled}
+          onChange={handleAutostart}
           label="开机自启并最小化到托盘"
           description="托盘常驻时，划词即查不受主窗口是否打开影响。" />
+
+        {autostartError && <p className="mt-1 text-[11px] text-danger">开机自启设置失败，系统状态未更新：{autostartError}</p>}
 
         <p className="mt-1 inline-flex items-center gap-1.5 text-[11px] text-positive">
           <CheckIcon size={12} /> 当前常驻内存约 138 MB · 冷启动 1.4s

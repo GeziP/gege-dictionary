@@ -29,10 +29,11 @@ interface DbInfo {
 }
 
 export function DataSection() {
-  const { settings, updateSettings, usage } = useLexNote();
+  const { settings, updateSettings, usage, settingsSaveStatus, settingsSaveError } = useLexNote();
   const isTauri = bridge.isTauri();
   const [status, setStatus] = useState<{ type: 'ok' | 'error'; msg: string } | null>(null);
   const [backups, setBackups] = useState<Backup[]>([]);
+  const [startupWarnings, setStartupWarnings] = useState<string[]>([]);
   const [dbInfo, setDbInfo] = useState<DbInfo | null>(null);
   const [newDir, setNewDir] = useState('');
   const [loading, setLoading] = useState<string | null>(null);
@@ -45,9 +46,10 @@ export function DataSection() {
   const loadInfo = useCallback(async () => {
     if (!isTauri) return;
     try {
-      const [stats, bks] = await Promise.all([
+      const [stats, bks, warnings] = await Promise.all([
         bridge.getDbStats() as Promise<DbInfo & { tagCount: number }>,
         bridge.listBackups(),
+        bridge.getStartupWarnings(),
       ]);
       setDbInfo({
         wordCount: stats.wordCount,
@@ -58,6 +60,7 @@ export function DataSection() {
       });
       setNewDir(stats.dataDir);
       setBackups(bks as Backup[]);
+      setStartupWarnings(warnings.map((warning) => warning.message));
     } catch (e) {
       console.error('Failed to load data info:', e);
     }
@@ -109,8 +112,12 @@ export function DataSection() {
     if (!confirm(`确定要将数据迁移到 ${newDir} 吗？原目录文件不会删除。`)) return;
     setLoading('changedir');
     try {
-      await bridge.changeDataDir(newDir);
-      flash('ok', `数据已迁移到 ${newDir}，重启后生效`);
+      const result = await bridge.changeDataDir(newDir);
+      if (result.warnings.length > 0) {
+        flash('error', `迁移完成，但有备份复制警告：${result.warnings.join('；')}`);
+      } else {
+        flash('ok', `数据已迁移到 ${result.newDbPath}，原数据库保留未删除`);
+      }
       loadInfo();
     } catch (e) {
       flash('error', `迁移失败: ${e}`);
@@ -128,26 +135,16 @@ export function DataSection() {
   };
 
   const handleExportAll = async () => {
+    setLoading('export');
     try {
-      const words = await bridge.getAllWords();
-      const ids = words.map((w: { id: string }) => w.id);
-      if (ids.length === 0) {
-        flash('error', '词库为空，无数据可导出');
-        return;
+      const exported = await bridge.exportDatabaseSnapshot();
+      if (exported) {
+        flash('ok', `已导出完整 SQLite 快照：${exported}`);
       }
-      const csv = await bridge.exportWordsData(ids, 'csv');
-      const chosen = await bridge.pickFolder('选择导出目录');
-      if (!chosen) return;
-      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `gege-export-${Date.now()}.csv`;
-      a.click();
-      URL.revokeObjectURL(url);
-      flash('ok', `已导出 ${ids.length} 条词条`);
     } catch (e) {
       flash('error', `导出失败: ${e}`);
+    } finally {
+      setLoading(null);
     }
   };
 
@@ -316,18 +313,12 @@ export function DataSection() {
             <li>当前领域与解析风格，以及实际命中的个人术语（未命中时不发送术语表）</li>
           </ol>
           <p className="mt-2">
-            鸽鸽词典没有服务端，不收集任何内容；崩溃日志默认不包含用户文本，API Key 在日志中脱敏。
+            鸽鸽词典没有服务端，不收集任何内容；崩溃日志默认不包含用户文本，API Key 在日志中脱敏。导出的数据库快照包含当前机器的 DPAPI 密文，换机器后需要重新配置 API Key。
           </p>
         </div>
-        <Toggle
-          checked={settings.anonymousStats}
-          onChange={(value) => updateSettings({ anonymousStats: value })}
-          label="发送匿名使用统计"
-          description="默认关闭。开启后仅上报功能使用次数，不含任何词汇或上下文内容。" />
-
         <div className="mt-3 flex gap-2">
-          <Button size="sm" onClick={handleExportAll}>
-            导出全部数据
+          <Button size="sm" onClick={handleExportAll} disabled={loading === 'export'}>
+            {loading === 'export' ? '导出中…' : '导出全部数据'}
           </Button>
           <Button size="sm" variant="danger" icon={<Trash2Icon size={12} />} onClick={handleClearDb}>
             清空数据库
@@ -343,6 +334,16 @@ export function DataSection() {
         }`}>
           {status.msg}
         </p>
+      )}
+      {settingsSaveStatus === 'saving' && <p className="rounded-md border border-line bg-raised px-3 py-2 text-[11px] text-ink-muted">设置保存中…</p>}
+      {settingsSaveStatus === 'error' && settingsSaveError && <p className="rounded-md border border-danger/30 bg-danger/5 px-3 py-2 text-[11px] text-danger">设置保存失败，已回滚：{settingsSaveError}</p>}
+      {startupWarnings.length > 0 && (
+        <div className="rounded-md border border-warning/30 bg-warning/5 px-3 py-2 text-[11px] text-ink-muted">
+          <p className="font-medium text-ink">启动警告</p>
+          <ul className="mt-1 list-disc space-y-0.5 pl-4">
+            {startupWarnings.map((warning, index) => <li key={`${index}-${warning}`}>{warning}</li>)}
+          </ul>
+        </div>
       )}
     </div>
   );

@@ -18,6 +18,9 @@
     "core:event:default",
     "core:event:allow-emit",
     "core:event:allow-listen",
+    "autostart:allow-enable",
+    "autostart:allow-disable",
+    "autostart:allow-is-enabled",
     "updater:default"
   ]
 }

@@ -8,6 +8,41 @@ use tauri::Manager;
 use crate::content_filter;
 use crate::AppState;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardFingerprint {
+    pub sequence: u32,
+    pub text: String,
+}
+
+fn should_skip_lookup(last: Option<&ClipboardFingerprint>, sequence: u32, text: &str) -> bool {
+    last.is_some_and(|previous| previous.sequence == sequence && previous.text == text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_clipboard_sequence_is_deduplicated_but_recopy_is_allowed() {
+        let previous = ClipboardFingerprint {
+            sequence: 7,
+            text: "same text".into(),
+        };
+        assert!(should_skip_lookup(Some(&previous), 7, "same text"));
+        assert!(!should_skip_lookup(Some(&previous), 8, "same text"));
+        assert!(!should_skip_lookup(Some(&previous), 7, "new text"));
+    }
+}
+
+fn clipboard_sequence_number() -> u32 {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetClipboardSequenceNumber() -> u32;
+    }
+    // SAFETY: this is a side-effect-free Win32 query with no pointers.
+    unsafe { GetClipboardSequenceNumber() }
+}
+
 fn get_foreground_window_info() -> (String, String) {
     use std::os::windows::ffi::OsStringExt;
     #[link(name = "user32")]
@@ -109,6 +144,7 @@ fn is_blacklisted(process_name: &str, window_title: &str, custom_blacklist: &[St
 pub fn start(app_handle: tauri::AppHandle, enabled: Arc<AtomicBool>) {
     thread::spawn(move || {
         let mut last_text = String::new();
+        let mut last_sequence = clipboard_sequence_number();
         let mut cooldown_until = std::time::Instant::now();
         let mut last_clipboard_poll = std::time::Instant::now() - Duration::from_millis(500);
         let mut last_mode_check = std::time::Instant::now() - Duration::from_millis(500);
@@ -156,7 +192,7 @@ pub fn start(app_handle: tauri::AppHandle, enabled: Arc<AtomicBool>) {
 
             let mut triggered = false;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                triggered = poll_once(&app_handle, &mut last_text);
+                triggered = poll_once(&app_handle, &mut last_text, &mut last_sequence);
             }));
             if let Err(e) = result {
                 eprintln!("[clipboard] recovered from panic: {e:?}");
@@ -205,16 +241,22 @@ fn get_trigger_mode(app_handle: &tauri::AppHandle) -> (String, Vec<String>) {
     ("smart".to_string(), Vec::new())
 }
 
-fn poll_once(app_handle: &tauri::AppHandle, last_text: &mut String) -> bool {
+fn poll_once(
+    app_handle: &tauri::AppHandle,
+    last_text: &mut String,
+    last_sequence: &mut u32,
+) -> bool {
     let current = match arboard::Clipboard::new() {
         Ok(mut cb) => cb.get_text().unwrap_or_default(),
         Err(_) => return false,
     };
 
+    let sequence = clipboard_sequence_number();
     let trimmed = current.trim().to_string();
-    if trimmed.is_empty() || trimmed == *last_text {
+    if trimmed.is_empty() || (sequence == *last_sequence && trimmed == *last_text) {
         return false;
     }
+    *last_sequence = sequence;
     *last_text = trimmed.clone();
 
     let (mode, blacklist) = get_trigger_mode(app_handle);
@@ -229,6 +271,7 @@ fn poll_once(app_handle: &tauri::AppHandle, last_text: &mut String) -> bool {
     }
 
     // "smart" mode: apply content filter and blacklist
+    let (win_title, proc_name) = get_foreground_window_info();
     if mode == "smart" {
         if content_filter::should_reject(last_text) {
             eprintln!(
@@ -238,7 +281,6 @@ fn poll_once(app_handle: &tauri::AppHandle, last_text: &mut String) -> bool {
             return false;
         }
 
-        let (win_title, proc_name) = get_foreground_window_info();
         if is_blacklisted(&proc_name, &win_title, &blacklist) {
             eprintln!("[clipboard] blacklisted app: {proc_name} / {win_title}");
             return false;
@@ -247,14 +289,13 @@ fn poll_once(app_handle: &tauri::AppHandle, last_text: &mut String) -> bool {
 
     let state = app_handle.state::<AppState>();
     if let Ok(ll) = state.last_looked_up.lock() {
-        if *ll == trimmed {
+        if should_skip_lookup(ll.as_ref(), sequence, &trimmed) {
             eprintln!("[clipboard] skipping already looked-up text");
             return false;
         }
     }
 
     let kind = detect_kind(last_text);
-    let (win_title, _) = get_foreground_window_info();
     eprintln!(
         "[clipboard] detected: {:?} kind={kind} from={win_title:?}",
         &last_text[..last_text.len().min(60)]
@@ -263,7 +304,7 @@ fn poll_once(app_handle: &tauri::AppHandle, last_text: &mut String) -> bool {
     let capture_data = serde_json::json!({
         "selection": *last_text,
         "context": *last_text,
-        "sourceApp": win_title,
+        "sourceApp": proc_name,
         "sourceTitle": win_title,
         "kind": kind,
         "method": "clipboard",
@@ -274,7 +315,10 @@ fn poll_once(app_handle: &tauri::AppHandle, last_text: &mut String) -> bool {
         *lc = Some(capture_data);
     }
     if let Ok(mut ll) = state.last_looked_up.lock() {
-        *ll = trimmed.clone();
+        *ll = Some(ClipboardFingerprint {
+            sequence,
+            text: trimmed.clone(),
+        });
     }
 
     open_or_reuse_lookup(app_handle, kind == "paragraph");
@@ -399,30 +443,33 @@ pub fn lookup_clipboard(
     if text.is_empty() {
         return;
     }
+    let sequence = clipboard_sequence_number();
 
     let state = app_handle.state::<AppState>();
     if let Ok(ll) = state.last_looked_up.lock() {
-        if *ll == text {
+        if should_skip_lookup(ll.as_ref(), sequence, &text) {
             eprintln!(
                 "[clipboard] skipping duplicate lookup: {:?}",
                 &text[..text.len().min(40)]
             );
-            open_or_reuse_lookup(app_handle, detect_kind(&text) == "paragraph");
             return;
         }
     }
 
     if let Ok(mut ll) = state.last_looked_up.lock() {
-        *ll = text.clone();
+        *ll = Some(ClipboardFingerprint {
+            sequence,
+            text: text.clone(),
+        });
     }
 
     let kind = detect_kind(&text);
-    let (win_title, _) = get_foreground_window_info();
+    let (win_title, proc_name) = get_foreground_window_info();
 
     let capture_data = serde_json::json!({
         "selection": text,
         "context": text,
-        "sourceApp": win_title,
+        "sourceApp": proc_name,
         "sourceTitle": win_title,
         "kind": kind,
         "method": "clipboard_manual",
