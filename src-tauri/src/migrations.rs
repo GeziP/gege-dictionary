@@ -1,5 +1,6 @@
 use chrono::Local;
 use rusqlite::Connection;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const LATEST_SCHEMA_VERSION: i64 = 3;
@@ -119,11 +120,14 @@ fn create_premigration_backup(db_path: &str, from_version: i64) -> Result<PathBu
     }
     let db_path = Path::new(db_path);
     let dir = db_path.parent().ok_or("无法定位数据库目录")?;
+    let backup_dir = dir.join("backups");
+    fs::create_dir_all(&backup_dir)
+        .map_err(|e| format!("migration backup directory failed: {e}"))?;
     let stamp = Local::now().format("%Y%m%d-%H%M%S-%3f");
-    let mut backup = dir.join(format!("gege-premigrate-v{from_version}-{stamp}.db"));
+    let mut backup = backup_dir.join(format!("gege-premigrate-v{from_version}-{stamp}.db"));
     let mut suffix = 1_u32;
     while backup.exists() {
-        backup = dir.join(format!(
+        backup = backup_dir.join(format!(
             "gege-premigrate-v{from_version}-{stamp}-{suffix:03}.db"
         ));
         suffix += 1;
@@ -135,28 +139,7 @@ fn create_premigration_backup(db_path: &str, from_version: i64) -> Result<PathBu
         false,
     )
     .map_err(|e| format!("创建迁移前备份失败（{}）: {e}", backup.display()))?;
-    prune_premigration_backups(dir)?;
     Ok(backup)
-}
-
-fn prune_premigration_backups(dir: &Path) -> Result<(), String> {
-    let mut backups = std::fs::read_dir(dir)
-        .map_err(|e| format!("读取迁移备份目录失败: {e}"))?
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("gege-premigrate-v")
-        })
-        .collect::<Vec<_>>();
-    backups.sort_by_key(|entry| entry.file_name());
-    let remove_count = backups.len().saturating_sub(3);
-    for entry in backups.into_iter().take(remove_count) {
-        std::fs::remove_file(entry.path())
-            .map_err(|e| format!("清理旧迁移备份失败（{}）: {e}", entry.path().display()))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -247,31 +230,21 @@ mod tests {
     }
 
     #[test]
-    fn premigration_backups_are_pruned_to_three() {
-        let dir = std::env::temp_dir().join(format!("gege-migration-test-{}", std::process::id()));
+    fn premigration_backup_uses_managed_backup_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "gege-migration-managed-backup-test-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("gege.db");
-        std::fs::write(&db_path, b"database").unwrap();
-        for version in 0..5 {
-            let name = dir.join(format!(
-                "gege-premigrate-v{version}-2026080{}-000000.db",
-                version + 1
-            ));
-            std::fs::write(name, b"backup").unwrap();
-        }
-        prune_premigration_backups(&dir).unwrap();
-        let count = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("gege-premigrate-v")
-            })
-            .count();
-        assert_eq!(count, 3);
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("CREATE TABLE words (id TEXT PRIMARY KEY, kind TEXT, saved_at TEXT);")
+            .unwrap();
+
+        let backup = create_premigration_backup(db_path.to_str().unwrap(), 0).unwrap();
+        assert_eq!(backup.parent(), Some(dir.join("backups").as_path()));
+        assert!(backup.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -18,6 +18,10 @@ fn should_skip_lookup(last: Option<&ClipboardFingerprint>, sequence: u32, text: 
     last.is_some_and(|previous| previous.sequence == sequence && previous.text == text)
 }
 
+fn initial_clipboard_fingerprint(sequence: u32, text: String) -> ClipboardFingerprint {
+    ClipboardFingerprint { sequence, text }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -31,6 +35,12 @@ mod tests {
         assert!(should_skip_lookup(Some(&previous), 7, "same text"));
         assert!(!should_skip_lookup(Some(&previous), 8, "same text"));
         assert!(!should_skip_lookup(Some(&previous), 7, "new text"));
+    }
+
+    #[test]
+    fn startup_fingerprint_skips_existing_clipboard_content() {
+        let initial = initial_clipboard_fingerprint(12, "already copied".into());
+        assert!(should_skip_lookup(Some(&initial), 12, "already copied"));
     }
 }
 
@@ -143,8 +153,14 @@ fn is_blacklisted(process_name: &str, window_title: &str, custom_blacklist: &[St
 
 pub fn start(app_handle: tauri::AppHandle, enabled: Arc<AtomicBool>) {
     thread::spawn(move || {
-        let mut last_text = String::new();
-        let mut last_sequence = clipboard_sequence_number();
+        let initial_sequence = clipboard_sequence_number();
+        let initial_text = arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.get_text())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let mut last_text = initial_clipboard_fingerprint(initial_sequence, initial_text).text;
+        let mut last_sequence = initial_sequence;
         let mut cooldown_until = std::time::Instant::now();
         let mut last_clipboard_poll = std::time::Instant::now() - Duration::from_millis(500);
         let mut last_mode_check = std::time::Instant::now() - Duration::from_millis(500);

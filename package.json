@@ -1,6 +1,6 @@
 {
   "name": "gege-dic",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "private": true,
   "type": "module",
   "scripts": {
@@ -11,7 +11,8 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "lint": "eslint . --ext .js,.jsx,.ts,.tsx",
-    "test": "vitest run"
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@emotion/react": "^11.13.3",

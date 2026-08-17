@@ -46,7 +46,7 @@ export function Workflow({ workflow }: { workflow?: DomainWorkflow }) {
   if (!steps.length) return null;
   return (
     <div>
-      <SectionHeading>{workflow.title || '流程'}</SectionHeading>
+      <SectionHeading>{workflow?.title || '流程'}</SectionHeading>
       <ol className="mt-1.5 space-y-0">
         {steps.map((step, index) => (
           <li key={`${index}-${step.label}`} className="relative flex gap-2.5 pb-2 last:pb-0">

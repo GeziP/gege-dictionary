@@ -22,5 +22,9 @@ v1.2 起，安装包必须使用 Tauri updater 密钥签名。公钥已提交到
 5. 检查版本、release notes、安装包、`.sig` 与 `latest.json` 后再发布 draft。
 6. 使用上一版本客户端完成一次检查、下载、签名校验、安装和重启验收。
 
+如需在不同 Windows 用户或机器上执行可选 live smoke test，可临时设置
+`GEGE_LIVE_API_KEY`；它只被 ignored 测试读取，不会写入数据库或日志。未设置时，测试从
+`GEGE_LIVE_DB` 的 DPAPI 密文读取，必须在原始加密用户/机器上下文中运行。
+
 更新包签名与 Windows Authenticode 代码签名用途不同；公开发布时仍建议为可执行文件配置
 Windows 代码签名证书，以减少 SmartScreen 警告。

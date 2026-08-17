@@ -190,6 +190,8 @@ gege-dictionary/
 | [v1.2 开发规格](docs/PRD-v1.2-spec.md) | schema 迁移、轻量复习、阅读会话与自动更新的实现和验收标准 | 想参与开发 |
 | [v1.3 开发规格](docs/PRD-v1.3-spec.md) | 个人术语表、领域 Profile、解析风格与安全按需 Prompt 注入 | 想参与开发 |
 | [v1.4 开发规格](docs/PRD-v1.4-spec.md) | 计算机 / IVD 结构化专业解析、代码与流程展示、低门槛术语维护 | 想了解领域深化设计 |
+| [v1.4.3 发布说明](docs/RELEASE-NOTES-v1.4.3.md) | 数据安全、迁移/恢复、导入、剪贴板与发布门禁 | 维护者与升级用户 |
+| [v1.4.4 发布说明](docs/RELEASE-NOTES-v1.4.4.md) | 可靠性回归、真实 API 验证、首屏性能与依赖安全 | 维护者与升级用户 |
 | [发布说明](docs/RELEASE.md) | updater 私钥保管、GitHub Secrets 与签名发布流程 | 版本维护者 |
 
 开发任务已拆解为 [Issues](https://github.com/GeziP/gege-dictionary/issues)，每个都附带验收清单，欢迎认领。

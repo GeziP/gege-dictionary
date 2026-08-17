@@ -1,7 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { DownloadIcon } from 'lucide-react';
 import type { SavedWord } from '../../types/lexnote';
-import { FIELD_LABELS, toAnkiTSV, toCSV, toMarkdown, type ExportField } from '../../utils/export';
+import { FIELD_LABELS, download, toAnkiTSV, toCSV, toMarkdown, type ExportField } from '../../utils/export';
 import { classNames } from '../../utils/format';
 import { Button } from '../ui/Button';
 import { Modal } from '../ui/Modal';
@@ -67,7 +67,6 @@ export function ExportDialog({ words, onClose, onExported }: ExportDialogProps) 
         onClose();
       }
     } catch {
-      const { download } = await import('../../utils/export');
       download(meta.name, content, 'text/plain');
       onExported(`已导出 ${words.length} 条为 ${meta.name}`);
       onClose();

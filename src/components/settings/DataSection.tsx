@@ -18,6 +18,8 @@ interface Backup {
   name: string;
   sizeKb: number;
   modifiedTs: number;
+  kind?: 'auto' | 'premigration' | 'restoreSafety';
+  restorable?: boolean;
 }
 
 interface DbInfo {
@@ -29,11 +31,10 @@ interface DbInfo {
 }
 
 export function DataSection() {
-  const { settings, updateSettings, usage, settingsSaveStatus, settingsSaveError } = useLexNote();
+  const { settings, updateSettings, usage, settingsSaveStatus, settingsSaveError, refreshAppState, flushSettings } = useLexNote();
   const isTauri = bridge.isTauri();
   const [status, setStatus] = useState<{ type: 'ok' | 'error'; msg: string } | null>(null);
   const [backups, setBackups] = useState<Backup[]>([]);
-  const [startupWarnings, setStartupWarnings] = useState<string[]>([]);
   const [dbInfo, setDbInfo] = useState<DbInfo | null>(null);
   const [newDir, setNewDir] = useState('');
   const [loading, setLoading] = useState<string | null>(null);
@@ -46,10 +47,9 @@ export function DataSection() {
   const loadInfo = useCallback(async () => {
     if (!isTauri) return;
     try {
-      const [stats, bks, warnings] = await Promise.all([
+      const [stats, bks] = await Promise.all([
         bridge.getDbStats() as Promise<DbInfo & { tagCount: number }>,
         bridge.listBackups(),
-        bridge.getStartupWarnings(),
       ]);
       setDbInfo({
         wordCount: stats.wordCount,
@@ -60,7 +60,6 @@ export function DataSection() {
       });
       setNewDir(stats.dataDir);
       setBackups(bks as Backup[]);
-      setStartupWarnings(warnings.map((warning) => warning.message));
     } catch (e) {
       console.error('Failed to load data info:', e);
     }
@@ -85,9 +84,10 @@ export function DataSection() {
     if (!confirm(`确定要恢复到 ${name} 吗？当前数据会先自动备份。`)) return;
     setLoading(`restore-${name}`);
     try {
+      await flushSettings();
       await bridge.restoreBackup(name);
       flash('ok', `已从 ${name} 恢复，当前数据已自动备份`);
-      loadInfo();
+      await Promise.all([refreshAppState(), loadInfo()]);
     } catch (e) {
       flash('error', `恢复失败: ${e}`);
     } finally {
@@ -112,13 +112,14 @@ export function DataSection() {
     if (!confirm(`确定要将数据迁移到 ${newDir} 吗？原目录文件不会删除。`)) return;
     setLoading('changedir');
     try {
+      await flushSettings();
       const result = await bridge.changeDataDir(newDir);
       if (result.warnings.length > 0) {
         flash('error', `迁移完成，但有备份复制警告：${result.warnings.join('；')}`);
       } else {
         flash('ok', `数据已迁移到 ${result.newDbPath}，原数据库保留未删除`);
       }
-      loadInfo();
+      await Promise.all([refreshAppState(), loadInfo()]);
     } catch (e) {
       flash('error', `迁移失败: ${e}`);
     } finally {
@@ -236,9 +237,10 @@ export function DataSection() {
                 <button
                   type="button"
                   onClick={() => handleRestore(backup.name)}
-                  disabled={loading === `restore-${backup.name}`}
+                  disabled={backup.restorable === false || loading === `restore-${backup.name}`}
                   className="text-[11px] text-accent hover:underline disabled:opacity-50">
                   {loading === `restore-${backup.name}` ? '恢复中…' : '恢复'}
+                  {backup.restorable === false && <span className="ml-1 text-[10px] text-ink-subtle">仅供迁移回溯</span>}
                 </button>
               </li>
             ))}
@@ -337,14 +339,6 @@ export function DataSection() {
       )}
       {settingsSaveStatus === 'saving' && <p className="rounded-md border border-line bg-raised px-3 py-2 text-[11px] text-ink-muted">设置保存中…</p>}
       {settingsSaveStatus === 'error' && settingsSaveError && <p className="rounded-md border border-danger/30 bg-danger/5 px-3 py-2 text-[11px] text-danger">设置保存失败，已回滚：{settingsSaveError}</p>}
-      {startupWarnings.length > 0 && (
-        <div className="rounded-md border border-warning/30 bg-warning/5 px-3 py-2 text-[11px] text-ink-muted">
-          <p className="font-medium text-ink">启动警告</p>
-          <ul className="mt-1 list-disc space-y-0.5 pl-4">
-            {startupWarnings.map((warning, index) => <li key={`${index}-${warning}`}>{warning}</li>)}
-          </ul>
-        </div>
-      )}
     </div>
   );
 }

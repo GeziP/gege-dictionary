@@ -11,6 +11,7 @@ mod word_import;
 
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -27,6 +28,36 @@ pub struct AppState {
     pub clipboard_enabled: Arc<AtomicBool>,
     pub last_looked_up: Mutex<Option<clipboard_watcher::ClipboardFingerprint>>,
     pub startup_warnings: Mutex<Vec<db::StartupWarning>>,
+}
+
+fn default_data_dir_from(app_data: Option<PathBuf>, known_data_dir: Option<PathBuf>) -> PathBuf {
+    app_data
+        .or(known_data_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("GegeDic")
+}
+
+fn default_data_dir() -> PathBuf {
+    default_data_dir_from(
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty()),
+        dirs::data_dir(),
+    )
+}
+
+fn set_data_dir_setting(
+    settings: &mut serde_json::Value,
+    data_dir: &std::path::Path,
+) -> Result<(), String> {
+    let root = settings
+        .as_object_mut()
+        .ok_or("新数据库设置格式无效，迁移已取消")?;
+    root.insert(
+        "dataDir".into(),
+        serde_json::Value::String(data_dir.to_string_lossy().to_string()),
+    );
+    Ok(())
 }
 
 fn normalize_selection(selection: &str, kind: &str) -> String {
@@ -1209,22 +1240,14 @@ async fn change_data_dir(
         let new_db = db::Database::open(&result.new_db_path)
             .map_err(|e| format!("打开新数据库失败: {e}"))?;
         let mut settings = new_db.get_settings()?;
-        if let Some(root) = settings.as_object_mut() {
-            root.insert(
-                "dataDir".into(),
-                serde_json::Value::String(
-                    std::path::Path::new(&result.new_db_path)
-                        .parent()
-                        .unwrap_or(std::path::Path::new(&new_dir))
-                        .to_string_lossy()
-                        .to_string(),
-                ),
-            );
-        }
+        set_data_dir_setting(
+            &mut settings,
+            std::path::Path::new(&result.new_db_path)
+                .parent()
+                .unwrap_or(std::path::Path::new(&new_dir)),
+        )?;
         new_db.save_settings(&settings)?;
-        let default_dir = dirs::data_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("GegeDic");
+        let default_dir = default_data_dir();
         let normalized_new_dir = std::path::Path::new(&result.new_db_path)
             .parent()
             .ok_or("无法解析新数据目录")?;
@@ -1481,31 +1504,32 @@ fn check_auto_backup(app: &AppHandle) {
 }
 
 fn validate_relocated_database(path: &std::path::Path) -> Result<(), String> {
-    let database = rusqlite::Connection::open(path).map_err(|e| format!("打开数据库失败: {e}"))?;
-    let integrity: String = database
-        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-        .map_err(|e| format!("完整性检查失败: {e}"))?;
-    if integrity != "ok" {
-        return Err(format!("完整性检查未通过: {integrity}"));
+    if database_file_is_startup_candidate(path) {
+        Ok(())
+    } else {
+        Err(format!(
+            "数据库 {} 完整性检查失败或 schema 版本不受支持",
+            path.display()
+        ))
     }
-    let schema: i64 = database
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .map_err(|e| format!("读取 schema 版本失败: {e}"))?;
-    if schema != migrations::LATEST_SCHEMA_VERSION {
-        return Err(format!("schema 版本不匹配: {schema}"));
-    }
-    Ok(())
 }
 
 fn resolve_startup_data_dir(
     default_dir: &std::path::Path,
 ) -> Result<(std::path::PathBuf, Vec<db::StartupWarning>), String> {
-    let configured = db::read_configured_data_dir(default_dir)?;
-    let Some(configured_dir) = configured else {
+    let (configured, configured_error) = match db::read_configured_data_dir(default_dir) {
+        Ok(configured) => (configured, None),
+        Err(error) => (Some(default_dir.to_path_buf()), Some(error)),
+    };
+    let Some(mut configured_dir) = configured else {
         return Ok((default_dir.to_path_buf(), Vec::new()));
     };
-    if configured_dir.is_dir() {
+    if configured_error.is_none() && configured_data_dir_has_database(&configured_dir) {
         return Ok((configured_dir, Vec::new()));
+    }
+    let mut configured_error = configured_error.unwrap_or_default();
+    if !configured_error.is_empty() {
+        eprintln!("[startup] data directory pointer could not be read: {configured_error}");
     }
 
     loop {
@@ -1513,14 +1537,25 @@ fn resolve_startup_data_dir(
             .set_title("鸽鸽词典数据目录不可用")
             .set_description(format!(
                 "已配置的数据目录不存在或无法访问：{}\n\n选择“是”重试，“否”重新定位已有 gege.db，“取消”退出或重置到默认目录。",
-                configured_dir.display()
+                format!("{} {}", configured_dir.display(), configured_error)
             ))
             .set_buttons(rfd::MessageButtons::YesNoCancel)
             .show();
         match choice {
             rfd::MessageDialogResult::Yes => {
-                if configured_dir.is_dir() {
-                    return Ok((configured_dir, Vec::new()));
+                if configured_error.is_empty() {
+                    if configured_data_dir_has_database(&configured_dir) {
+                        return Ok((configured_dir, Vec::new()));
+                    }
+                } else {
+                    match db::read_configured_data_dir(default_dir) {
+                        Ok(Some(candidate)) => {
+                            configured_dir = candidate;
+                            configured_error.clear();
+                        }
+                        Ok(None) => return Ok((default_dir.to_path_buf(), Vec::new())),
+                        Err(error) => configured_error = error,
+                    }
                 }
             }
             rfd::MessageDialogResult::No => {
@@ -1572,21 +1607,132 @@ fn resolve_startup_data_dir(
     }
 }
 
-pub fn run() {
-    let default_data_dir = dirs::data_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("GegeDic");
+fn configured_data_dir_has_database(directory: &std::path::Path) -> bool {
+    if !directory.is_dir() {
+        return false;
+    }
+    let primary = directory.join(db::DB_FILENAME);
+    if primary.is_file() {
+        return database_file_is_startup_candidate(&primary);
+    }
+    database_file_is_startup_candidate(&directory.join(db::LEGACY_DB_FILENAME))
+}
 
-    std::fs::create_dir_all(&default_data_dir).expect("Failed to create data directory");
-    let (data_dir, startup_warnings) = resolve_startup_data_dir(&default_data_dir)
-        .expect("Failed to resolve configured data directory");
-    std::fs::create_dir_all(&data_dir).expect("Failed to create configured data directory");
+fn database_file_is_startup_candidate(path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .and_then(|connection| {
+            let integrity = connection
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?;
+            if integrity != "ok" {
+                return Ok(false);
+            }
+            let has_words = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='words')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !has_words {
+                return Ok(false);
+            }
+            let schema =
+                connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+            if schema > migrations::LATEST_SCHEMA_VERSION {
+                return Ok(false);
+            }
+            if schema == migrations::LATEST_SCHEMA_VERSION {
+                drop(connection);
+                return Ok(db::validate_database_file(path).is_ok());
+            }
+
+            // Older databases are migrated on the next startup, but they
+            // still need the legacy words contract that the migrations and
+            // post-migration indexes depend on. Do not treat an arbitrary
+            // table named `words` as a valid configured database.
+            let required_words_columns = [
+                "id",
+                "lemma",
+                "translation",
+                "pos",
+                "context_meaning",
+                "explanation",
+                "source_app",
+                "source_title",
+                "mastery",
+                "kind",
+                "saved_at",
+                "updated_at",
+                "lookups",
+                "data",
+            ];
+            let mut statement = connection.prepare("PRAGMA table_info(words)")?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            if required_words_columns
+                .iter()
+                .any(|column| !columns.iter().any(|actual| actual == column))
+            {
+                return Ok(false);
+            }
+            Ok(true)
+        })
+        .is_ok_and(|result| result)
+}
+
+pub fn run() {
+    let default_data_dir = default_data_dir();
+
+    if let Err(error) = std::fs::create_dir_all(&default_data_dir) {
+        rfd::MessageDialog::new()
+            .set_title("鸽鸽词典无法启动")
+            .set_description(format!("无法创建默认数据目录：{error}"))
+            .set_level(rfd::MessageLevel::Error)
+            .show();
+        return;
+    }
+    let (data_dir, startup_warnings) = match resolve_startup_data_dir(&default_data_dir) {
+        Ok(result) => result,
+        Err(error) => {
+            rfd::MessageDialog::new()
+                .set_title("鸽鸽词典无法启动")
+                .set_description(error)
+                .set_level(rfd::MessageLevel::Error)
+                .show();
+            return;
+        }
+    };
+    if let Err(error) = std::fs::create_dir_all(&data_dir) {
+        rfd::MessageDialog::new()
+            .set_title("鸽鸽词典无法启动")
+            .set_description(format!("无法访问配置的数据目录：{error}"))
+            .set_level(rfd::MessageLevel::Error)
+            .show();
+        return;
+    }
 
     let db_path = db::resolve_db_path(&data_dir);
-    let database = db::Database::open(db_path.to_str().unwrap()).expect("Failed to open database");
-    database
-        .initialize()
-        .expect("Failed to initialize database");
+    let database = match db::Database::open(db_path.to_str().unwrap()) {
+        Ok(database) => database,
+        Err(error) => {
+            rfd::MessageDialog::new()
+                .set_title("鸽鸽词典无法启动")
+                .set_description(format!("无法打开数据目录中的数据库：{error}"))
+                .set_level(rfd::MessageLevel::Error)
+                .show();
+            return;
+        }
+    };
+    if let Err(error) = database.initialize() {
+        rfd::MessageDialog::new()
+            .set_title("鸽鸽词典无法启动")
+            .set_description(format!("数据库初始化失败：{error}"))
+            .set_level(rfd::MessageLevel::Error)
+            .show();
+        return;
+    }
 
     #[cfg(windows)]
     if let Err(e) = migrate_api_key_storage(&database) {
@@ -1679,9 +1825,38 @@ pub fn run() {
         .setup(move |app| {
             let cb = clipboard_enabled.clone();
             setup_tray(app, cb.clone())?;
-            if std::env::args().any(|arg| arg == "--minimized") {
-                if let Some(window) = app.get_webview_window("main") {
+            let minimized = std::env::args().any(|arg| arg == "--minimized");
+            if let Some(window) = app.get_webview_window("main") {
+                if minimized {
+                    // The runtime may apply the window's initial visibility after
+                    // `setup` returns. Queue the hide on the UI thread as well as
+                    // applying it immediately so autostart never flashes a window.
+                    let deferred_window = window.clone();
                     let _ = window.hide();
+                    let _ = window.run_on_main_thread(move || {
+                        let _ = deferred_window.hide();
+                    });
+                    let delayed_app = app.app_handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        for delay_ms in [50_u64, 250, 1_000] {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            if let Some(window) = delayed_app.get_webview_window("main") {
+                                let deferred_window = window.clone();
+                                let _ = window.hide();
+                                let _ = window.run_on_main_thread(move || {
+                                    let _ = deferred_window.hide();
+                                });
+                            }
+                        }
+                    });
+                } else {
+                    let deferred_window = window.clone();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                    let _ = window.run_on_main_thread(move || {
+                        let _ = deferred_window.show();
+                        let _ = deferred_window.set_focus();
+                    });
                 }
             }
             check_auto_backup(app.app_handle());
@@ -1713,6 +1888,26 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    const LEGACY_WORDS_SCHEMA: &str = r#"
+        CREATE TABLE words (
+            id TEXT PRIMARY KEY,
+            lemma TEXT NOT NULL,
+            translation TEXT,
+            pos TEXT,
+            context_meaning TEXT,
+            explanation TEXT,
+            source_app TEXT,
+            source_title TEXT,
+            mastery TEXT DEFAULT 'new',
+            kind TEXT DEFAULT 'word',
+            saved_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            lookups INTEGER DEFAULT 1,
+            data TEXT NOT NULL
+        );
+        PRAGMA user_version = 0;
+    "#;
+
     #[test]
     fn cache_normalization_preserves_sentence_case() {
         assert_eq!(
@@ -1743,9 +1938,187 @@ mod tests {
     }
 
     #[test]
+    fn migration_requires_object_settings_to_update_data_dir() {
+        let mut settings = serde_json::json!({"theme": "dark"});
+        set_data_dir_setting(&mut settings, std::path::Path::new(r"D:\Data")).unwrap();
+        assert_eq!(settings["dataDir"], r"D:\Data");
+
+        let mut malformed = serde_json::json!([]);
+        assert!(set_data_dir_setting(&mut malformed, std::path::Path::new(r"D:\Data")).is_err());
+    }
+
+    #[test]
     fn streaming_fallback_only_applies_before_first_content() {
         assert!(should_fallback_stream(false));
         assert!(!should_fallback_stream(true));
+    }
+
+    #[test]
+    fn startup_does_not_accept_configured_directory_without_database_file() {
+        let root = std::env::temp_dir().join(format!(
+            "gege-startup-directory-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(!configured_data_dir_has_database(&root));
+        let connection = rusqlite::Connection::open(root.join(db::DB_FILENAME)).unwrap();
+        drop(connection);
+        assert!(!configured_data_dir_has_database(&root));
+        let database = db::Database::open(root.join(db::DB_FILENAME).to_str().unwrap()).unwrap();
+        database.initialize().unwrap();
+        assert!(configured_data_dir_has_database(&root));
+        drop(database);
+        std::fs::write(root.join(db::DB_FILENAME), b"corrupt").unwrap();
+        let _ = std::fs::remove_file(root.join(format!("{}-wal", db::DB_FILENAME)));
+        let _ = std::fs::remove_file(root.join(format!("{}-shm", db::DB_FILENAME)));
+        assert!(!configured_data_dir_has_database(&root));
+        let legacy =
+            db::Database::open(root.join(db::LEGACY_DB_FILENAME).to_str().unwrap()).unwrap();
+        legacy.initialize().unwrap();
+        assert!(!configured_data_dir_has_database(&root));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn isolated_appdata_override_is_used_for_the_default_directory() {
+        let override_root = std::path::PathBuf::from(r"C:\temp\gege-smoke-appdata");
+        let known_root = std::path::PathBuf::from(r"C:\Users\test\AppData\Roaming");
+        assert_eq!(
+            default_data_dir_from(Some(override_root.clone()), Some(known_root)),
+            override_root.join("GegeDic")
+        );
+    }
+
+    #[test]
+    fn relocation_rejects_database_with_schema_version_but_missing_contract() {
+        let root = std::env::temp_dir().join(format!(
+            "gege-relocation-schema-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(db::DB_FILENAME);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "PRAGMA user_version = {}; CREATE TABLE words (id TEXT);",
+                migrations::LATEST_SCHEMA_VERSION
+            ))
+            .unwrap();
+        drop(connection);
+
+        assert!(validate_relocated_database(&path).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn relocation_accepts_older_valid_database_for_migration() {
+        let root = std::env::temp_dir().join(format!(
+            "gege-relocation-legacy-schema-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(db::DB_FILENAME);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(LEGACY_WORDS_SCHEMA).unwrap();
+        drop(connection);
+
+        assert!(validate_relocated_database(&path).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn relocation_rejects_older_database_without_words_contract() {
+        let root = std::env::temp_dir().join(format!(
+            "gege-relocation-incomplete-legacy-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(db::DB_FILENAME);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE words (id TEXT PRIMARY KEY, kind TEXT, saved_at TEXT); PRAGMA user_version = 0;",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(validate_relocated_database(&path).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn configured_older_database_is_selected_for_startup_migration() {
+        let root = std::env::temp_dir().join(format!(
+            "gege-startup-legacy-schema-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let default_dir = root.join("default");
+        let selected_dir = root.join("selected");
+        std::fs::create_dir_all(&selected_dir).unwrap();
+        let path = selected_dir.join(db::DB_FILENAME);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(LEGACY_WORDS_SCHEMA).unwrap();
+        drop(connection);
+        db::persist_configured_data_dir(&default_dir, &selected_dir).unwrap();
+
+        let (resolved, warnings) = resolve_startup_data_dir(&default_dir).unwrap();
+        assert_eq!(resolved, selected_dir);
+        assert!(warnings.is_empty());
+        let database = db::Database::open(path.to_str().unwrap()).unwrap();
+        database.initialize().unwrap();
+        let reopened = rusqlite::Connection::open(&path).unwrap();
+        let version: i64 = reopened
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, migrations::LATEST_SCHEMA_VERSION);
+        drop(reopened);
+        drop(database);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn startup_rejects_latest_version_without_schema_contract() {
+        let root =
+            std::env::temp_dir().join(format!("gege-startup-schema-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(db::DB_FILENAME);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE words (id TEXT); PRAGMA user_version = {};",
+                migrations::LATEST_SCHEMA_VERSION
+            ))
+            .unwrap();
+        drop(connection);
+
+        assert!(!configured_data_dir_has_database(&root));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn database_initialization_rejects_latest_version_missing_schema_contract() {
+        let root =
+            std::env::temp_dir().join(format!("gege-init-schema-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(db::DB_FILENAME);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(LEGACY_WORDS_SCHEMA).unwrap();
+        connection
+            .pragma_update(None, "user_version", migrations::LATEST_SCHEMA_VERSION)
+            .unwrap();
+        drop(connection);
+
+        let database = db::Database::open(path.to_str().unwrap()).unwrap();
+        assert!(database.initialize().is_err());
+        drop(database);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(windows)]
@@ -1797,10 +2170,17 @@ mod tests {
     #[ignore = "requires GEGE_LIVE_DB and makes a paid network request"]
     async fn live_configured_stream_lookup_completes() {
         let db_path = std::env::var("GEGE_LIVE_DB").expect("GEGE_LIVE_DB is required");
-        let database = db::Database::open(&db_path).unwrap();
+        let database = db::Database::open_read_only(&db_path).unwrap();
         let settings = database.get_settings().unwrap();
         let provider = &settings["provider"];
-        let api_key = dpapi::decrypt(provider["apiKey"].as_str().unwrap()).unwrap();
+        let api_key = match std::env::var("GEGE_LIVE_API_KEY") {
+            Ok(value) if !value.trim().is_empty() => value,
+            _ => dpapi::decrypt(provider["apiKey"].as_str().unwrap()).unwrap_or_else(|error| {
+                panic!(
+                    "无法解密 GEGE_LIVE_DB 中的 API Key（可在原始 Windows 用户会话运行，或通过 GEGE_LIVE_API_KEY 临时注入）：{error}"
+                )
+            }),
+        };
         let templates = database.get_templates().unwrap();
         let template = templates
             .iter()

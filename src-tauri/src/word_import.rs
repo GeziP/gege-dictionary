@@ -3,6 +3,15 @@ use std::collections::HashMap;
 
 pub const MAX_IMPORT_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_IMPORT_ROWS: usize = 10_000;
+const ALLOWED_IMPORT_TARGETS: &[&str] = &[
+    "lemma",
+    "translation",
+    "pos",
+    "contextMeaning",
+    "explanation",
+    "note",
+    "tags",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -125,6 +134,11 @@ pub fn parse_import_rows(
     format: &str,
     mapping: &HashMap<String, String>,
 ) -> Result<(Vec<ParsedImportRow>, Vec<ImportRowError>), String> {
+    for target in mapping.keys() {
+        if !ALLOWED_IMPORT_TARGETS.contains(&target.as_str()) {
+            return Err(format!("不允许的导入映射字段: {target}"));
+        }
+    }
     let lemma_column = mapping
         .get("lemma")
         .filter(|value| !value.trim().is_empty())
@@ -143,6 +157,9 @@ pub fn parse_import_rows(
     let mut rows = Vec::new();
     let mut errors = Vec::new();
     for (index, record) in reader.records().enumerate() {
+        if index >= MAX_IMPORT_ROWS {
+            return Err("导入文件不能超过 10,000 行".into());
+        }
         let row_number = index + 2;
         let record = match record {
             Ok(record) => record,
@@ -224,5 +241,24 @@ mod tests {
         let content = "lemma\n".to_string() + &"word\n".repeat(10_001);
         let error = preview_word_import(&content, "tsv").unwrap_err();
         assert!(error.contains("10,000"));
+    }
+
+    #[test]
+    fn parser_rejects_more_than_ten_thousand_rows_without_preview() {
+        let content = "lemma\n".to_string() + &"word\n".repeat(10_001);
+        let mapping = [("lemma".to_string(), "lemma".to_string())]
+            .into_iter()
+            .collect();
+        let error = parse_import_rows(&content, "tsv", &mapping).unwrap_err();
+        assert!(error.contains("10,000"));
+    }
+
+    #[test]
+    fn parser_rejects_internal_mapping_targets() {
+        let mapping = [("id".to_string(), "lemma".to_string())]
+            .into_iter()
+            .collect();
+        let error = parse_import_rows("lemma\nhello\n", "csv", &mapping).unwrap_err();
+        assert!(error.contains("映射") || error.contains("target") || error.contains("字段"));
     }
 }

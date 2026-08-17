@@ -4,6 +4,7 @@ node_modules/
 # Build output
 dist/
 src-tauri/target/
+.verify-target/
 
 # IDE
 .vscode/
@@ -20,6 +21,7 @@ desktop.ini
 .env
 .env.*
 *.pem
+api-key.txt
 
 # Generated assets (can be regenerated)
 gen_icon.py

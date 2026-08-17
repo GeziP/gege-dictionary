@@ -1,7 +1,11 @@
 use crate::glossary::{self, GlossaryTerm};
-use rusqlite::{backup::Backup, params, params_from_iter, Connection, Result as SqlResult, Row};
+use rusqlite::{
+    backup::Backup, params, params_from_iter, Connection, OptionalExtension, Result as SqlResult,
+    Row,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -277,6 +281,27 @@ impl Database {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_read_only(path: &str) -> Result<Self, String> {
+        // `immutable=1` prevents SQLite from creating WAL/SHM sidecars while
+        // the live smoke test inspects the user's real database.
+        let uri_path = path.replace('\\', "/");
+        let uri = if uri_path.contains(':') {
+            format!("file:///{uri_path}?immutable=1")
+        } else {
+            format!("file:{uri_path}?immutable=1")
+        };
+        let conn = Connection::open_with_flags(
+            &uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| format!("DB read-only open error: {e}"))?;
+        Ok(Self {
+            conn,
+            path: path.to_string(),
+        })
+    }
+
     pub fn open_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory().map_err(|e| format!("Memory DB error: {e}"))?;
         Ok(Self {
@@ -333,6 +358,9 @@ pub(crate) fn snapshot_connection(
                 return Err(format!("数据库 schema 版本不匹配: {schema}"));
             }
         }
+        if validate_schema {
+            validate_schema_contract(&target)?;
+        }
         drop(target);
         atomic_replace(&temp, destination)
     })();
@@ -373,10 +401,15 @@ impl Database {
         }
         let source = Connection::open(&backup_path).map_err(|e| format!("打开备份失败: {e}"))?;
         validate_connection(&source)?;
-        let safety_path = db_dir.join("backups").join(format!(
-            "{RESTORE_SAFETY_PREFIX}{}.db",
-            chrono::Local::now().format("%Y%m%d-%H%M%S-%3f")
-        ));
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S-%3f");
+        let mut safety_name = format!("{RESTORE_SAFETY_PREFIX}{stamp}.db");
+        let mut safety_path = db_dir.join("backups").join(&safety_name);
+        let mut suffix = 1_u32;
+        while safety_path.exists() {
+            safety_name = format!("{RESTORE_SAFETY_PREFIX}{stamp}-{suffix:03}.db");
+            safety_path = db_dir.join("backups").join(&safety_name);
+            suffix += 1;
+        }
         self.snapshot_to(&safety_path)?;
         let restore_result = (|| -> Result<(), String> {
             let backup =
@@ -413,6 +446,9 @@ impl Database {
                 |row| row.get(0),
             )
             .map_err(|e| format!("检查数据库状态失败: {e}"))?;
+        // Create only tables that migrations can safely use before touching
+        // the current words schema. A database selected from an older schema
+        // must be migrated before indexes, FTS and triggers reference it.
         self.conn
             .execute_batch(
                 "
@@ -433,18 +469,11 @@ impl Database {
                 data TEXT NOT NULL
             );
 
-            CREATE INDEX IF NOT EXISTS idx_words_lemma ON words(lemma);
-            CREATE INDEX IF NOT EXISTS idx_words_saved_at ON words(saved_at);
-            CREATE INDEX IF NOT EXISTS idx_words_mastery ON words(mastery);
-            CREATE INDEX IF NOT EXISTS idx_words_source ON words(source_app);
-
             CREATE TABLE IF NOT EXISTS word_tags (
                 word_id TEXT NOT NULL REFERENCES words(id) ON DELETE CASCADE,
                 tag TEXT NOT NULL,
                 PRIMARY KEY (word_id, tag)
             );
-
-            CREATE INDEX IF NOT EXISTS idx_word_tags_tag ON word_tags(tag);
 
             CREATE TABLE IF NOT EXISTS cache (
                 cache_key TEXT PRIMARY KEY,
@@ -469,6 +498,25 @@ impl Database {
                 tokens INTEGER DEFAULT 0
             );
 
+            ",
+            )
+            .map_err(|e| format!("DB init error: {e}"))?;
+
+        if existing_database {
+            crate::migrations::migrate(&self.conn, &self.path)?;
+        } else {
+            crate::migrations::initialize_latest(&self.conn)?;
+        }
+
+        self.conn
+            .execute_batch(
+                "
+            CREATE INDEX IF NOT EXISTS idx_words_lemma ON words(lemma);
+            CREATE INDEX IF NOT EXISTS idx_words_saved_at ON words(saved_at);
+            CREATE INDEX IF NOT EXISTS idx_words_mastery ON words(mastery);
+            CREATE INDEX IF NOT EXISTS idx_words_source ON words(source_app);
+            CREATE INDEX IF NOT EXISTS idx_word_tags_tag ON word_tags(tag);
+
             CREATE VIRTUAL TABLE IF NOT EXISTS words_fts USING fts5(
                 lemma, translation, context_meaning, explanation,
                 content='words', content_rowid='rowid'
@@ -492,16 +540,11 @@ impl Database {
             END;
             ",
             )
-            .map_err(|e| format!("DB init error: {e}"))?;
-
-        if existing_database {
-            crate::migrations::migrate(&self.conn, &self.path)?;
-        } else {
-            crate::migrations::initialize_latest(&self.conn)?;
-        }
+            .map_err(|e| format!("DB init post-migration error: {e}"))?;
 
         self.ensure_default_settings()?;
         self.ensure_default_templates()?;
+        self.validate()?;
         Ok(())
     }
 
@@ -1409,10 +1452,14 @@ impl Database {
     }
 
     pub fn save_settings(&self, settings: &Value) -> Result<(), String> {
+        let mut sanitized = settings.clone();
+        if let Some(root) = sanitized.as_object_mut() {
+            root.remove("anonymousStats");
+        }
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES ('app', ?1)",
-                params![settings.to_string()],
+                params![sanitized.to_string()],
             )
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -1931,7 +1978,7 @@ fn validate_integrity(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_connection(conn: &Connection) -> Result<(), String> {
+fn validate_connection_basic(conn: &Connection) -> Result<(), String> {
     validate_integrity(conn)?;
     let schema = crate::migrations::current_version(conn)?;
     if schema != crate::migrations::LATEST_SCHEMA_VERSION {
@@ -1940,11 +1987,139 @@ fn validate_connection(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_connection(conn: &Connection) -> Result<(), String> {
+    validate_connection_basic(conn)?;
+    validate_schema_contract(conn)
+}
+
+pub(crate) fn validate_database_file(path: &Path) -> Result<(), String> {
+    let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("打开数据库失败: {e}"))?;
+    validate_connection(&connection)
+        .map_err(|error| format!("数据库 {} 验证失败: {error}", path.display()))
+}
+
+fn validate_schema_contract(conn: &Connection) -> Result<(), String> {
+    const REQUIRED_COLUMNS: &[(&str, &[&str])] = &[
+        (
+            "words",
+            &[
+                "id",
+                "lemma",
+                "translation",
+                "pos",
+                "context_meaning",
+                "explanation",
+                "source_app",
+                "source_title",
+                "mastery",
+                "kind",
+                "saved_at",
+                "updated_at",
+                "lookups",
+                "data",
+            ],
+        ),
+        ("word_tags", &["word_id", "tag"]),
+        ("cache", &["cache_key", "model", "response", "created_at"]),
+        ("settings", &["key", "value"]),
+        ("templates", &["id", "data"]),
+        ("usage_log", &["date", "queries", "tokens"]),
+        (
+            "review_state",
+            &[
+                "word_id",
+                "box",
+                "due_at",
+                "last_result",
+                "correct_count",
+                "wrong_count",
+                "reviewed_at",
+                "created_at",
+            ],
+        ),
+        (
+            "glossary_terms",
+            &[
+                "id",
+                "term",
+                "term_key",
+                "translation",
+                "domain",
+                "note",
+                "case_sensitive",
+                "enabled",
+                "created_at",
+                "updated_at",
+            ],
+        ),
+    ];
+
+    for (table, required_columns) in REQUIRED_COLUMNS {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                params![table],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("schema table check failed for {table}: {e}"))?;
+        if !exists {
+            return Err(format!("schema missing required table: {table}"));
+        }
+        let pragma = format!("PRAGMA table_info(\"{table}\")");
+        let mut statement = conn
+            .prepare(&pragma)
+            .map_err(|e| format!("schema column check failed for {table}: {e}"))?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| format!("schema column check failed for {table}: {e}"))?
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(|e| format!("schema column check failed for {table}: {e}"))?;
+        for column in *required_columns {
+            if !columns.contains(*column) {
+                return Err(format!("schema missing required column: {table}.{column}"));
+            }
+        }
+    }
+
+    let fts_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name='words_fts'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("schema FTS check failed: {e}"))?;
+    if !fts_sql
+        .as_deref()
+        .map(|sql| sql.to_ascii_lowercase().contains("using fts5"))
+        .unwrap_or(false)
+    {
+        return Err("schema missing words_fts FTS5 table".into());
+    }
+
+    for trigger in ["words_ai", "words_ad", "words_au"] {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)",
+                params![trigger],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("schema trigger check failed for {trigger}: {e}"))?;
+        if !exists {
+            return Err(format!("schema missing required trigger: {trigger}"));
+        }
+    }
+    Ok(())
+}
+
 fn is_safe_backup_name(name: &str) -> bool {
     let path = Path::new(name);
     path.file_name().and_then(|file| file.to_str()) == Some(name)
         && name.ends_with(".db")
-        && (name.starts_with(AUTO_BACKUP_PREFIX) || name.starts_with(PREMIGRATION_BACKUP_PREFIX))
+        && (name.starts_with(AUTO_BACKUP_PREFIX)
+            || name.starts_with(PREMIGRATION_BACKUP_PREFIX)
+            || name.starts_with(RESTORE_SAFETY_PREFIX))
 }
 
 fn available_space(path: &Path) -> Result<u64, String> {
@@ -1985,6 +2160,30 @@ fn verify_directory_writable(directory: &Path) -> Result<(), String> {
         Ok(())
     })();
     let _ = fs::remove_file(&probe);
+    result
+}
+
+fn copy_file_without_replace(source: &Path, destination: &Path) -> Result<u64, String> {
+    let mut created = false;
+    let result = (|| -> Result<u64, String> {
+        let mut input = fs::File::open(source)
+            .map_err(|e| format!("无法打开备份文件 {}: {e}", source.display()))?;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .map_err(|e| format!("目标备份文件已存在或不可写 {}: {e}", destination.display()))?;
+        created = true;
+        let bytes = std::io::copy(&mut input, &mut output)
+            .map_err(|e| format!("复制备份文件失败 {}: {e}", source.display()))?;
+        output
+            .sync_all()
+            .map_err(|e| format!("同步备份文件失败 {}: {e}", destination.display()))?;
+        Ok(bytes)
+    })();
+    if result.is_err() && created {
+        let _ = fs::remove_file(destination);
+    }
     result
 }
 
@@ -2059,7 +2258,10 @@ pub fn list_backups(db_path: &str) -> Result<Vec<Value>, String> {
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let name = entry.file_name().to_string_lossy().to_string();
-            if !name.starts_with(AUTO_BACKUP_PREFIX) || !name.ends_with(".db") {
+            if !is_safe_backup_name(&name) {
+                return None;
+            }
+            if !entry.path().is_file() {
                 return None;
             }
             let meta = entry.metadata().ok()?;
@@ -2074,6 +2276,14 @@ pub fn list_backups(db_path: &str) -> Result<Vec<Value>, String> {
                 "sizeKb": size_kb,
                 "modifiedTs": modified_ts,
                 "path": entry.path().to_string_lossy().to_string(),
+                "kind": if name.starts_with(AUTO_BACKUP_PREFIX) {
+                    "auto"
+                } else if name.starts_with(PREMIGRATION_BACKUP_PREFIX) {
+                    "premigration"
+                } else {
+                    "restoreSafety"
+                },
+                "restorable": !name.starts_with(PREMIGRATION_BACKUP_PREFIX),
             }))
         })
         .collect();
@@ -2094,6 +2304,10 @@ pub fn restore_backup(database: &mut Database, backup_name: &str) -> Result<(), 
 pub fn cleanup_migration_target(result: &DataDirChangeResult) {
     let new_db = Path::new(&result.new_db_path);
     let _ = fs::remove_file(new_db);
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let sidecar = PathBuf::from(format!("{}{}", result.new_db_path, suffix));
+        let _ = fs::remove_file(sidecar);
+    }
     if let Some(parent) = new_db.parent() {
         for name in &result.copied_backup_names {
             let _ = fs::remove_file(parent.join("backups").join(name));
@@ -2117,6 +2331,13 @@ pub fn change_data_dir(database: &Database, new_dir: &str) -> Result<DataDirChan
     let old_dir = old_db_path.parent().ok_or("无法解析原目录")?;
     if target_dir == old_dir {
         return Err("目标目录与当前数据目录相同".into());
+    }
+    if fs::read_dir(&target_dir)
+        .map_err(|e| format!("读取目标目录失败: {e}"))?
+        .next()
+        .is_some()
+    {
+        return Err("目标数据目录必须为空".into());
     }
     let new_db_path = target_dir.join(DB_FILENAME);
     if new_db_path.exists() || target_dir.join(LEGACY_DB_FILENAME).exists() {
@@ -2164,8 +2385,11 @@ pub fn change_data_dir(database: &Database, new_dir: &str) -> Result<DataDirChan
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().to_string();
+                if !is_safe_backup_name(&name) {
+                    continue;
+                }
                 let destination = new_backups.join(&name);
-                match fs::copy(entry.path(), &destination) {
+                match copy_file_without_replace(&entry.path(), &destination) {
                     Ok(_) => copied_backup_names.push(name),
                     Err(error) => warnings.push(format!("备份复制失败 {name}: {error}")),
                 }
@@ -2406,6 +2630,30 @@ mod tests {
                 "kind": "word"
             }))
             .unwrap();
+        source
+            .save_settings(&serde_json::json!({
+                "provider": {"apiKey": ""},
+                "theme": "dark",
+                "dataDir": "migration-settings"
+            }))
+            .unwrap();
+        source
+            .conn
+            .execute(
+                "UPDATE review_state SET box=3 WHERE word_id='migration-word'",
+                [],
+            )
+            .unwrap();
+        source
+            .save_glossary_term(&serde_json::json!({
+                "term": "migration-term",
+                "translation": "迁移术语",
+                "domain": "general",
+                "note": "保留",
+                "caseSensitive": false,
+                "enabled": true
+            }))
+            .unwrap();
         std::fs::write(
             old_dir
                 .join("backups")
@@ -2418,6 +2666,7 @@ mod tests {
             b"legacy",
         )
         .unwrap();
+        std::fs::write(old_dir.join("backups").join("notes.txt"), b"unrelated").unwrap();
 
         let result = change_data_dir(&source, new_dir.to_str().unwrap()).unwrap();
         assert_eq!(
@@ -2432,16 +2681,120 @@ mod tests {
                 .join(DB_FILENAME)
                 .to_string_lossy()
         );
-        assert_eq!(result.backups_copied, 2);
+        assert!(old_path.exists());
+        assert_eq!(result.backups_copied, 1);
         assert!(new_dir.join(DB_FILENAME).exists());
         assert!(new_dir
             .join("backups")
             .join("gege-backup-20260811-120000-001.db")
             .exists());
-        assert!(new_dir
+        assert!(!new_dir
             .join("backups")
             .join("lexnote-backup-old.db")
             .exists());
+        assert!(!new_dir.join("backups").join("notes.txt").exists());
+        let migrated = Database::open(result.new_db_path.as_str()).unwrap();
+        migrated.initialize().unwrap();
+        assert_eq!(migrated.get_all_words().unwrap().len(), 1);
+        assert_eq!(migrated.get_settings().unwrap()["theme"], "dark");
+        let box_number: i64 = migrated
+            .conn
+            .query_row(
+                "SELECT box FROM review_state WHERE word_id='migration-word'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(box_number, 3);
+        assert_eq!(
+            migrated.list_glossary_terms(None, None, 20, 0).unwrap()["total"],
+            1
+        );
+    }
+
+    #[test]
+    fn isolated_reliability_workflow_round_trips_database_state() {
+        let root = TestDir::new("isolated-workflow");
+        let old_dir = root.0.join("old");
+        let new_dir = root.0.join("new");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let old_path = old_dir.join(DB_FILENAME);
+        let database = Database::open(old_path.to_str().unwrap()).unwrap();
+        database.initialize().unwrap();
+        database
+            .save_word(&serde_json::json!({
+                "id": "workflow-word",
+                "lemma": "workflow",
+                "translation": "工作流",
+                "kind": "word"
+            }))
+            .unwrap();
+        database
+            .save_settings(&serde_json::json!({
+                "provider": {"apiKey": ""},
+                "theme": "dark"
+            }))
+            .unwrap();
+        database
+            .conn
+            .execute(
+                "UPDATE review_state SET box=3 WHERE word_id='workflow-word'",
+                [],
+            )
+            .unwrap();
+        database
+            .save_glossary_term(&serde_json::json!({
+                "term": "workflow-term",
+                "translation": "工作流术语",
+                "domain": "general",
+                "note": "保留",
+                "caseSensitive": false,
+                "enabled": true
+            }))
+            .unwrap();
+
+        let backup_name = backup_database(&database).unwrap();
+        let mapping = [
+            ("lemma".to_string(), "lemma".to_string()),
+            ("translation".to_string(), "translation".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let import = database
+            .import_words("lemma,translation\nimported,导入词条\n", "csv", &mapping)
+            .unwrap();
+        assert_eq!(import.inserted, 1);
+
+        let migration = change_data_dir(&database, new_dir.to_str().unwrap()).unwrap();
+        drop(database);
+        let mut reopened = Database::open(&migration.new_db_path).unwrap();
+        reopened.initialize().unwrap();
+        assert_eq!(reopened.get_all_words().unwrap().len(), 2);
+        assert_eq!(reopened.get_settings().unwrap()["theme"], "dark");
+        assert_eq!(
+            reopened
+                .conn
+                .query_row(
+                    "SELECT box FROM review_state WHERE word_id='workflow-word'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            reopened.list_glossary_terms(None, None, 20, 0).unwrap()["total"],
+            1
+        );
+
+        restore_backup(&mut reopened, &backup_name).unwrap();
+        assert_eq!(reopened.get_all_words().unwrap().len(), 1);
+        assert_eq!(reopened.get_all_words().unwrap()[0]["lemma"], "workflow");
+        assert_eq!(reopened.get_settings().unwrap()["theme"], "dark");
+        assert_eq!(
+            reopened.list_glossary_terms(None, None, 20, 0).unwrap()["total"],
+            1
+        );
     }
 
     #[test]
@@ -2486,6 +2839,30 @@ mod tests {
             .count();
         assert_eq!(auto_count, 10);
         assert!(legacy.exists());
+    }
+
+    #[test]
+    fn daily_backup_detection_is_scoped_to_the_local_calendar_day() {
+        let root = TestDir::new("auto-backup-calendar-day");
+        let backups = root.0.join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        let db_path = root.0.join(DB_FILENAME);
+        let today = chrono::Local::now().format("%Y%m%d");
+        let yesterday = (chrono::Local::now() - chrono::Duration::days(1)).format("%Y%m%d");
+        std::fs::write(
+            backups.join(format!("{AUTO_BACKUP_PREFIX}{yesterday}-235959-000.db")),
+            b"yesterday",
+        )
+        .unwrap();
+        std::fs::create_dir(backups.join(format!("{AUTO_BACKUP_PREFIX}{today}-000000-000.db")))
+            .unwrap();
+        assert!(!has_auto_backup_today(db_path.to_str().unwrap()).unwrap());
+        std::fs::write(
+            backups.join(format!("{AUTO_BACKUP_PREFIX}{today}-000001-000.db")),
+            b"today",
+        )
+        .unwrap();
+        assert!(has_auto_backup_today(db_path.to_str().unwrap()).unwrap());
     }
 
     #[test]
@@ -2550,6 +2927,23 @@ mod tests {
         db.initialize().unwrap();
         db.save_word(&serde_json::json!({"id": "before", "lemma": "before", "kind": "word"}))
             .unwrap();
+        db.save_settings(&serde_json::json!({
+            "provider": {"apiKey": ""},
+            "theme": "dark"
+        }))
+        .unwrap();
+        db.conn
+            .execute("UPDATE review_state SET box=3 WHERE word_id='before'", [])
+            .unwrap();
+        db.save_glossary_term(&serde_json::json!({
+            "term": "restore-term",
+            "translation": "恢复术语",
+            "domain": "general",
+            "note": "保留",
+            "caseSensitive": false,
+            "enabled": true
+        }))
+        .unwrap();
         let backup_name = backup_database(&db).unwrap();
         db.save_word(&serde_json::json!({"id": "after", "lemma": "after", "kind": "word"}))
             .unwrap();
@@ -2557,8 +2951,168 @@ mod tests {
         let words = db.get_all_words().unwrap();
         assert_eq!(words.len(), 1);
         assert_eq!(words[0]["lemma"], "before");
+        assert_eq!(db.get_settings().unwrap()["theme"], "dark");
+        let box_number: i64 = db
+            .conn
+            .query_row(
+                "SELECT box FROM review_state WHERE word_id='before'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(box_number, 3);
+        assert_eq!(
+            db.list_glossary_terms(None, None, 20, 0).unwrap()["total"],
+            1
+        );
         assert!(path.exists());
         assert!(root.0.join("backups").join(backup_name).exists());
+        assert!(list_backups(path.to_str().unwrap())
+            .unwrap()
+            .iter()
+            .any(|item| item["kind"] == "restoreSafety" && item["restorable"] == true));
+    }
+
+    #[test]
+    fn backup_listing_marks_pre_migration_snapshots_non_restorable() {
+        let root = TestDir::new("backup-list-kinds");
+        let path = root.0.join(DB_FILENAME);
+        let database = Database::open(path.to_str().unwrap()).unwrap();
+        database.initialize().unwrap();
+        let backups = root.0.join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        let premigration = backups.join("gege-premigrate-v2-test.db");
+        database.snapshot_to(&premigration).unwrap();
+        let listed = list_backups(path.to_str().unwrap()).unwrap();
+        let item = listed
+            .iter()
+            .find(|item| item["name"] == "gege-premigrate-v2-test.db")
+            .unwrap();
+        assert_eq!(item["kind"], "premigration");
+        assert_eq!(item["restorable"], false);
+    }
+
+    #[test]
+    fn restore_rejects_incomplete_schema_without_changing_current_database() {
+        let root = TestDir::new("restore-invalid-schema");
+        let path = root.0.join(DB_FILENAME);
+        let mut db = Database::open(path.to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        db.save_word(&serde_json::json!({
+            "id": "current",
+            "lemma": "current value",
+            "kind": "word"
+        }))
+        .unwrap();
+
+        let invalid_name = "gege-backup-invalid-schema.db";
+        let invalid_path = root.0.join("backups").join(invalid_name);
+        std::fs::create_dir_all(invalid_path.parent().unwrap()).unwrap();
+        let invalid = Connection::open(&invalid_path).unwrap();
+        invalid
+            .execute_batch(
+                "CREATE TABLE words (
+                    id TEXT PRIMARY KEY,
+                    lemma TEXT NOT NULL,
+                    translation TEXT,
+                    pos TEXT,
+                    context_meaning TEXT,
+                    explanation TEXT,
+                    source_app TEXT,
+                    source_title TEXT,
+                    mastery TEXT,
+                    kind TEXT,
+                    saved_at TEXT,
+                    updated_at TEXT,
+                    lookups INTEGER,
+                    data TEXT
+                );
+                INSERT INTO words (id, lemma) VALUES ('invalid', 'invalid value');
+                PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        drop(invalid);
+
+        let error = restore_backup(&mut db, invalid_name).unwrap_err();
+        assert!(error.contains("schema") || error.contains("表") || error.contains("column"));
+        let lemma: String = db
+            .conn
+            .query_row("SELECT lemma FROM words WHERE id='current'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(lemma, "current value");
+    }
+
+    #[test]
+    fn migration_rejects_non_empty_target_without_creating_database() {
+        let root = TestDir::new("migration-non-empty-target");
+        let old_dir = root.0.join("old");
+        let new_dir = root.0.join("new");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        let marker = new_dir.join("keep-me.txt");
+        std::fs::write(&marker, b"do not replace").unwrap();
+
+        let old_path = old_dir.join(DB_FILENAME);
+        let source = Database::open(old_path.to_str().unwrap()).unwrap();
+        source.initialize().unwrap();
+        source
+            .save_word(&serde_json::json!({
+                "id": "migration-source",
+                "lemma": "source",
+                "kind": "word"
+            }))
+            .unwrap();
+
+        let error = change_data_dir(&source, new_dir.to_str().unwrap()).unwrap_err();
+        assert!(!error.is_empty());
+        assert_eq!(std::fs::read(&marker).unwrap(), b"do not replace");
+        assert!(!new_dir.join(DB_FILENAME).exists());
+    }
+
+    #[test]
+    fn backup_copy_never_replaces_existing_destination() {
+        let root = TestDir::new("backup-copy-no-replace");
+        let source = root.0.join("source.db");
+        let destination = root.0.join("destination.db");
+        std::fs::write(&source, b"new backup").unwrap();
+        std::fs::write(&destination, b"keep existing").unwrap();
+
+        assert!(copy_file_without_replace(&source, &destination).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"keep existing");
+    }
+
+    #[test]
+    fn cleanup_migration_target_removes_sqlite_sidecars() {
+        let root = TestDir::new("migration-cleanup-sidecars");
+        let target_dir = root.0.join("target");
+        let new_db = target_dir.join(DB_FILENAME);
+        std::fs::create_dir_all(target_dir.join("backups")).unwrap();
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            std::fs::write(
+                PathBuf::from(format!("{}{}", new_db.display(), suffix)),
+                b"partial",
+            )
+            .unwrap();
+        }
+        let copied = "gege-backup-test.db".to_string();
+        std::fs::write(target_dir.join("backups").join(&copied), b"backup").unwrap();
+        cleanup_migration_target(&DataDirChangeResult {
+            old_db_path: root.0.join("old").to_string_lossy().to_string(),
+            new_db_path: new_db.to_string_lossy().to_string(),
+            backups_copied: 1,
+            warnings: Vec::new(),
+            copied_backup_names: vec![copied],
+        });
+        assert!(!new_db.exists());
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(!PathBuf::from(format!("{}{}", new_db.display(), suffix)).exists());
+        }
+        assert!(!target_dir
+            .join("backups")
+            .join("gege-backup-test.db")
+            .exists());
     }
 
     #[test]
@@ -2584,6 +3138,7 @@ mod tests {
         db.initialize().unwrap();
         db.save_settings(&serde_json::json!({"provider": {"apiKey": ""}, "theme": "dark", "anonymousStats": true}))
             .unwrap();
+        assert!(db.get_settings().unwrap().get("anonymousStats").is_none());
         db.initialize().unwrap();
         let settings = db.get_settings().unwrap();
         assert_eq!(settings["theme"], "dark");

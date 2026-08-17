@@ -322,6 +322,8 @@ export async function listBackups(): Promise<Array<{
   sizeKb: number;
   modifiedTs: number;
   path: string;
+  kind: 'auto' | 'premigration' | 'restoreSafety';
+  restorable: boolean;
 }>> {
   return invoke('list_backups');
 }

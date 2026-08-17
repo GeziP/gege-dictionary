@@ -29,10 +29,16 @@ export function CaptureSection() {
   }, []);
 
   useEffect(() => {
-    bridge.getAutostartStatus().then(setAutostartEnabled).catch((error) => {
-      setAutostartError(String(error));
+    let active = true;
+    bridge.getAutostartStatus().then((actual) => {
+      if (!active) return;
+      setAutostartEnabled(actual);
+      updateSettings({ launchAtLogin: actual });
+    }).catch((error) => {
+      if (active) setAutostartError(String(error));
     });
-  }, []);
+    return () => { active = false; };
+  }, [updateSettings]);
 
   const handleAutostart = useCallback(async (enabled: boolean) => {
     setAutostartError(null);

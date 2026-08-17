@@ -36,6 +36,34 @@ const DEFAULT_SETTINGS: AppSettings = {
   skippedUpdateVersion: '',
 };
 
+type SettingsPatch = Omit<Partial<AppSettings>, 'provider'> & {
+  provider?: Partial<AppSettings['provider']>;
+};
+
+function applySettingsPatch(base: AppSettings, patch: SettingsPatch): AppSettings {
+  const { provider, ...rest } = patch;
+  return {
+    ...base,
+    ...rest,
+    ...(provider ? { provider: { ...base.provider, ...provider } } : {}),
+  };
+}
+
+function normalizeSettingsPatch(base: AppSettings, patch: SettingsPatch): SettingsPatch {
+  const normalized: SettingsPatch = { ...patch };
+  if (patch.provider) {
+    const providerPatch: Partial<AppSettings['provider']> = {};
+    for (const key of Object.keys(patch.provider) as Array<keyof AppSettings['provider']>) {
+      const value = patch.provider[key];
+      if (value !== base.provider[key]) {
+        (providerPatch as Record<string, unknown>)[key] = value;
+      }
+    }
+    normalized.provider = providerPatch;
+  }
+  return normalized;
+}
+
 interface Usage {
   today: number;
   month: number;
@@ -65,10 +93,11 @@ interface LexNoteValue {
   lookupContext: string;
   lookupSourceApp: string;
   lookupSourceTitle: string;
+  startupWarnings: string[];
   setNetwork: (mode: NetworkMode) => void;
   setCaptureMethod: (method: CaptureMethod) => void;
   setOnboarded: (value: boolean) => void;
-  updateSettings: (patch: Partial<AppSettings>) => void;
+  updateSettings: (patch: SettingsPatch) => void;
   saveWord: (word: SavedWord) => void;
   removeWords: (ids: string[]) => void;
   updateWord: (id: string, patch: Partial<SavedWord>) => void;
@@ -80,6 +109,8 @@ interface LexNoteValue {
   triggerLookup: (selection: string, context: string, kind: string, sourceApp?: string, sourceTitle?: string, forceRefresh?: boolean) => void;
   clearLookup: () => void;
   refreshWords: () => void;
+  refreshAppState: () => Promise<void>;
+  flushSettings: () => Promise<void>;
 }
 
 const LexNoteContext = createContext<LexNoteValue | null>(null);
@@ -90,8 +121,9 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
   const [words, setWords] = useState<SavedWord[]>([]);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const settingsRef = useRef(DEFAULT_SETTINGS);
-  const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
-  const settingsVersionRef = useRef(0);
+  const confirmedSettingsRef = useRef<AppSettings>(DEFAULT_SETTINGS);
+  const pendingSettingsRef = useRef<SettingsPatch[]>([]);
+  const drainingSettingsRef = useRef(false);
   const [settingsSaveStatus, setSettingsSaveStatus] = useState<SettingsSaveStatus>('idle');
   const [settingsSaveError, setSettingsSaveError] = useState<string | null>(null);
   const [templates, setTemplates] = useState<PromptTemplate[]>([]);
@@ -99,6 +131,7 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
   const [captureMethod, setCaptureMethod] = useState<CaptureMethod>('uia');
   const [onboarded, setOnboarded] = useState(false);
   const [usage, setUsage] = useState<Usage>({ today: 0, month: 0, tokens: 0 });
+  const [startupWarnings, setStartupWarnings] = useState<string[]>([]);
 
   const [initState, setInitState] = useState<InitState>(isTauri ? 'loading' : 'ready');
   const [lookupStatus, setLookupStatus] = useState<LookupStatus>('idle');
@@ -120,50 +153,69 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
     }
   }, [isTauri]);
 
-  useEffect(() => {
+  const refreshStartupWarnings = useCallback(async () => {
     if (!isTauri) return;
+    try {
+      const warnings = await bridge.getStartupWarnings();
+      setStartupWarnings(warnings.map((warning) => warning.message));
+    } catch (error) {
+      console.error('Failed to load startup warnings:', error);
+    }
+  }, [isTauri]);
 
-    (async () => {
-      const [dbWords, dbSettings, dbTemplates, dbUsage] = await Promise.allSettled([
-        bridge.getAllWords(),
-        bridge.getSettings(),
-        bridge.getTemplates(),
-        bridge.getUsage(),
-      ]);
+  const refreshAppState = useCallback(async () => {
+    if (!isTauri) return;
+    const [dbWords, dbSettings, dbTemplates, dbUsage, dbWarnings] = await Promise.allSettled([
+      bridge.getAllWords(),
+      bridge.getSettings(),
+      bridge.getTemplates(),
+      bridge.getUsage(),
+      bridge.getStartupWarnings(),
+    ]);
 
-      if (dbWords.status === 'fulfilled') {
-        setWords(dbWords.value as SavedWord[]);
-      }
-
-      if (dbSettings.status === 'fulfilled') {
-        const s = dbSettings.value as Partial<AppSettings>;
-        if (s.provider) {
-          setSettings((prev) => ({ ...prev, ...s }));
-          setOnboarded(!!s.provider.apiKey && s.provider.apiKey.length > 0);
-        } else {
-          setOnboarded(false);
-        }
+    if (dbWords.status === 'fulfilled') {
+      setWords(dbWords.value as SavedWord[]);
+    }
+    if (dbSettings.status === 'fulfilled') {
+      const saved = dbSettings.value as Partial<AppSettings>;
+      if (saved.provider) {
+        const merged = {
+          ...DEFAULT_SETTINGS,
+          ...saved,
+          provider: { ...DEFAULT_PROVIDER, ...saved.provider },
+        } as AppSettings;
+        confirmedSettingsRef.current = merged;
+        const optimistic = pendingSettingsRef.current.reduce(applySettingsPatch, merged);
+        settingsRef.current = optimistic;
+        setSettings(optimistic);
+        setOnboarded(Boolean(optimistic.provider.apiKey));
       } else {
         setOnboarded(false);
       }
-
-      if (dbTemplates.status === 'fulfilled') {
-        const dbTpls = dbTemplates.value as PromptTemplate[];
-        const userTpls = dbTpls.filter((t) => !t.builtIn);
-        const merged = [...DEFAULT_TEMPLATES.filter((t) => t.builtIn), ...userTpls];
-        setTemplates(merged);
-        for (const tpl of merged) {
-          bridge.saveTemplate(tpl).catch(console.error);
-        }
-      }
-
-      if (dbUsage.status === 'fulfilled') {
-        setUsage(dbUsage.value);
-      }
-
-      setInitState('ready');
-    })();
+    }
+    if (dbTemplates.status === 'fulfilled') {
+      const userTemplates = (dbTemplates.value as PromptTemplate[]).filter((tpl) => !tpl.builtIn);
+      const merged = [...DEFAULT_TEMPLATES.filter((tpl) => tpl.builtIn), ...userTemplates];
+      setTemplates(merged);
+    }
+    if (dbUsage.status === 'fulfilled') {
+      setUsage(dbUsage.value);
+    }
+    if (dbWarnings.status === 'fulfilled') {
+      setStartupWarnings(dbWarnings.value.map((warning) => warning.message));
+    }
   }, [isTauri]);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    void refreshAppState().finally(() => setInitState('ready'));
+  }, [isTauri, refreshAppState]);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    const interval = window.setInterval(() => void refreshStartupWarnings(), 30_000);
+    return () => window.clearInterval(interval);
+  }, [isTauri, refreshStartupWarnings]);
 
   useEffect(() => {
     settingsRef.current = settings;
@@ -178,40 +230,62 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
     root.classList.toggle('dark', prefersDark);
   }, [settings.theme]);
 
+  const drainSettingsQueue = useCallback(async () => {
+    if (!isTauri || drainingSettingsRef.current) return;
+    drainingSettingsRef.current = true;
+    setSettingsSaveStatus('saving');
+    setSettingsSaveError(null);
+    let lastError: unknown = null;
+    try {
+      while (pendingSettingsRef.current.length > 0) {
+        const patch = pendingSettingsRef.current[0];
+        const snapshot = applySettingsPatch(confirmedSettingsRef.current, patch);
+        try {
+          await bridge.saveSettings(snapshot);
+          confirmedSettingsRef.current = snapshot;
+          pendingSettingsRef.current.shift();
+        } catch (error) {
+          lastError = error;
+          pendingSettingsRef.current.shift();
+          const rebased = pendingSettingsRef.current.reduce(applySettingsPatch, confirmedSettingsRef.current);
+          settingsRef.current = rebased;
+          setSettings(rebased);
+        }
+      }
+    } finally {
+      drainingSettingsRef.current = false;
+      const finalSettings = pendingSettingsRef.current.reduce(applySettingsPatch, confirmedSettingsRef.current);
+      settingsRef.current = finalSettings;
+      setSettings(finalSettings);
+      if (lastError) {
+        setSettingsSaveStatus('error');
+        setSettingsSaveError(String(lastError));
+      } else {
+        setSettingsSaveStatus('idle');
+      }
+    }
+  }, [isTauri]);
+
   const updateSettings = useCallback(
-    (patch: Partial<AppSettings>) => {
+    (patch: SettingsPatch) => {
       const previous = settingsRef.current;
-      const next = { ...previous, ...patch };
+      const next = applySettingsPatch(previous, patch);
       settingsRef.current = next;
       setSettings(next);
       if (!isTauri) return;
-      const version = ++settingsVersionRef.current;
-      const keys = Object.keys(patch);
-      const analysisOnly = keys.length > 0 && keys.every((key) =>
-        key === 'activeDomainProfile' || key === 'analysisStyle'
-      );
+      pendingSettingsRef.current.push(normalizeSettingsPatch(previous, patch));
       setSettingsSaveStatus('saving');
       setSettingsSaveError(null);
-      const save = () => analysisOnly
-        ? bridge.saveAnalysisPreferences(next.activeDomainProfile, next.analysisStyle)
-        : bridge.saveSettings(next);
-      saveQueueRef.current = saveQueueRef.current
-        .catch(() => undefined)
-        .then(save)
-        .then(() => {
-          if (version === settingsVersionRef.current) setSettingsSaveStatus('idle');
-        })
-        .catch((error) => {
-          if (version === settingsVersionRef.current) {
-            settingsRef.current = previous;
-            setSettings(previous);
-            setSettingsSaveStatus('error');
-            setSettingsSaveError(String(error));
-          }
-        });
+      void drainSettingsQueue();
     },
-    [isTauri]
+    [drainSettingsQueue, isTauri]
   );
+
+  const flushSettings = useCallback(async () => {
+    while (drainingSettingsRef.current) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+  }, []);
 
   const saveWord = useCallback(
     (word: SavedWord) => {
@@ -305,6 +379,7 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
   const resetTemplates = useCallback(() => setTemplates(DEFAULT_TEMPLATES), []);
 
   const requestIdRef = React.useRef<string>('');
+  const streamTerminalRequestRef = React.useRef<string | null>(null);
   const activeLookupRef = React.useRef<{ selection: string; kind: string }>({ selection: '', kind: 'word' });
 
   // Listen for streaming events
@@ -315,18 +390,24 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
 
     const doneListener = bridge.listenLookupDone((e) => {
       if (e.requestId !== requestIdRef.current) return;
+      if (streamTerminalRequestRef.current === e.requestId) return;
+      streamTerminalRequestRef.current = e.requestId;
       setLookupStatus('done');
       setLookupResult(e.entry as Entry);
     });
 
     const errorListener = bridge.listenLookupError((e) => {
       if (e.requestId !== requestIdRef.current) return;
+      if (streamTerminalRequestRef.current === e.requestId) return;
+      streamTerminalRequestRef.current = e.requestId;
       setLookupStatus('error');
       setLookupError(e.message);
+      setLookupResult(null);
     });
 
     const deltaListener = bridge.listenLookupDelta((e) => {
       if (e.requestId !== requestIdRef.current) return;
+      if (streamTerminalRequestRef.current === e.requestId) return;
       const aliases: Record<string, keyof Entry> = {
         word: 'selection',
         context_meaning: 'contextMeaning',
@@ -393,24 +474,31 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
 
       if (!isTauri) return;
 
+      const rid = `req-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      requestIdRef.current = rid;
+      streamTerminalRequestRef.current = null;
       const useStreaming = settings.streamingEnabled === true && lookupListenersReady;
       if (useStreaming) {
-        const rid = `req-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-        requestIdRef.current = rid;
         try {
           await bridge.lookupWordStream(selection, context, kind, rid, forceRefresh);
         } catch (e) {
           console.warn('[triggerLookup] streaming failed:', e);
+          if (requestIdRef.current !== rid) return;
+          const alreadyTerminated = streamTerminalRequestRef.current === rid;
           requestIdRef.current = '';
-          setLookupStatus('error');
-          setLookupError(String(e));
+          if (!alreadyTerminated) {
+            setLookupStatus('error');
+            setLookupError(String(e));
+          }
         }
       } else {
         try {
           const entry = await bridge.lookupWord(selection, context, kind, forceRefresh);
+          if (requestIdRef.current !== rid) return;
           setLookupStatus('done');
           setLookupResult(entry as Entry);
         } catch (e) {
+          if (requestIdRef.current !== rid) return;
           setLookupStatus('error');
           setLookupError(String(e));
         }
@@ -452,6 +540,7 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
     lookupContext,
     lookupSourceApp,
     lookupSourceTitle,
+    startupWarnings,
     setNetwork,
     setCaptureMethod,
     setOnboarded,
@@ -467,6 +556,8 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
     triggerLookup,
     clearLookup,
     refreshWords,
+    refreshAppState,
+    flushSettings,
   };
 
   return <LexNoteContext.Provider value={value}>{children}</LexNoteContext.Provider>;

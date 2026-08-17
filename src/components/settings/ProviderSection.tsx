@@ -26,7 +26,7 @@ export function ProviderSection() {
   const [test, setTest] = useState<TestState>({ status: 'idle' });
 
   const patch = (changes: Partial<typeof provider>) =>
-  updateSettings({ provider: { ...provider, ...changes } });
+  updateSettings({ provider: changes });
 
   const runTest = async () => {
     setTest({ status: 'testing' });

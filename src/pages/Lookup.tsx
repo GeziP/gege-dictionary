@@ -112,7 +112,7 @@ export function Lookup() {
   }, [pinned, lookupStatus]);
 
   const handleSave = useCallback(() => {
-    if (!entry) return;
+    if (!entry || lookupStatus !== 'done') return;
     const word: SavedWord = {
       ...entry,
       id: existing?.id || `w-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -130,7 +130,7 @@ export function Lookup() {
     countLookup(0);
     const timer = setTimeout(() => setUndoTimer(null), 5000);
     setUndoTimer(timer);
-  }, [entry, existing, lookupContext, lookupSourceApp, lookupSourceTitle, tagInput, ctxSaveWord, countLookup]);
+  }, [entry, existing, lookupContext, lookupSourceApp, lookupSourceTitle, tagInput, ctxSaveWord, countLookup, lookupStatus]);
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
@@ -269,7 +269,7 @@ export function Lookup() {
             </div>
           )}
 
-          {entry && (
+          {entry && (lookupStatus === 'streaming' || lookupStatus === 'done') && (
             <motion.div
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
@@ -467,7 +467,7 @@ export function Lookup() {
         )}
 
         {/* Save Bar */}
-        {entry && (
+        {entry && lookupStatus === 'done' && (
           <div className="border-t border-line bg-raised px-3 py-2">
             {!saved ? (
               <div className="flex items-center gap-2">

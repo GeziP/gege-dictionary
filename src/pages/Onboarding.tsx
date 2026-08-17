@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import {
@@ -17,6 +17,7 @@ import { TextInput } from '../components/ui/TextInput';
 import { Toggle } from '../components/ui/Toggle';
 import { WALLPAPER_LIGHT } from '../data/scenes';
 import { classNames } from '../utils/format';
+import * as bridge from '../lib/tauri-bridge';
 
 const STEPS = ['配置模型', '划词即查', '数据与隐私'];
 
@@ -25,9 +26,26 @@ export function Onboarding() {
   const { settings, updateSettings, setOnboarded } = useLexNote();
   const [step, setStep] = useState(0);
   const [test, setTest] = useState<'idle' | 'testing' | 'ok' | 'error'>('idle');
+  const [autostartError, setAutostartError] = useState<string | null>(null);
+  const [autostartEnabled, setAutostartEnabled] = useState(settings.launchAtLogin);
   const provider = settings.provider;
   const patch = (changes: Partial<typeof provider>) =>
-  updateSettings({ provider: { ...provider, ...changes } });
+  updateSettings({ provider: changes });
+
+  useEffect(() => {
+    if (!bridge.isTauri()) return;
+    let active = true;
+    bridge.getAutostartStatus()
+      .then((actual) => {
+        if (!active) return;
+        setAutostartEnabled(actual);
+        updateSettings({ launchAtLogin: actual });
+      })
+      .catch((error) => {
+        if (active) setAutostartError(String(error));
+      });
+    return () => { active = false; };
+  }, [updateSettings]);
 
   return (
     <div className="relative flex h-full w-full items-center justify-center overflow-hidden bg-canvas p-6">
@@ -183,11 +201,21 @@ export function Onboarding() {
               </div>
               <div className="mt-2">
                 <Toggle
-                checked={settings.launchAtLogin}
-                onChange={(value) => updateSettings({ launchAtLogin: value })}
+                checked={autostartEnabled}
+                onChange={async (value) => {
+                  setAutostartError(null);
+                  try {
+                    const actual = await bridge.setAutostart(value);
+                    setAutostartEnabled(actual);
+                    updateSettings({ launchAtLogin: actual });
+                  } catch (error) {
+                    setAutostartError(String(error));
+                  }
+                }}
                 label="开机自启并常驻托盘"
                 description="关闭主窗口后仍可随时使用划词即查。" />
-              
+                {autostartError && <p className="mt-1 text-[11px] text-danger">开机自启设置失败：{autostartError}</p>}
+
                 <Toggle
                 checked={settings.captureContext}
                 onChange={(value) => updateSettings({ captureContext: value })}

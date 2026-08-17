@@ -971,6 +971,44 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Mutex, OnceLock};
+    use std::thread;
+    use std::time::Duration;
+
+    struct EnvironmentGuard {
+        values: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl Drop for EnvironmentGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.values {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+        }
+    }
+
+    fn loopback_proxy_guard() -> (std::sync::MutexGuard<'static, ()>, EnvironmentGuard) {
+        static PROXY_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = PROXY_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let names = ["NO_PROXY", "no_proxy"];
+        let previous = names
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect();
+        for name in names {
+            std::env::set_var(name, "127.0.0.1,localhost");
+        }
+        (lock, EnvironmentGuard { values: previous })
+    }
 
     #[test]
     fn test_url_construction_openai() {
@@ -1044,6 +1082,75 @@ mod tests {
         let mut other = serde_json::json!({ "model": "gpt-4o-mini" });
         apply_provider_options(&mut other, "https://api.openai.com/v1");
         assert!(other.get("thinking").is_none());
+    }
+
+    #[tokio::test]
+    async fn openai_streaming_round_trips_sse_and_emits_deltas() {
+        let (_proxy_lock, _proxy_guard) = loopback_proxy_guard();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("POST /chat/completions HTTP/1.1"));
+            assert!(request.contains("authorization: Bearer test-key"));
+            assert!(request.contains("\"stream\":true"));
+
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"world\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).unwrap();
+            stream
+                .write_all(&body.as_bytes()[..body.len() / 2])
+                .unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(5));
+            stream
+                .write_all(&body.as_bytes()[body.len() / 2..])
+                .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let mut deltas = Vec::new();
+        let result = stream_lookup_sse(
+            &format!("http://{address}"),
+            "test-key",
+            "test-model",
+            "openai",
+            0.3,
+            1200,
+            30,
+            "hello",
+            "context",
+            "word",
+            "Translate {{selection}} in {{context}}",
+            |delta| deltas.push(delta.to_string()),
+        )
+        .await
+        .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(result, "Hello world");
+        assert_eq!(deltas, ["Hello ", "world"]);
     }
 
     #[test]
