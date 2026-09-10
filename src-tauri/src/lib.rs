@@ -170,6 +170,53 @@ fn migrate_api_key_storage(database: &db::Database) -> Result<(), String> {
     Ok(())
 }
 
+const API_KEY_PLACEHOLDER: &str = "••••••••";
+
+fn is_placeholder_api_key(value: &str) -> bool {
+    value == API_KEY_PLACEHOLDER || value.chars().all(|c| c == '•' || c == '*') && value.len() >= 4
+}
+
+fn selection_meta(selection: &str, kind: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(selection.as_bytes());
+    let digest = hasher.finalize();
+    let head = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+    format!(
+        "len={} kind={kind} head_hash={head:08x}",
+        selection.len()
+    )
+}
+
+fn record_event(state: &tauri::State<'_, AppState>, event: &str, extra: serde_json::Value) {
+    if let Ok(db) = state.db.lock() {
+        let _ = db.record_local_event(event, &extra);
+    }
+}
+
+fn record_event_handle(app: &tauri::AppHandle, event: &str, extra: serde_json::Value) {
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(db) = state.db.lock() {
+            let _ = db.record_local_event(event, &extra);
+        }
+    }
+}
+
+#[tauri::command]
+async fn get_local_metrics(
+    state: tauri::State<'_, AppState>,
+    days: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.get_local_metrics(days.unwrap_or(7))
+}
+
+#[tauri::command]
+async fn clear_local_metrics(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.clear_local_metrics()
+}
+
 #[tauri::command]
 async fn get_all_words(
     state: tauri::State<'_, AppState>,
@@ -235,8 +282,16 @@ async fn submit_review(
     word_id: String,
     correct: bool,
 ) -> Result<serde_json::Value, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.submit_review(&word_id, correct)
+    let result = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db.submit_review(&word_id, correct)?
+    };
+    record_event(
+        &state,
+        "review_card_answered",
+        serde_json::json!({ "result": if correct { "correct" } else { "wrong" } }),
+    );
+    Ok(result)
 }
 
 #[tauri::command]
@@ -313,7 +368,7 @@ async fn get_settings(state: tauri::State<'_, AppState>) -> Result<serde_json::V
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let mut settings = db.get_settings()?;
 
-    // Decrypt API key for the frontend
+    // Never send the plaintext API key to the WebView; only a placeholder + flag.
     #[cfg(windows)]
     if let Some(provider) = settings.get_mut("provider").and_then(|p| p.as_object_mut()) {
         if let Some(key_val) = provider
@@ -323,8 +378,12 @@ async fn get_settings(state: tauri::State<'_, AppState>) -> Result<serde_json::V
         {
             if dpapi::is_encrypted(&key_val) {
                 match dpapi::decrypt(&key_val) {
-                    Ok(plain) => {
-                        provider.insert("apiKey".to_string(), serde_json::Value::String(plain));
+                    Ok(_plain) => {
+                        provider.insert(
+                            "apiKey".to_string(),
+                            serde_json::Value::String(API_KEY_PLACEHOLDER.to_string()),
+                        );
+                        provider.insert("hasApiKey".to_string(), serde_json::Value::Bool(true));
                     }
                     Err(e) => {
                         eprintln!("[get_settings] DPAPI decrypt failed: {e}, clearing key");
@@ -332,9 +391,21 @@ async fn get_settings(state: tauri::State<'_, AppState>) -> Result<serde_json::V
                             "apiKey".to_string(),
                             serde_json::Value::String(String::new()),
                         );
+                        provider.insert("hasApiKey".to_string(), serde_json::Value::Bool(false));
                     }
                 }
+            } else {
+                let has = !key_val.is_empty();
+                if has {
+                    provider.insert(
+                        "apiKey".to_string(),
+                        serde_json::Value::String(API_KEY_PLACEHOLDER.to_string()),
+                    );
+                }
+                provider.insert("hasApiKey".to_string(), serde_json::Value::Bool(has));
             }
+        } else {
+            provider.insert("hasApiKey".to_string(), serde_json::Value::Bool(false));
         }
     }
 
@@ -404,14 +475,22 @@ async fn save_settings(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
         {
-            eprintln!(
-                "[save_settings] apiKey len={}, already_encrypted={}",
-                key_val.len(),
-                dpapi::is_encrypted(&key_val)
-            );
-            let secured = secure_api_key_for_storage(&key_val, &stored_key)?;
-            provider.insert("apiKey".to_string(), serde_json::Value::String(secured));
+            if is_placeholder_api_key(&key_val) || (key_val.is_empty() && !stored_key.is_empty()) {
+                eprintln!("[save_settings] placeholder/empty apiKey; keeping stored ciphertext");
+                provider.insert("apiKey".to_string(), serde_json::Value::String(stored_key));
+            } else {
+                eprintln!(
+                    "[save_settings] apiKey len={}, already_encrypted={}",
+                    key_val.len(),
+                    dpapi::is_encrypted(&key_val)
+                );
+                let secured = secure_api_key_for_storage(&key_val, &stored_key)?;
+                provider.insert("apiKey".to_string(), serde_json::Value::String(secured));
+            }
         }
+    }
+    if let Some(provider) = settings.get_mut("provider").and_then(|p| p.as_object_mut()) {
+        provider.remove("hasApiKey");
     }
 
     if let Some(root) = settings.as_object_mut() {
@@ -718,13 +797,21 @@ async fn lookup_word(
     if api_key.starts_with("dpapi:") {
         return Err("API Key 解密失败，请到设置页重新输入".to_string());
     }
-    eprintln!("[lookup_word] selection={selection:?}, kind={kind:?}, model={model:?}, protocol={protocol:?}, timeout={timeout_secs}s, tpl_len={}", template_body.len());
+    eprintln!(
+        "[lookup_word] {} model={model:?} protocol={protocol:?} timeout={timeout_secs}s tpl_len={}",
+        selection_meta(&selection, &kind),
+        template_body.len()
+    );
 
     let cache_key = lookup_cache_key(&selection, &context, &kind, &model, &template_body);
     if !force_refresh {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         if let Some(mut cached) = db.get_cache(&cache_key, cache_ttl)? {
             eprintln!("[lookup_word] cache HIT");
+            let _ = db.record_local_event(
+                "lookup_cache_hit",
+                &serde_json::json!({ "kind": kind }),
+            );
             if let Some(obj) = cached.as_object_mut() {
                 obj.insert("fromCache".to_string(), serde_json::Value::Bool(true));
             }
@@ -732,6 +819,7 @@ async fn lookup_word(
         }
     }
     eprintln!("[lookup_word] cache miss, calling LLM...");
+    record_event(&state, "lookup_cache_miss", serde_json::json!({ "kind": kind }));
 
     let full_text = llm::stream_lookup(
         &base_url,
@@ -968,6 +1056,10 @@ async fn lookup_word_stream(
     let app_clone = app.clone();
     let mut extractor = llm::IncrementalJsonExtractor::new();
     let mut saw_stream_content = false;
+    let stream_started = std::time::Instant::now();
+    let mut first_field_logged = false;
+    let app_for_metrics = app.clone();
+    let kind_for_metrics = kind.clone();
 
     let result = llm::stream_lookup_sse(
         &base_url,
@@ -985,7 +1077,26 @@ async fn lookup_word_stream(
             if !delta.is_empty() {
                 saw_stream_content = true;
             }
-            for (field, value) in extractor.push(delta) {
+            let fields = extractor.push(delta);
+            if !fields.is_empty() && !first_field_logged {
+                first_field_logged = true;
+                let ms = stream_started.elapsed().as_millis() as u64;
+                let bucket = match ms {
+                    0..=499 => "0-500",
+                    500..=999 => "500-1000",
+                    1000..=1999 => "1000-2000",
+                    _ => "2000+",
+                };
+                record_event_handle(
+                    &app_for_metrics,
+                    "lookup_stream_first_field",
+                    serde_json::json!({
+                        "ms_bucket": bucket,
+                        "kind": kind_for_metrics,
+                    }),
+                );
+            }
+            for (field, value) in fields {
                 let _ = app_clone.emit(
                     "lookup://delta",
                     serde_json::json!({
@@ -1044,6 +1155,7 @@ async fn lookup_word_stream(
             eprintln!("[lookup_stream] SSE failed: {e}");
             if should_fallback_stream(saw_stream_content) {
                 eprintln!("[lookup_stream] falling back to one non-streaming request");
+                record_event_handle(&app, "lookup_stream_fallback", serde_json::json!({}));
                 match llm::stream_lookup(
                     &base_url,
                     &api_key,
@@ -1109,14 +1221,51 @@ async fn lookup_word_stream(
     }
 }
 
+fn resolve_api_key_for_request(
+    state: &tauri::State<'_, AppState>,
+    api_key: &str,
+) -> Result<String, String> {
+    if !api_key.is_empty() && !is_placeholder_api_key(api_key) {
+        return Ok(api_key.to_string());
+    }
+    #[cfg(windows)]
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let stored = db
+            .get_settings()?
+            .get("provider")
+            .and_then(|p| p.get("apiKey"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if stored.is_empty() {
+            return Err("尚未配置 API Key".into());
+        }
+        if dpapi::is_encrypted(&stored) {
+            return dpapi::decrypt(&stored);
+        }
+        return Ok(stored);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        if api_key.is_empty() || is_placeholder_api_key(api_key) {
+            return Err("尚未配置 API Key".into());
+        }
+        Ok(api_key.to_string())
+    }
+}
+
 #[tauri::command]
 async fn test_connection(
+    state: tauri::State<'_, AppState>,
     base_url: String,
     api_key: String,
     model: String,
     protocol: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let proto = protocol.as_deref().unwrap_or("openai");
+    let api_key = resolve_api_key_for_request(&state, &api_key)?;
     llm::test_connection(&base_url, &api_key, &model, proto).await
 }
 
@@ -1298,8 +1447,9 @@ async fn get_last_capture(state: tauri::State<'_, AppState>) -> Result<serde_jso
     if val.is_null() {
         eprintln!("[get_last_capture] returned NULL");
     } else {
-        let sel = val.get("selection").and_then(|v| v.as_str()).unwrap_or("?");
-        eprintln!("[get_last_capture] returned selection={sel:?}");
+        let sel = val.get("selection").and_then(|v| v.as_str()).unwrap_or("");
+        let kind = val.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        eprintln!("[get_last_capture] returned {}", selection_meta(sel, kind));
     }
     Ok(val)
 }
@@ -1748,6 +1898,11 @@ pub fn run() {
         Err(e) => eprintln!("[startup] Cache cleanup error: {e}"),
         _ => {}
     }
+    match database.cleanup_local_events(90) {
+        Ok(n) if n > 0 => eprintln!("[startup] Cleaned {n} expired local_events rows"),
+        Err(e) => eprintln!("[startup] local_events cleanup error: {e}"),
+        _ => {}
+    }
 
     let clipboard_watch_enabled = database
         .get_settings()
@@ -1800,6 +1955,8 @@ pub fn run() {
             preview_glossary_matches,
             get_usage,
             increment_usage,
+            get_local_metrics,
+            clear_local_metrics,
             lookup_word,
             lookup_word_stream,
             test_connection,

@@ -1,16 +1,58 @@
 /// Content filter to reduce clipboard false positives.
-/// Returns `true` if the content should be REJECTED (not looked up).
+/// Prefer false negatives (allow English) over false positives (reject prose).
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterReason {
+    Empty,
+    Secret,
+    FilePath,
+    Code,
+    Base64,
+    Email,
+    IpAddress,
+}
+
+impl FilterReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Secret => "secret",
+            Self::FilePath => "file_path",
+            Self::Code => "code",
+            Self::Base64 => "base64",
+            Self::Email => "email",
+            Self::IpAddress => "ip_address",
+        }
+    }
+}
 
 pub fn should_reject(text: &str) -> bool {
+    reject_reason(text).is_some()
+}
+
+pub fn reject_reason(text: &str) -> Option<FilterReason> {
     if text.is_empty() {
-        return true;
+        return Some(FilterReason::Empty);
     }
-    is_secret(text)
-        || is_file_path(text)
-        || is_code_snippet(text)
-        || is_base64_blob(text)
-        || is_email(text)
-        || is_ip_address(text)
+    if is_secret(text) {
+        return Some(FilterReason::Secret);
+    }
+    if is_file_path(text) {
+        return Some(FilterReason::FilePath);
+    }
+    if is_code_snippet(text) {
+        return Some(FilterReason::Code);
+    }
+    if is_base64_blob(text) {
+        return Some(FilterReason::Base64);
+    }
+    if is_email(text) {
+        return Some(FilterReason::Email);
+    }
+    if is_ip_address(text) {
+        return Some(FilterReason::IpAddress);
+    }
+    None
 }
 
 fn is_secret(text: &str) -> bool {
@@ -22,7 +64,6 @@ fn is_secret(text: &str) -> bool {
             return true;
         }
     }
-    // High-entropy no-space string (likely API key or hash)
     if !text.contains(' ') && text.len() >= 20 && text.len() <= 200 {
         let entropy = shannon_entropy(text);
         if entropy > 4.5 {
@@ -37,73 +78,251 @@ fn is_file_path(text: &str) -> bool {
     if line.len() > 300 {
         return false;
     }
-    // Windows paths
     if line.len() >= 3
         && line.as_bytes()[1] == b':'
         && (line.as_bytes()[2] == b'\\' || line.as_bytes()[2] == b'/')
     {
         return true;
     }
-    // Unix paths
     if line.starts_with('/') && !line.contains(' ') && line.contains('/') {
         let parts: Vec<&str> = line.split('/').collect();
         if parts.len() >= 3 {
             return true;
         }
     }
-    // UNC paths
     if line.starts_with("\\\\") {
         return true;
     }
     false
 }
 
+/// Prefixes that almost never begin natural English sentences.
+const STRONG_PREFIXES: &[&str] = &[
+    "#include",
+    "pub fn",
+    "async fn",
+    "impl ",
+    "namespace ",
+    "if (",
+    "for (",
+    "while (",
+    "switch (",
+    "catch (",
+];
+
+/// Prefixes that also appear in prose; require additional code context.
+const WEAK_PREFIXES: &[&str] = &[
+    "function ", "fn ", "def ", "class ", "import ", "from ", "const ", "let ", "var ",
+    "struct ", "interface ", "type ", "enum ", "package ",
+];
+
+const NATURAL_STARTERS: &[&str] = &[
+    "the ", "a ", "an ", "my ", "this ", "that ", "it ", "some ", "any ", "these ", "those ",
+    "our ", "your ", "all ", "both ", "each ", "every ", "both ", "no ", "one ", "two ",
+    "to ", "of ", "in ", "on ", "at ", "for ", "with ", "and ", "or ", "but ", "if ", "as ",
+    "data", "answer", "action", "example", "note", "list", "order", "type",
+];
+
+fn has_strong_code_context(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.ends_with(';')
+        || trimmed.ends_with('{')
+        || trimmed.ends_with('}')
+        || trimmed.ends_with("=>")
+        || trimmed.ends_with("->")
+    {
+        return true;
+    }
+    if trimmed.contains("=>")
+        || trimmed.contains("->")
+        || trimmed.contains("::")
+        || trimmed.contains("&&")
+        || trimmed.contains("||")
+    {
+        return true;
+    }
+    if trimmed.contains(" = ") || trimmed.contains("=:") || trimmed.contains(" =\t") {
+        return true;
+    }
+    if trimmed.contains('(') && trimmed.contains(')') {
+        // function-call / definition shaped: keyword then identifier(...)
+        let lower = trimmed.to_ascii_lowercase();
+        for kw in ["function ", "def ", "fn ", "class "] {
+            if lower.starts_with(kw) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn looks_like_identifier(token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    token
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$')
+        && token
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+}
+
+fn is_natural_word(token: &str) -> bool {
+    let t = token.trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase();
+    NATURAL_STARTERS
+        .iter()
+        .any(|w| t == w.trim() || w.trim_end() == t)
+        || matches!(
+            t.as_str(),
+            "the"
+                | "a"
+                | "an"
+                | "my"
+                | "this"
+                | "that"
+                | "it"
+                | "some"
+                | "any"
+                | "these"
+                | "those"
+                | "our"
+                | "your"
+                | "all"
+                | "data"
+                | "answer"
+                | "action"
+                | "example"
+                | "note"
+                | "list"
+                | "order"
+                | "type"
+                | "practice"
+                | "matters"
+                | "now"
+                | "on"
+                | "from"
+                | "to"
+                | "of"
+                | "in"
+                | "at"
+                | "for"
+                | "with"
+                | "and"
+                | "or"
+                | "but"
+        )
+}
+
+fn weak_prefix_has_code_context(first_line: &str) -> bool {
+    let trimmed = first_line.trim_start();
+    if has_strong_code_context(first_line) {
+        return true;
+    }
+
+    // from X import Y
+    if trimmed.to_ascii_lowercase().starts_with("from ") && trimmed.contains(" import ") {
+        return true;
+    }
+
+    // import module / import x as y
+    if let Some(rest) = trimmed.strip_prefix("import ") {
+        let rest = rest.trim();
+        if rest.ends_with(';') {
+            return true;
+        }
+        let first = rest.split_whitespace().next().unwrap_or("");
+        if looks_like_identifier(first) && !is_natural_word(first) && !first.is_empty() {
+            // "import the" / "import my" allowed; "import numpy" / "import React" rejected
+            if first.chars().any(|c| c == '.' || c == '_' || c == '/' || c == '-') {
+                return true;
+            }
+            if first.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                return true;
+            }
+            // multi-token programming import: import { a, b } / import type { X }
+            if rest.starts_with('{') || rest.contains(" {") {
+                return true;
+            }
+            // import numpy as np / import module.sub
+            if !is_natural_word(first) {
+                let codeish = rest.split_whitespace().all(|t| {
+                    let t = t.trim_matches(|c| c == '\'' || c == '"' || c == ';' || c == ',');
+                    t == "as" || t == "from" || looks_like_identifier(t) || t.starts_with('{') || t.ends_with('}')
+                });
+                if codeish && !rest.to_ascii_lowercase().contains("the ") {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // const/let/var x = ...
+    if let Some(rest) = trimmed
+        .strip_prefix("const ")
+        .or_else(|| trimmed.strip_prefix("let "))
+        .or_else(|| trimmed.strip_prefix("var "))
+    {
+        let first = rest.split_whitespace().next().unwrap_or("");
+        if looks_like_identifier(first) && !is_natural_word(first) {
+            return true;
+        }
+    }
+
+    // type Foo / class Foo / struct Foo / interface Foo / enum Foo / package foo
+    for kw in ["type ", "class ", "struct ", "interface ", "enum ", "package "] {
+        if let Some(rest) = trimmed.strip_prefix(kw) {
+            let first = rest.split_whitespace().next().unwrap_or("");
+            if looks_like_identifier(first) && !is_natural_word(first) {
+                if kw == "package " {
+                    return true;
+                }
+                // "type the answer" first="the" → natural
+                if first.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                    || first.contains('_')
+                    || rest.contains('=')
+                    || rest.contains('{')
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 fn is_code_snippet(text: &str) -> bool {
-    let indicators = [
-        "function ",
-        "fn ",
-        "def ",
-        "class ",
-        "import ",
-        "from ",
-        "#include",
-        "const ",
-        "let ",
-        "var ",
-        "pub fn",
-        "async fn",
-        "impl ",
-        "struct ",
-        "interface ",
-        "type ",
-        "enum ",
-        "package ",
-        "namespace ",
-        "if (",
-        "for (",
-        "while (",
-        "switch (",
-        "catch (",
-        "=>",
-        "->",
-        "::",
-        "&&",
-        "||",
-        "};",
-        "});",
-        ");",
-    ];
     let lines: Vec<&str> = text.lines().take(5).collect();
     let first_line = lines.first().copied().unwrap_or("");
 
-    // Starts with a code-like keyword
-    for ind in &indicators {
+    for ind in STRONG_PREFIXES {
         if first_line.trim_start().starts_with(ind) {
             return true;
         }
     }
 
-    // Multiple lines with code indicators
+    // Symbol-only strong operators anywhere on first line of short copy
+    let first_trim = first_line.trim();
+    if first_trim.contains("};") || first_trim.contains("});") || first_trim.contains(");") {
+        if first_trim
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .all(|c| !c.is_ascii_alphabetic())
+            || first_trim.contains("function")
+            || first_trim.contains("const ")
+        {
+            return true;
+        }
+    }
+
+    for ind in WEAK_PREFIXES {
+        if first_line.trim_start().starts_with(ind) && weak_prefix_has_code_context(first_line) {
+            return true;
+        }
+    }
+
     if lines.len() >= 3 {
         let code_line_count = lines
             .iter()
@@ -135,7 +354,6 @@ fn is_base64_blob(text: &str) -> bool {
         return false;
     }
     let clean: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    // Likely base64 if length is multiple of 4 and ends with = or has enough length
     clean.len() >= 40 && (clean.ends_with('=') || clean.len() % 4 == 0)
 }
 
@@ -158,13 +376,11 @@ fn is_ip_address(text: &str) -> bool {
     if t.contains(' ') {
         return false;
     }
-    // IPv4 with optional port
     let ip_part = t.split(':').next().unwrap_or(t);
     let parts: Vec<&str> = ip_part.split('.').collect();
     if parts.len() == 4 {
         return parts.iter().all(|p| p.parse::<u8>().is_ok());
     }
-    // IPv6 (contains multiple colons)
     if t.matches(':').count() >= 2 && t.chars().all(|c| c.is_ascii_hexdigit() || c == ':') {
         return true;
     }
@@ -196,6 +412,10 @@ mod tests {
         assert!(should_reject("sk-abc123def456ghi789jkl012mno345pqr"));
         assert!(should_reject("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefgh"));
         assert!(should_reject("AKIAIOSFODNN7EXAMPLE"));
+        assert_eq!(
+            reject_reason("sk-abc123def456ghi789jkl012mno345pqr"),
+            Some(FilterReason::Secret)
+        );
     }
 
     #[test]
@@ -210,6 +430,11 @@ mod tests {
         assert!(should_reject("function hello() {\n  return 'world';\n}"));
         assert!(should_reject("const x = 42;\nconst y = x + 1;"));
         assert!(should_reject("import React from 'react';"));
+        assert!(should_reject("import numpy as np"));
+        assert!(should_reject("from typing import List"));
+        assert!(should_reject("type Foo = { a: number }"));
+        assert!(should_reject("const x = 42"));
+        assert!(should_reject("let mut count = 0;"));
     }
 
     #[test]
@@ -239,5 +464,16 @@ mod tests {
         ));
         assert!(!should_reject("unprecedented"));
         assert!(!should_reject("machine learning"));
+    }
+
+    #[test]
+    fn test_allows_natural_english_with_code_like_words() {
+        assert!(!should_reject("import the data from Excel"));
+        assert!(!should_reject("From now on, always validate the result"));
+        assert!(!should_reject("from now on"));
+        assert!(!should_reject("Constant practice matters"));
+        assert!(!should_reject("type the answer in the box"));
+        assert!(!should_reject("const of the matter"));
+        assert!(!should_reject("let the dog out"));
     }
 }

@@ -21,6 +21,10 @@ export function CaptureSection() {
   const [blacklistInput, setBlacklistInput] = useState(
     (settings.clipboardBlacklist || []).join(', ')
   );
+  const [ideBlacklistInput, setIdeBlacklistInput] = useState(
+    (settings.ideBlacklist || []).join(', ')
+  );
+  const lookupInIde = settings.lookupInIde !== false;
 
   useEffect(() => {
     bridge.getClipboardWatchStatus().then(setWatchEnabled).catch((error) => {
@@ -69,6 +73,14 @@ export function CaptureSection() {
     updateSettings({ clipboardBlacklist: entries });
   };
 
+  const handleIdeBlacklistBlur = () => {
+    const entries = ideBlacklistInput
+      .split(/[,，\n]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    updateSettings({ ideBlacklist: entries });
+  };
+
   return (
     <div className="space-y-3">
       <SettingsSection
@@ -105,8 +117,33 @@ export function CaptureSection() {
             onChange={(e) => setBlacklistInput(e.target.value)}
             onBlur={handleBlacklistBlur}
             placeholder="逗号分隔的进程名或窗口标题关键词"
-            hint="从这些应用复制时不会触发查词（默认已排除密码管理器和终端）"
+            hint="从这些应用复制时不会触发查词（密码管理器始终拦截）"
           />
+        </div>
+
+        <div className="mt-3 rounded-md border border-line bg-raised p-3">
+          <Toggle
+            checked={lookupInIde}
+            onChange={(value) => updateSettings({ lookupInIde: value })}
+            label="在 IDE / 终端中查词"
+            description="默认开启。关闭后，在 VS Code、IDEA、终端等应用中复制英文不会自动弹窗。"
+          />
+          {!lookupInIde && (
+            <div className="mt-3">
+              <label className="mb-1.5 block text-[11px] font-medium text-ink-muted">
+                IDE / 终端进程
+              </label>
+              <TextInput
+                label="IDE 黑名单"
+                hideLabel
+                value={ideBlacklistInput}
+                onChange={(e) => setIdeBlacklistInput(e.target.value)}
+                onBlur={handleIdeBlacklistBlur}
+                placeholder="code.exe, devenv.exe, idea64.exe, ..."
+                hint="仅在关闭上方开关时生效"
+              />
+            </div>
+          )}
         </div>
 
         <div className="mt-3 rounded-md border border-line bg-raised p-3">

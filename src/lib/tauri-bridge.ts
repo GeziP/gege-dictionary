@@ -113,6 +113,14 @@ export async function saveSettings(settings: AppSettings): Promise<void> {
   return invoke('save_settings', { settings });
 }
 
+export async function getLocalMetrics(days = 7): Promise<import('../types/lexnote').LocalMetrics> {
+  return invoke('get_local_metrics', { days });
+}
+
+export async function clearLocalMetrics(): Promise<void> {
+  return invoke('clear_local_metrics');
+}
+
 export async function saveAnalysisPreferences(
   domain: AppSettings['activeDomainProfile'],
   style: AppSettings['analysisStyle'],
