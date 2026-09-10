@@ -1560,7 +1560,8 @@ async fn ocr_recognize_region(
             let _ =
                 db.record_local_event("ocr_filtered", &serde_json::json!({ "reason": "empty" }));
         } else {
-            let _ = db.record_local_event("ocr_triggered", &serde_json::json!({ "kind": "word" }));
+            let kind = clipboard_watcher::detect_kind_public(text.trim());
+            let _ = db.record_local_event("ocr_triggered", &serde_json::json!({ "kind": kind }));
         }
     }
 

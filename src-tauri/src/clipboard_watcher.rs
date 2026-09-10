@@ -428,7 +428,7 @@ fn open_or_reuse_lookup(app_handle: &tauri::AppHandle, is_long: bool) {
         }));
         position_lookup_window(app_handle, &win, w, h);
         let _ = win.show();
-        let _ = app_handle.emit_to("lookup", "lookup://reset", ());
+        // Frontend listens for this CustomEvent (no location.reload).
         let _ = win.eval("window.dispatchEvent(new CustomEvent('gege-lookup-reset'))");
         return;
     }

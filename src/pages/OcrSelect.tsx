@@ -55,8 +55,8 @@ export function OcrSelect() {
           return;
         }
         if (result?.truncated) {
-          // Inform via toast-less hint after lookup opens.
-          console.warn('OCR text truncated to', result.length);
+          // User-visible notice before opening lookup.
+          setHint(`文本较长，已截取前 ${result.length} 字`);
         }
         await bridge.setOcrCaptureAndLookup(text);
         await closeSelf();
