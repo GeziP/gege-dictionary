@@ -112,15 +112,27 @@ const STRONG_PREFIXES: &[&str] = &[
 
 /// Prefixes that also appear in prose; require additional code context.
 const WEAK_PREFIXES: &[&str] = &[
-    "function ", "fn ", "def ", "class ", "import ", "from ", "const ", "let ", "var ",
-    "struct ", "interface ", "type ", "enum ", "package ",
+    "function ",
+    "fn ",
+    "def ",
+    "class ",
+    "import ",
+    "from ",
+    "const ",
+    "let ",
+    "var ",
+    "struct ",
+    "interface ",
+    "type ",
+    "enum ",
+    "package ",
 ];
 
 const NATURAL_STARTERS: &[&str] = &[
     "the ", "a ", "an ", "my ", "this ", "that ", "it ", "some ", "any ", "these ", "those ",
-    "our ", "your ", "all ", "both ", "each ", "every ", "both ", "no ", "one ", "two ",
-    "to ", "of ", "in ", "on ", "at ", "for ", "with ", "and ", "or ", "but ", "if ", "as ",
-    "data", "answer", "action", "example", "note", "list", "order", "type",
+    "our ", "your ", "all ", "both ", "each ", "every ", "both ", "no ", "one ", "two ", "to ",
+    "of ", "in ", "on ", "at ", "for ", "with ", "and ", "or ", "but ", "if ", "as ", "data",
+    "answer", "action", "example", "note", "list", "order", "type",
 ];
 
 fn has_strong_code_context(line: &str) -> bool {
@@ -170,7 +182,9 @@ fn looks_like_identifier(token: &str) -> bool {
 }
 
 fn is_natural_word(token: &str) -> bool {
-    let t = token.trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase();
+    let t = token
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_ascii_lowercase();
     NATURAL_STARTERS
         .iter()
         .any(|w| t == w.trim() || w.trim_end() == t)
@@ -235,7 +249,10 @@ fn weak_prefix_has_code_context(first_line: &str) -> bool {
         let first = rest.split_whitespace().next().unwrap_or("");
         if looks_like_identifier(first) && !is_natural_word(first) && !first.is_empty() {
             // "import the" / "import my" allowed; "import numpy" / "import React" rejected
-            if first.chars().any(|c| c == '.' || c == '_' || c == '/' || c == '-') {
+            if first
+                .chars()
+                .any(|c| c == '.' || c == '_' || c == '/' || c == '-')
+            {
                 return true;
             }
             if first.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
@@ -249,7 +266,11 @@ fn weak_prefix_has_code_context(first_line: &str) -> bool {
             if !is_natural_word(first) {
                 let codeish = rest.split_whitespace().all(|t| {
                     let t = t.trim_matches(|c| c == '\'' || c == '"' || c == ';' || c == ',');
-                    t == "as" || t == "from" || looks_like_identifier(t) || t.starts_with('{') || t.ends_with('}')
+                    t == "as"
+                        || t == "from"
+                        || looks_like_identifier(t)
+                        || t.starts_with('{')
+                        || t.ends_with('}')
                 });
                 if codeish && !rest.to_ascii_lowercase().contains("the ") {
                     return true;
@@ -271,7 +292,14 @@ fn weak_prefix_has_code_context(first_line: &str) -> bool {
     }
 
     // type Foo / class Foo / struct Foo / interface Foo / enum Foo / package foo
-    for kw in ["type ", "class ", "struct ", "interface ", "enum ", "package "] {
+    for kw in [
+        "type ",
+        "class ",
+        "struct ",
+        "interface ",
+        "enum ",
+        "package ",
+    ] {
         if let Some(rest) = trimmed.strip_prefix(kw) {
             let first = rest.split_whitespace().next().unwrap_or("");
             if looks_like_identifier(first) && !is_natural_word(first) {

@@ -2241,10 +2241,7 @@ fn validate_schema_contract(conn: &Connection) -> Result<(), String> {
                 "updated_at",
             ],
         ),
-        (
-            "local_events",
-            &["id", "date", "event", "count", "extra"],
-        ),
+        ("local_events", &["id", "date", "event", "count", "extra"]),
     ];
 
     for (table, required_columns) in REQUIRED_COLUMNS {

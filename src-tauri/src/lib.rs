@@ -182,10 +182,7 @@ fn selection_meta(selection: &str, kind: &str) -> String {
     hasher.update(selection.as_bytes());
     let digest = hasher.finalize();
     let head = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
-    format!(
-        "len={} kind={kind} head_hash={head:08x}",
-        selection.len()
-    )
+    format!("len={} kind={kind} head_hash={head:08x}", selection.len())
 }
 
 fn record_event(state: &tauri::State<'_, AppState>, event: &str, extra: serde_json::Value) {
@@ -818,10 +815,7 @@ async fn lookup_word(
         let db = state.db.lock().map_err(|e| e.to_string())?;
         if let Some(mut cached) = db.get_cache(&cache_key, cache_ttl)? {
             eprintln!("[lookup_word] cache HIT");
-            let _ = db.record_local_event(
-                "lookup_cache_hit",
-                &serde_json::json!({ "kind": kind }),
-            );
+            let _ = db.record_local_event("lookup_cache_hit", &serde_json::json!({ "kind": kind }));
             if let Some(obj) = cached.as_object_mut() {
                 obj.insert("fromCache".to_string(), serde_json::Value::Bool(true));
             }
@@ -829,7 +823,11 @@ async fn lookup_word(
         }
     }
     eprintln!("[lookup_word] cache miss, calling LLM...");
-    record_event(&state, "lookup_cache_miss", serde_json::json!({ "kind": kind }));
+    record_event(
+        &state,
+        "lookup_cache_miss",
+        serde_json::json!({ "kind": kind }),
+    );
 
     let full_text = llm::stream_lookup(
         &base_url,
@@ -1062,7 +1060,11 @@ async fn lookup_word_stream(
         }
         let _ = db.record_local_event("lookup_cache_miss", &serde_json::json!({ "kind": kind }));
     } else {
-        record_event_handle(&app, "lookup_cache_miss", serde_json::json!({ "kind": kind }));
+        record_event_handle(
+            &app,
+            "lookup_cache_miss",
+            serde_json::json!({ "kind": kind }),
+        );
     }
 
     eprintln!(

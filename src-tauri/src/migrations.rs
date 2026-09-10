@@ -76,7 +76,7 @@ pub fn initialize_latest(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(&format!(
         "{REVIEW_SCHEMA}\n{GLOSSARY_SCHEMA}\n{LOCAL_EVENTS_SCHEMA}"
     ))
-        .map_err(|e| format!("创建最新 schema 失败: {e}"))?;
+    .map_err(|e| format!("创建最新 schema 失败: {e}"))?;
     conn.pragma_update(None, "user_version", LATEST_SCHEMA_VERSION)
         .map_err(|e| format!("写入 schema 版本失败: {e}"))
 }

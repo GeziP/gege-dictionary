@@ -308,10 +308,7 @@ async fn call_openai_blocking(
         .text()
         .await
         .map_err(|e| format!("响应读取失败: {e}"))?;
-    eprintln!(
-        "[call_openai_blocking] response_len={}",
-        resp_text.len()
-    );
+    eprintln!("[call_openai_blocking] response_len={}", resp_text.len());
 
     let resp_json: Value = serde_json::from_str(&resp_text).map_err(|e| {
         format!(

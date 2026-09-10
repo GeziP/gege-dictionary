@@ -385,10 +385,7 @@ fn poll_once(
         last_text.len()
     );
     if let Ok(db) = state.db.lock() {
-        let _ = db.record_local_event(
-            "clipboard_triggered",
-            &serde_json::json!({ "kind": kind }),
-        );
+        let _ = db.record_local_event("clipboard_triggered", &serde_json::json!({ "kind": kind }));
     }
 
     let capture_data = serde_json::json!({
