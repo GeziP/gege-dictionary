@@ -563,6 +563,17 @@ impl Database {
             "clipboardWatch": true,
             "clipboardMode": "smart",
             "clipboardBlacklist": [],
+            "lookupInIde": true,
+            "ideBlacklist": [
+                "code.exe",
+                "devenv.exe",
+                "idea64.exe",
+                "cursor.exe",
+                "cmd.exe",
+                "powershell.exe",
+                "pwsh.exe",
+                "windowsterminal.exe"
+            ],
             "streamingEnabled": true,
             "cacheTtlDays": 30,
             "reviewLimit": 20,

@@ -4,7 +4,7 @@ export type Register = 'formal' | 'neutral' | 'spoken' | 'slang' | 'technical';
 
 export type Mastery = 'new' | 'learning' | 'familiar' | 'mastered';
 
-export type CaptureMethod = 'uia' | 'clipboard' | 'manual';
+export type CaptureMethod = 'clipboard' | 'manual';
 
 export interface Sense {
   pos: string;

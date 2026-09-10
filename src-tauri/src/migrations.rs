@@ -253,6 +253,29 @@ mod tests {
     }
 
     #[test]
+    fn upgrades_v3_with_local_events_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE words (id TEXT PRIMARY KEY, kind TEXT, saved_at TEXT);
+             CREATE TABLE review_state (word_id TEXT PRIMARY KEY, box INTEGER, due_at TEXT, last_result TEXT, correct_count INTEGER, wrong_count INTEGER, reviewed_at TEXT, created_at TEXT);
+             CREATE TABLE glossary_terms (id TEXT PRIMARY KEY, term TEXT, term_key TEXT, translation TEXT, domain TEXT, note TEXT, case_sensitive INTEGER, enabled INTEGER, created_at TEXT, updated_at TEXT);
+             INSERT INTO words VALUES ('kept', 'word', '2026-08-01');",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        migrate(&conn, "").unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 4);
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_events')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists);
+    }
+
+    #[test]
     fn premigration_backup_uses_managed_backup_directory() {
         let dir = std::env::temp_dir().join(format!(
             "gege-migration-managed-backup-test-{}",

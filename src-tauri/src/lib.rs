@@ -325,8 +325,14 @@ async fn get_reading_sessions(
     limit: u32,
     offset: u32,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.get_reading_sessions(gap_minutes, limit, offset)
+    let result = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db.get_reading_sessions(gap_minutes, limit, offset)?
+    };
+    if offset == 0 {
+        record_event(&state, "reading_session_viewed", serde_json::json!({}));
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -724,6 +730,10 @@ async fn lookup_word(
                 "[lookup_word] glossary_term_applied count={}, domain={domain}",
                 glossary_matches.len()
             );
+            let _ = db.record_local_event(
+                "glossary_term_applied",
+                &serde_json::json!({ "count_bucket": glossary_matches.len().min(10).to_string() }),
+            );
         }
         let tpl_body = glossary::enrich_template(&tpl_body, domain, style, &glossary_matches);
 
@@ -949,6 +959,10 @@ async fn lookup_word_stream(
                 "[lookup_stream] glossary_term_applied count={}, domain={domain}",
                 glossary_matches.len()
             );
+            let _ = db.record_local_event(
+                "glossary_term_applied",
+                &serde_json::json!({ "count_bucket": glossary_matches.len().min(10).to_string() }),
+            );
         }
         let tpl_body = glossary::enrich_template(&tpl_body, domain, style, &glossary_matches);
 
@@ -1028,6 +1042,7 @@ async fn lookup_word_stream(
     if !force_refresh {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         if let Some(mut cached) = db.get_cache(&cache_key, cache_ttl)? {
+            let _ = db.record_local_event("lookup_cache_hit", &serde_json::json!({ "kind": kind }));
             if let Some(obj) = cached.as_object_mut() {
                 obj.insert("fromCache".to_string(), serde_json::Value::Bool(true));
                 obj.insert(
@@ -1045,6 +1060,9 @@ async fn lookup_word_stream(
             );
             return Ok(());
         }
+        let _ = db.record_local_event("lookup_cache_miss", &serde_json::json!({ "kind": kind }));
+    } else {
+        record_event_handle(&app, "lookup_cache_miss", serde_json::json!({ "kind": kind }));
     }
 
     eprintln!(

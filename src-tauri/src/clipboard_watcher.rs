@@ -323,8 +323,22 @@ fn poll_once(
         return false;
     }
 
-    // "smart" mode: apply content filter and blacklist
+    // Password managers and custom blacklist apply in every mode.
     let (win_title, proc_name) = get_foreground_window_info();
+    if is_blacklisted(&proc_name, &win_title, &blacklist) {
+        eprintln!("[clipboard] blacklisted app: {proc_name} / {win_title}");
+        if let Some(state) = app_handle.try_state::<AppState>() {
+            if let Ok(db) = state.db.lock() {
+                let _ = db.record_local_event(
+                    "clipboard_filtered",
+                    &serde_json::json!({ "reason": "blacklist" }),
+                );
+            }
+        }
+        return false;
+    }
+
+    // "smart" mode: apply content filter and IDE gate
     if mode == "smart" {
         if let Some(reason) = content_filter::reject_reason(last_text) {
             eprintln!(
@@ -337,19 +351,6 @@ fn poll_once(
                     let _ = db.record_local_event(
                         "clipboard_filtered",
                         &serde_json::json!({ "reason": reason.as_str() }),
-                    );
-                }
-            }
-            return false;
-        }
-
-        if is_blacklisted(&proc_name, &win_title, &blacklist) {
-            eprintln!("[clipboard] blacklisted app: {proc_name} / {win_title}");
-            if let Some(state) = app_handle.try_state::<AppState>() {
-                if let Ok(db) = state.db.lock() {
-                    let _ = db.record_local_event(
-                        "clipboard_filtered",
-                        &serde_json::json!({ "reason": "blacklist" }),
                     );
                 }
             }

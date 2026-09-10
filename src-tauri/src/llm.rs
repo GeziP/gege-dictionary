@@ -309,14 +309,14 @@ async fn call_openai_blocking(
         .await
         .map_err(|e| format!("响应读取失败: {e}"))?;
     eprintln!(
-        "[call_openai_blocking] raw response (first 500 chars): {}",
-        &resp_text[..resp_text.len().min(500)]
+        "[call_openai_blocking] response_len={}",
+        resp_text.len()
     );
 
     let resp_json: Value = serde_json::from_str(&resp_text).map_err(|e| {
         format!(
             "响应JSON解析失败: {e}. 原始响应: {}",
-            &resp_text[..resp_text.len().min(300)]
+            &resp_text[..resp_text.len().min(200)]
         )
     })?;
 
@@ -390,14 +390,14 @@ async fn call_openai_blocking(
             .and_then(|c| c.get("finish_reason"))
             .and_then(|f| f.as_str())
             .unwrap_or("unknown");
-        let resp_snippet = if resp_text.len() > 300 {
-            format!("{}...", &resp_text[..300])
-        } else {
-            resp_text.clone()
-        };
-        eprintln!("[call_openai_blocking] empty content! full_resp={resp_snippet}");
+        let resp_snippet_len = resp_text.len().min(200);
+        eprintln!(
+            "[call_openai_blocking] empty content! resp_len={} snippet_len={resp_snippet_len}",
+            resp_text.len()
+        );
         return Err(format!(
-            "模型返回空内容 (finish_reason={finish_reason}). 原始响应: {resp_snippet}"
+            "模型返回空内容 (finish_reason={finish_reason}). 原始响应长度: {}",
+            resp_text.len()
         ));
     }
     Ok(content)

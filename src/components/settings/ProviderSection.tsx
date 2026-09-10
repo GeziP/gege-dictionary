@@ -85,6 +85,22 @@ export function ProviderSection() {
           </label>
           <label className="block sm:col-span-2">
             <span className="mb-1 block text-[11px] text-ink-muted">API Key</span>
+            {provider.hasApiKey && !editingKey ? (
+              <div className="mb-1.5 flex items-center gap-2 rounded-md border border-line bg-sunken px-2.5 py-1.5 text-[12px]">
+                <ShieldCheckIcon size={13} className="text-positive" />
+                <span className="text-ink">已配置</span>
+                <button
+                  type="button"
+                  className="ml-auto text-[11px] text-accent hover:underline"
+                  onClick={() => {
+                    setEditingKey(true);
+                    patch({ apiKey: '', hasApiKey: false });
+                  }}
+                >
+                  更换 Key
+                </button>
+              </div>
+            ) : null}
             <TextInput
               type={showKey || editingKey ? 'text' : 'password'}
               value={editingKey || showKey ? provider.apiKey : ''}
@@ -101,10 +117,10 @@ export function ProviderSection() {
                   {showKey ? <EyeOffIcon size={13} /> : <EyeIcon size={13} />}
                 </button>
               } />
-            
+
             <span className="mt-1 flex items-center gap-1 text-[11px] text-ink-subtle">
               <ShieldCheckIcon size={11} className="text-positive" />
-              经 Windows DPAPI 加密后存储，不会以明文写入配置文件或日志
+              经 Windows DPAPI 加密后存储；界面不显示明文，也不会写入日志
             </span>
             {settings.apiKeyError && (
               <span className="mt-1 block text-[11px] text-danger">{settings.apiKeyError}</span>

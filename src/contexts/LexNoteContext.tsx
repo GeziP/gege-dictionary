@@ -139,7 +139,7 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
   const [settingsSaveError, setSettingsSaveError] = useState<string | null>(null);
   const [templates, setTemplates] = useState<PromptTemplate[]>([]);
   const [network, setNetwork] = useState<NetworkMode>('ok');
-  const [captureMethod, setCaptureMethod] = useState<CaptureMethod>('uia');
+  const [captureMethod, setCaptureMethod] = useState<CaptureMethod>('clipboard');
   const [onboarded, setOnboarded] = useState(false);
   const [usage, setUsage] = useState<Usage>({ today: 0, month: 0, tokens: 0 });
   const [startupWarnings, setStartupWarnings] = useState<string[]>([]);
