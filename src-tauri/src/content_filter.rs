@@ -226,6 +226,15 @@ fn is_natural_word(token: &str) -> bool {
                 | "and"
                 | "or"
                 | "but"
+                | "me"
+                | "us"
+                | "them"
+                | "we"
+                | "you"
+                | "him"
+                | "her"
+                | "they"
+                | "i"
         )
 }
 
@@ -279,7 +288,7 @@ fn weak_prefix_has_code_context(first_line: &str) -> bool {
         }
     }
 
-    // const/let/var x = ...
+    // const/let/var x = ...  (allow "let me know", "let us see", "let the dog out")
     if let Some(rest) = trimmed
         .strip_prefix("const ")
         .or_else(|| trimmed.strip_prefix("let "))
@@ -287,7 +296,21 @@ fn weak_prefix_has_code_context(first_line: &str) -> bool {
     {
         let first = rest.split_whitespace().next().unwrap_or("");
         if looks_like_identifier(first) && !is_natural_word(first) {
-            return true;
+            // Bare identifiers are code only with assignment/declaration shape.
+            if trimmed.contains('=')
+                || trimmed.ends_with(';')
+                || rest.contains('{')
+                || rest.starts_with('{')
+                || rest.starts_with('&')
+                || rest.starts_with('*')
+                || first.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            {
+                return true;
+            }
+            // "let mut count" / "const x" style tokens with _ or known code ops
+            if first.contains('_') || first.chars().any(|c| c == '.' || c == ':') {
+                return true;
+            }
         }
     }
 
@@ -503,5 +526,27 @@ mod tests {
         assert!(!should_reject("type the answer in the box"));
         assert!(!should_reject("const of the matter"));
         assert!(!should_reject("let the dog out"));
+        assert!(!should_reject("let me know"));
+        assert!(!should_reject("let me know when you are ready"));
+        assert!(!should_reject("let us see"));
+        assert!(!should_reject("let them decide"));
+        assert!(!should_reject("Please let him go"));
+    }
+
+    #[test]
+    fn test_allows_let_me_know_but_rejects_let_binding() {
+        assert!(!should_reject("let me know"));
+        assert!(should_reject("let mut count = 0;"));
+        assert!(should_reject("let x = 42"));
+        assert!(should_reject("const MAX_SIZE = 1024;"));
+        assert!(!should_reject("const of the matter"));
+    }
+
+    #[test]
+    fn test_truncate_for_log_is_utf8_safe() {
+        let long = "响应JSON解析失败测试".repeat(40);
+        let cut = crate::llm::truncate_for_log(&long, 20);
+        assert!(cut.chars().count() <= 21);
+        assert!(cut.ends_with('…'));
     }
 }

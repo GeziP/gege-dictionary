@@ -69,6 +69,35 @@ export function LocalStatsSection() {
               <StatCard label="流式降级" value={String(metrics.streamFallback)} />
               <StatCard label="复习答题" value={String(metrics.reviewAnswered)} />
             </div>
+            <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3">
+              <StatCard label="阅读会话查看" value={String(metrics.sessionsViewed)} />
+              <StatCard label="术语命中" value={String(metrics.glossaryApplied)} />
+              <StatCard
+                label="流式首字段 ≤1s"
+                value={String(
+                  (metrics.streamFirstFieldBuckets?.['0-500'] || 0) +
+                    (metrics.streamFirstFieldBuckets?.['500-1000'] || 0)
+                )}
+              />
+            </div>
+            {Object.keys(metrics.streamFirstFieldBuckets || {}).length > 0 && (
+              <div className="mt-3">
+                <p className="mb-1 text-[11px] font-medium text-ink-muted">流式首字段耗时分桶</p>
+                <ul className="space-y-1 text-[11px] text-ink-muted">
+                  {Object.entries(metrics.streamFirstFieldBuckets || {})
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([bucket, count]) => (
+                      <li
+                        key={bucket}
+                        className="flex items-center justify-between rounded bg-sunken px-2 py-1"
+                      >
+                        <span className="font-mono">{bucket}ms</span>
+                        <span>{count}</span>
+                      </li>
+                    ))}
+                </ul>
+              </div>
+            )}
             {reasons.length > 0 && (
               <div className="mt-3">
                 <p className="mb-1 flex items-center gap-1.5 text-[11px] font-medium text-ink-muted">

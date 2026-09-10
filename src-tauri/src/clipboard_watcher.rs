@@ -338,7 +338,21 @@ fn poll_once(
         return false;
     }
 
-    // "smart" mode: apply content filter and IDE gate
+    // IDE/terminal gate applies in every non-manual mode when lookupInIde is off.
+    if !lookup_in_ide && is_ide_or_terminal(&proc_name, &win_title, &ide_blacklist) {
+        eprintln!("[clipboard] ide/terminal lookup disabled: {proc_name}");
+        if let Some(state) = app_handle.try_state::<AppState>() {
+            if let Ok(db) = state.db.lock() {
+                let _ = db.record_local_event(
+                    "clipboard_filtered",
+                    &serde_json::json!({ "reason": "ide_blacklist" }),
+                );
+            }
+        }
+        return false;
+    }
+
+    // "smart" mode: apply content filter
     if mode == "smart" {
         if let Some(reason) = content_filter::reject_reason(last_text) {
             eprintln!(
@@ -351,19 +365,6 @@ fn poll_once(
                     let _ = db.record_local_event(
                         "clipboard_filtered",
                         &serde_json::json!({ "reason": reason.as_str() }),
-                    );
-                }
-            }
-            return false;
-        }
-
-        if !lookup_in_ide && is_ide_or_terminal(&proc_name, &win_title, &ide_blacklist) {
-            eprintln!("[clipboard] ide/terminal lookup disabled: {proc_name}");
-            if let Some(state) = app_handle.try_state::<AppState>() {
-                if let Ok(db) = state.db.lock() {
-                    let _ = db.record_local_event(
-                        "clipboard_filtered",
-                        &serde_json::json!({ "reason": "ide_blacklist" }),
                     );
                 }
             }
