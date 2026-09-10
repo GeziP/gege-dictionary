@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 use crate::content_filter;
 use crate::AppState;
@@ -421,14 +421,15 @@ fn open_or_reuse_lookup(app_handle: &tauri::AppHandle, is_long: bool) {
     };
 
     if let Some(win) = app_handle.get_webview_window("lookup") {
-        // Reuse existing window: navigate and resize
+        // Reuse existing window: resize and ask frontend to reset without reload.
         let _ = win.set_size(tauri::Size::Logical(tauri::LogicalSize {
             width: w,
             height: h,
         }));
         position_lookup_window(app_handle, &win, w, h);
         let _ = win.show();
-        let _ = win.eval("window.location.reload()");
+        let _ = app_handle.emit_to("lookup", "lookup://reset", ());
+        let _ = win.eval("window.dispatchEvent(new CustomEvent('gege-lookup-reset'))");
         return;
     }
 
@@ -517,6 +518,14 @@ fn detect_kind(text: &str) -> &'static str {
     } else {
         "word"
     }
+}
+
+pub fn detect_kind_public(text: &str) -> &'static str {
+    detect_kind(text)
+}
+
+pub fn open_or_reuse_lookup_public(app_handle: &tauri::AppHandle, is_long: bool) {
+    open_or_reuse_lookup(app_handle, is_long)
 }
 
 pub fn lookup_clipboard(

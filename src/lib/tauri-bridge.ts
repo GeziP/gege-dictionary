@@ -282,6 +282,88 @@ export async function copyText(text: string): Promise<void> {
   return invoke('copy_text', { text });
 }
 
+export interface OcrStatus {
+  available: boolean;
+  language: string;
+  message: string;
+}
+
+export async function getOcrStatus(): Promise<OcrStatus> {
+  return invoke<OcrStatus>('get_ocr_status');
+}
+
+export async function ocrRecognizeRegion(
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  language?: string
+): Promise<{ text: string; truncated: boolean; length: number }> {
+  return invoke('ocr_recognize_region', { x, y, width, height, language: language || null });
+}
+
+export async function startOcrCapture(): Promise<void> {
+  return invoke('start_ocr_capture');
+}
+
+export async function setOcrCaptureAndLookup(text: string): Promise<void> {
+  return invoke('set_ocr_capture_and_lookup', { text });
+}
+
+export interface AnkiConfig {
+  enabled: boolean;
+  host: string;
+  port: number;
+  deck: string;
+  model: string;
+  autoSend: boolean;
+}
+
+export async function getAnkiConfig(): Promise<AnkiConfig> {
+  return invoke<AnkiConfig>('get_anki_config');
+}
+
+export async function testAnkiConnection(): Promise<{ ok: boolean; version: unknown; endpoint: string }> {
+  return invoke('test_anki_connection');
+}
+
+export async function listAnkiDecks(): Promise<string[]> {
+  return invoke<string[]>('list_anki_decks');
+}
+
+export async function listAnkiModels(): Promise<string[]> {
+  return invoke<string[]>('list_anki_models');
+}
+
+export async function sendWordsToAnki(
+  ids: string[]
+): Promise<{ added: number; skipped: number; errors: string[] }> {
+  return invoke('send_words_to_anki', { ids });
+}
+
+export async function registerOcrHotkey(shortcut = 'Control+Shift+O'): Promise<void> {
+  if (!IS_TAURI) return;
+  const plugin = await import('@tauri-apps/plugin-global-shortcut');
+  try {
+    await plugin.unregister(shortcut);
+  } catch {
+    // not registered
+  }
+  await plugin.register(shortcut, () => {
+    void invoke('start_ocr_capture');
+  });
+}
+
+export async function unregisterOcrHotkey(shortcut = 'Control+Shift+O'): Promise<void> {
+  if (!IS_TAURI) return;
+  const plugin = await import('@tauri-apps/plugin-global-shortcut');
+  try {
+    await plugin.unregister(shortcut);
+  } catch {
+    // already unregistered
+  }
+}
+
 export async function testConnection(
   baseUrl: string,
   apiKey: string,

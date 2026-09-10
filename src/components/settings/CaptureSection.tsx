@@ -162,6 +162,57 @@ export function CaptureSection() {
       </SettingsSection>
 
       <SettingsSection
+        title="截图 OCR 取词"
+        description="系统本地 OCR，覆盖扫描 PDF / 视频字幕等无法复制的场景。默认热键 Ctrl+Shift+O。"
+      >
+        <Toggle
+          checked={(settings.ocr?.enabled ?? true) !== false}
+          onChange={(value) => {
+            const hotkey = settings.ocr?.hotkey || 'Control+Shift+O';
+            const ocr = { ...(settings.ocr || {}), enabled: value, hotkey };
+            updateSettings({ ocr });
+            if (value) {
+              void bridge
+                .registerOcrHotkey(hotkey)
+                .catch((e) => console.error('register ocr hotkey', e));
+            } else {
+              void bridge
+                .unregisterOcrHotkey(hotkey)
+                .catch((e) => console.error('unregister ocr hotkey', e));
+            }
+          }}
+          label="启用截图取词"
+          description="关闭后不注册热键；托盘菜单仍可手动触发。"
+        />
+        <div className="mt-2 flex items-center gap-2">
+          <button
+            type="button"
+            className="rounded-md border border-line px-2 py-1 text-[11px] text-ink-muted hover:text-ink"
+            onClick={() => void bridge.startOcrCapture()}
+          >
+            立即框选取词
+          </button>
+          <button
+            type="button"
+            className="rounded-md border border-line px-2 py-1 text-[11px] text-ink-muted hover:text-ink"
+            onClick={async () => {
+              try {
+                const st = await bridge.getOcrStatus();
+                window.alert(st.message);
+              } catch (e) {
+                window.alert(String(e));
+              }
+            }}
+          >
+            检测 OCR 可用性
+          </button>
+        </div>
+        <p className="mt-2 text-[10px] text-ink-subtle">
+          识别仅在本机进行，截图位图不会写入磁盘或上传。
+        </p>
+      </SettingsSection>
+
+      <SettingsSection
         title="上下文设置"
         description="控制发送给 LLM 的上下文信息。">
 

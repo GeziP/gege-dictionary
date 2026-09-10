@@ -238,6 +238,21 @@ export interface LocalMetrics {
   glossaryApplied: number;
 }
 
+export interface AnkiSettings {
+  enabled: boolean;
+  host: string;
+  port: number;
+  deck: string;
+  model: string;
+  autoSend: boolean;
+}
+
+export interface OcrSettings {
+  enabled?: boolean;
+  hotkey?: string;
+  language?: string;
+}
+
 export interface AppSettings {
   provider: ProviderConfig;
   clipboardWatch: boolean;
@@ -264,4 +279,6 @@ export interface AppSettings {
   ttsVoice: string;
   ttsRate: number;
   fontSize: number;
+  anki?: AnkiSettings;
+  ocr?: OcrSettings;
 }
