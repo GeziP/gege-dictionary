@@ -26,6 +26,8 @@ impl FilterReason {
     }
 }
 
+/// Boolean convenience API used by tests and simple call sites.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn should_reject(text: &str) -> bool {
     reject_reason(text).is_some()
 }
