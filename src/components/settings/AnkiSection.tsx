@@ -96,7 +96,7 @@ export function AnkiSection() {
             checked={anki.autoSend}
             onChange={(v) => patch({ autoSend: v })}
             label="收藏后自动发送"
-            description="默认关闭，避免误推。"
+            description="开启后，查词窗点「加入生词库」会尝试同步到 Anki（Anki 未开则静默失败）。"
           />
           <div className="flex items-center gap-2">
             <Button size="sm" onClick={() => void test()} disabled={busy}>

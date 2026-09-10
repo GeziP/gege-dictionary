@@ -558,4 +558,8 @@ export async function closeLookupWindow(): Promise<void> {
   }
 }
 
+export async function showMainWindow(): Promise<void> {
+  return invoke('show_main_window');
+}
+
 export { emit };

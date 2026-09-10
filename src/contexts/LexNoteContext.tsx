@@ -122,7 +122,7 @@ interface LexNoteValue {
   setCaptureMethod: (method: CaptureMethod) => void;
   setOnboarded: (value: boolean) => void;
   updateSettings: (patch: SettingsPatch) => void;
-  saveWord: (word: SavedWord) => void;
+  saveWord: (word: SavedWord) => Promise<void>;
   removeWords: (ids: string[]) => void;
   updateWord: (id: string, patch: Partial<SavedWord>) => void;
   tagWords: (ids: string[], tags: string[]) => void;
@@ -312,13 +312,16 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const saveWord = useCallback(
-    (word: SavedWord) => {
+    (word: SavedWord): Promise<void> => {
       setWords((prev) => [word, ...prev.filter((w) => w.id !== word.id)]);
-      if (isTauri) {
-        bridge.saveWord(word)
-          .then(() => bridge.emitWordSaved())
-          .catch(console.error);
-      }
+      if (!isTauri) return Promise.resolve();
+      return bridge
+        .saveWord(word)
+        .then(() => bridge.emitWordSaved())
+        .catch((e) => {
+          console.error(e);
+          throw e;
+        });
     },
     [isTauri]
   );

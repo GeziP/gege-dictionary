@@ -24,8 +24,25 @@ function RouteLoading() {
 
 function MainRouter() {
   const { onboarded, initState } = useLexNote();
+  const [navPath, setNavPath] = React.useState<string | null>(null);
   const isLookup = window.location.pathname === '/lookup';
   const isOcrSelect = window.location.pathname === '/ocr-select';
+
+  React.useEffect(() => {
+    if (isLookup || isOcrSelect) return;
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event');
+        unlisten = await listen<{ path: string }>('gege://navigate', (e) => {
+          if (e.payload?.path) setNavPath(e.payload.path);
+        });
+      } catch {
+        /* non-tauri */
+      }
+    })();
+    return () => unlisten?.();
+  }, [isLookup, isOcrSelect]);
 
   if (isOcrSelect) {
     return <React.Suspense fallback={<RouteLoading />}><OcrSelect /></React.Suspense>;
@@ -45,6 +62,17 @@ function MainRouter() {
         <Routes>
           <Route path="/onboarding" element={<Onboarding />} />
           <Route path="*" element={<Navigate to="/onboarding" replace />} />
+        </Routes>
+      </React.Suspense>
+    );
+  }
+
+  if (navPath) {
+    return (
+      <React.Suspense fallback={<RouteLoading />}>
+        <Routes>
+          <Route path="/settings" element={<Settings />} />
+          <Route path="*" element={<Settings />} />
         </Routes>
       </React.Suspense>
     );

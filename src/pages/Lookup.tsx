@@ -52,6 +52,7 @@ export function Lookup() {
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [showContext, setShowContext] = useState(false);
   const [contextDraft, setContextDraft] = useState('');
+  const [ankiFlash, setAnkiFlash] = useState<string | null>(null);
   const fontUp = () => setFontSize((s) => Math.min(s + 1, 18));
   const fontDown = () => setFontSize((s) => Math.max(s - 1, 10));
 
@@ -131,12 +132,33 @@ export function Lookup() {
       lookups: (existing?.lookups || 0) + 1,
       note: existing?.note || '',
     };
-    ctxSaveWord(word);
-    setSaved(true);
-    countLookup(0);
-    const timer = setTimeout(() => setUndoTimer(null), 5000);
-    setUndoTimer(timer);
-  }, [entry, existing, lookupContext, lookupSourceApp, lookupSourceTitle, tagInput, ctxSaveWord, countLookup, lookupStatus]);
+    ctxSaveWord(word)
+      .then(() => {
+        setSaved(true);
+        countLookup(0);
+        const timer = setTimeout(() => setUndoTimer(null), 5000);
+        setUndoTimer(timer);
+        if (settings.anki?.enabled && settings.anki.autoSend) {
+          return bridge
+            .sendWordsToAnki([word.id])
+            .then((report) => {
+              if (report.added > 0) {
+                setAnkiFlash(`已同步 Anki（${report.added}）`);
+              } else if (report.skipped > 0) {
+                setAnkiFlash('Anki 已有此词');
+              }
+            })
+            .catch(() => {
+              /* Anki optional */
+            });
+        }
+        return undefined;
+      })
+      .catch((e) => {
+        console.error('saveWord failed', e);
+        setSaved(false);
+      });
+  }, [entry, existing, lookupContext, lookupSourceApp, lookupSourceTitle, tagInput, ctxSaveWord, countLookup, lookupStatus, settings.anki]);
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
@@ -181,6 +203,7 @@ export function Lookup() {
       setTagInput('');
       setInitDone(false);
       setEmptyHint(false);
+      setAnkiFlash(null);
     };
     window.addEventListener('gege-lookup-reset', onReset);
     return () => window.removeEventListener('gege-lookup-reset', onReset);
@@ -324,15 +347,58 @@ export function Lookup() {
           )}
 
           {lookupStatus === 'error' && (
-            <div className="flex flex-col items-center gap-3 py-8">
+            <div className="flex flex-col items-center gap-3 py-8 text-center">
               <p className="text-[12px] text-danger">{lookupError}</p>
-              <button
-                type="button"
-                onClick={handleRetry}
-                className="inline-flex items-center gap-1.5 rounded-md border border-line bg-raised px-3 py-1.5 text-[11px] text-ink hover:bg-sunken"
-              >
-                <RefreshCwIcon size={12} /> 重试
-              </button>
+              {(() => {
+                const msg = (lookupError || '').toLowerCase();
+                const noKey =
+                  msg.includes('api key') ||
+                  msg.includes('apikey') ||
+                  msg.includes('未配置') ||
+                  msg.includes('unauthorized') ||
+                  msg.includes('401');
+                const filtered = msg.includes('被过滤') || msg.includes('filtered');
+                if (noKey) {
+                  return (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        await bridge.closeLookupWindow();
+                        await bridge.showMainWindow().catch(() => undefined);
+                        // Main window router opens Settings via query if supported; otherwise library.
+                        try {
+                          const mod = await import('@tauri-apps/api/webviewWindow');
+                          const main = await mod.WebviewWindow.getByLabel('main');
+                          if (main) {
+                            await main.emit('gege://navigate', { path: '/settings' });
+                          }
+                        } catch {
+                          /* ignore */
+                        }
+                      }}
+                      className="rounded-md border border-line bg-raised px-3 py-1.5 text-[11px] text-ink hover:bg-sunken"
+                    >
+                      去设置配置 API Key
+                    </button>
+                  );
+                }
+                if (filtered) {
+                  return (
+                    <p className="text-[11px] text-ink-subtle">
+                      该内容不会发送给模型。可关闭智能过滤或改用双击 Ctrl+C 强制查词。
+                    </p>
+                  );
+                }
+                return (
+                  <button
+                    type="button"
+                    onClick={handleRetry}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-line bg-raised px-3 py-1.5 text-[11px] text-ink hover:bg-sunken"
+                  >
+                    <RefreshCwIcon size={12} /> 重试
+                  </button>
+                );
+              })()}
             </div>
           )}
 
@@ -561,6 +627,9 @@ export function Lookup() {
                 <span className="inline-flex items-center gap-1.5 text-[11px] text-positive">
                   <CheckCircle2Icon size={12} /> 已收藏
                 </span>
+                {ankiFlash && (
+                  <span className="text-[10px] text-ink-subtle">{ankiFlash}</span>
+                )}
                 {undoTimer && (
                   <button
                     type="button"
