@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const LATEST_SCHEMA_VERSION: i64 = 3;
+pub const LATEST_SCHEMA_VERSION: i64 = 4;
 
 const REVIEW_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS review_state (
@@ -38,6 +38,18 @@ CREATE INDEX IF NOT EXISTS idx_glossary_domain_enabled
 ON glossary_terms(domain, enabled);
 "#;
 
+const LOCAL_EVENTS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS local_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    event TEXT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0,
+    extra TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(date, event, extra)
+);
+CREATE INDEX IF NOT EXISTS idx_local_events_date ON local_events(date);
+"#;
+
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, REVIEW_SCHEMA),
     (
@@ -52,6 +64,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
         "#,
     ),
     (3, GLOSSARY_SCHEMA),
+    (4, LOCAL_EVENTS_SCHEMA),
 ];
 
 pub fn current_version(conn: &Connection) -> Result<i64, String> {
@@ -60,8 +73,10 @@ pub fn current_version(conn: &Connection) -> Result<i64, String> {
 }
 
 pub fn initialize_latest(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch(&format!("{REVIEW_SCHEMA}\n{GLOSSARY_SCHEMA}"))
-        .map_err(|e| format!("创建最新 schema 失败: {e}"))?;
+    conn.execute_batch(&format!(
+        "{REVIEW_SCHEMA}\n{GLOSSARY_SCHEMA}\n{LOCAL_EVENTS_SCHEMA}"
+    ))
+    .map_err(|e| format!("创建最新 schema 失败: {e}"))?;
     conn.pragma_update(None, "user_version", LATEST_SCHEMA_VERSION)
         .map_err(|e| format!("写入 schema 版本失败: {e}"))
 }
@@ -152,7 +167,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE words (id TEXT PRIMARY KEY, kind TEXT, saved_at TEXT);")
             .unwrap();
         migrate(&conn, "").unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 3);
+        assert_eq!(current_version(&conn).unwrap(), 4);
         let first_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM review_state", [], |row| row.get(0))
             .unwrap();
@@ -161,6 +176,14 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM review_state", [], |row| row.get(0))
             .unwrap();
         assert_eq!(first_count, second_count);
+        let events_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_events')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(events_exists);
     }
 
     #[test]
@@ -209,7 +232,7 @@ mod tests {
         .unwrap();
         conn.pragma_update(None, "user_version", 2).unwrap();
         migrate(&conn, "").unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 3);
+        assert_eq!(current_version(&conn).unwrap(), 4);
         assert_eq!(
             conn.query_row(
                 "SELECT box FROM review_state WHERE word_id='kept'",
@@ -227,6 +250,29 @@ mod tests {
             )
             .unwrap();
         assert!(glossary_exists);
+    }
+
+    #[test]
+    fn upgrades_v3_with_local_events_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE words (id TEXT PRIMARY KEY, kind TEXT, saved_at TEXT);
+             CREATE TABLE review_state (word_id TEXT PRIMARY KEY, box INTEGER, due_at TEXT, last_result TEXT, correct_count INTEGER, wrong_count INTEGER, reviewed_at TEXT, created_at TEXT);
+             CREATE TABLE glossary_terms (id TEXT PRIMARY KEY, term TEXT, term_key TEXT, translation TEXT, domain TEXT, note TEXT, case_sensitive INTEGER, enabled INTEGER, created_at TEXT, updated_at TEXT);
+             INSERT INTO words VALUES ('kept', 'word', '2026-08-01');",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        migrate(&conn, "").unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 4);
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_events')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists);
     }
 
     #[test]

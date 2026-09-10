@@ -119,18 +119,19 @@ fn get_foreground_window_info() -> (String, String) {
     }
 }
 
-const DEFAULT_BLACKLIST: &[&str] = &[
-    "1password",
-    "keepass",
-    "bitwarden",
-    "lastpass",
+/// Password managers only — never auto-lookup clipboard from these apps.
+const DEFAULT_BLACKLIST: &[&str] = &["1password", "keepass", "bitwarden", "lastpass"];
+
+/// Used only when `lookupInIde` is false.
+const DEFAULT_IDE_BLACKLIST: &[&str] = &[
+    "code.exe",
+    "devenv.exe",
+    "idea64.exe",
+    "cursor.exe",
     "cmd.exe",
     "powershell.exe",
     "pwsh.exe",
     "windowsterminal.exe",
-    "code.exe",
-    "devenv.exe",
-    "idea64.exe",
 ];
 
 fn is_blacklisted(process_name: &str, window_title: &str, custom_blacklist: &[String]) -> bool {
@@ -144,6 +145,29 @@ fn is_blacklisted(process_name: &str, window_title: &str, custom_blacklist: &[St
     }
     for entry in custom_blacklist {
         let e = entry.to_lowercase();
+        if !e.is_empty() && (proc_lower.contains(&e) || title_lower.contains(&e)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_ide_or_terminal(process_name: &str, window_title: &str, ide_blacklist: &[String]) -> bool {
+    let proc_lower = process_name.to_lowercase();
+    let title_lower = window_title.to_lowercase();
+    let list: Vec<String> = if ide_blacklist.is_empty() {
+        DEFAULT_IDE_BLACKLIST
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        ide_blacklist.to_vec()
+    };
+    for entry in list {
+        let e = entry.to_lowercase();
+        if e.is_empty() {
+            continue;
+        }
         if proc_lower.contains(&e) || title_lower.contains(&e) {
             return true;
         }
@@ -176,7 +200,7 @@ pub fn start(app_handle: tauri::AppHandle, enabled: Arc<AtomicBool>) {
             }
             let now = std::time::Instant::now();
             if now.duration_since(last_mode_check) >= Duration::from_millis(500) {
-                mode = get_trigger_mode(&app_handle).0;
+                mode = get_trigger_settings(&app_handle).0;
                 if mode == "manual" {
                     mode = "double".into();
                 }
@@ -233,7 +257,7 @@ fn is_ctrl_c_down() -> bool {
     }
 }
 
-fn get_trigger_mode(app_handle: &tauri::AppHandle) -> (String, Vec<String>) {
+fn get_trigger_settings(app_handle: &tauri::AppHandle) -> (String, Vec<String>, bool, Vec<String>) {
     let state = app_handle.state::<AppState>();
     if let Ok(db) = state.db.lock() {
         if let Ok(settings) = db.get_settings() {
@@ -251,10 +275,23 @@ fn get_trigger_mode(app_handle: &tauri::AppHandle) -> (String, Vec<String>) {
                         .collect()
                 })
                 .unwrap_or_default();
-            return (mode, blacklist);
+            let lookup_in_ide = settings
+                .get("lookupInIde")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let ide_blacklist = settings
+                .get("ideBlacklist")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            return (mode, blacklist, lookup_in_ide, ide_blacklist);
         }
     }
-    ("smart".to_string(), Vec::new())
+    ("smart".to_string(), Vec::new(), true, Vec::new())
 }
 
 fn poll_once(
@@ -275,7 +312,7 @@ fn poll_once(
     *last_sequence = sequence;
     *last_text = trimmed.clone();
 
-    let (mode, blacklist) = get_trigger_mode(app_handle);
+    let (mode, blacklist, lookup_in_ide, ide_blacklist) = get_trigger_settings(app_handle);
 
     // "manual" mode: only trigger via tray/hotkey, never auto
     if mode == "manual" {
@@ -286,19 +323,51 @@ fn poll_once(
         return false;
     }
 
-    // "smart" mode: apply content filter and blacklist
+    // Password managers and custom blacklist apply in every mode.
     let (win_title, proc_name) = get_foreground_window_info();
-    if mode == "smart" {
-        if content_filter::should_reject(last_text) {
-            eprintln!(
-                "[clipboard] rejected by content filter: {:?}",
-                &last_text[..last_text.len().min(40)]
-            );
-            return false;
+    if is_blacklisted(&proc_name, &win_title, &blacklist) {
+        eprintln!("[clipboard] blacklisted app: {proc_name} / {win_title}");
+        if let Some(state) = app_handle.try_state::<AppState>() {
+            if let Ok(db) = state.db.lock() {
+                let _ = db.record_local_event(
+                    "clipboard_filtered",
+                    &serde_json::json!({ "reason": "blacklist" }),
+                );
+            }
         }
+        return false;
+    }
 
-        if is_blacklisted(&proc_name, &win_title, &blacklist) {
-            eprintln!("[clipboard] blacklisted app: {proc_name} / {win_title}");
+    // IDE/terminal gate applies in every non-manual mode when lookupInIde is off.
+    if !lookup_in_ide && is_ide_or_terminal(&proc_name, &win_title, &ide_blacklist) {
+        eprintln!("[clipboard] ide/terminal lookup disabled: {proc_name}");
+        if let Some(state) = app_handle.try_state::<AppState>() {
+            if let Ok(db) = state.db.lock() {
+                let _ = db.record_local_event(
+                    "clipboard_filtered",
+                    &serde_json::json!({ "reason": "ide_blacklist" }),
+                );
+            }
+        }
+        return false;
+    }
+
+    // "smart" mode: apply content filter
+    if mode == "smart" {
+        if let Some(reason) = content_filter::reject_reason(last_text) {
+            eprintln!(
+                "[clipboard] rejected by content filter reason={} len={}",
+                reason.as_str(),
+                last_text.len()
+            );
+            if let Some(state) = app_handle.try_state::<AppState>() {
+                if let Ok(db) = state.db.lock() {
+                    let _ = db.record_local_event(
+                        "clipboard_filtered",
+                        &serde_json::json!({ "reason": reason.as_str() }),
+                    );
+                }
+            }
             return false;
         }
     }
@@ -313,9 +382,12 @@ fn poll_once(
 
     let kind = detect_kind(last_text);
     eprintln!(
-        "[clipboard] detected: {:?} kind={kind} from={win_title:?}",
-        &last_text[..last_text.len().min(60)]
+        "[clipboard] detected len={} kind={kind} app={proc_name:?}",
+        last_text.len()
     );
+    if let Ok(db) = state.db.lock() {
+        let _ = db.record_local_event("clipboard_triggered", &serde_json::json!({ "kind": kind }));
+    }
 
     let capture_data = serde_json::json!({
         "selection": *last_text,
@@ -464,10 +536,7 @@ pub fn lookup_clipboard(
     let state = app_handle.state::<AppState>();
     if let Ok(ll) = state.last_looked_up.lock() {
         if should_skip_lookup(ll.as_ref(), sequence, &text) {
-            eprintln!(
-                "[clipboard] skipping duplicate lookup: {:?}",
-                &text[..text.len().min(40)]
-            );
+            eprintln!("[clipboard] skipping duplicate lookup len={}", text.len());
             return;
         }
     }

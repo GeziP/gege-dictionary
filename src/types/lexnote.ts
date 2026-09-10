@@ -4,7 +4,7 @@ export type Register = 'formal' | 'neutral' | 'spoken' | 'slang' | 'technical';
 
 export type Mastery = 'new' | 'learning' | 'familiar' | 'mastered';
 
-export type CaptureMethod = 'uia' | 'clipboard' | 'manual';
+export type CaptureMethod = 'clipboard' | 'manual';
 
 export interface Sense {
   pos: string;
@@ -205,6 +205,8 @@ export interface ProviderConfig {
   protocol: ApiProtocol;
   baseUrl: string;
   apiKey: string;
+  /** Backend never sends plaintext; true when a key is configured. */
+  hasApiKey?: boolean;
   model: string;
   temperature: number;
   maxTokens: number;
@@ -219,11 +221,30 @@ export interface PromptTemplate {
   builtIn: boolean;
 }
 
+export interface LocalMetrics {
+  days: number;
+  cutoffDate: string;
+  todayQueries: number;
+  queries: number;
+  cacheHit: number;
+  cacheMiss: number;
+  cacheHitRate: number;
+  filtered: number;
+  filteredByReason: Record<string, number>;
+  streamFallback: number;
+  streamFirstFieldBuckets: Record<string, number>;
+  reviewAnswered: number;
+  sessionsViewed: number;
+  glossaryApplied: number;
+}
+
 export interface AppSettings {
   provider: ProviderConfig;
   clipboardWatch: boolean;
   clipboardMode?: 'smart' | 'full' | 'double';
   clipboardBlacklist?: string[];
+  lookupInIde?: boolean;
+  ideBlacklist?: string[];
   streamingEnabled?: boolean;
   cacheTtlDays?: 0 | 7 | 30 | 90;
   reviewLimit?: 0 | 10 | 20 | 50;

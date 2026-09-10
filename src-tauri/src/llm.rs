@@ -6,6 +6,16 @@ use std::time::Duration;
 
 const SYSTEM_PROMPT: &str = "You are a precise English-Chinese lexicography assistant. CRITICAL RULES: 1) Respond with a single valid JSON object ONLY. 2) No markdown fences, no extra text before or after the JSON. 3) All string values must use \\n for newlines and \\\" for quotes. 4) Do NOT embed markdown code blocks (```) inside JSON strings. Use plain text or pseudocode instead. 5) No trailing commas.";
 
+/// UTF-8-safe prefix for error messages. Never panics on multi-byte boundaries.
+pub(crate) fn truncate_for_log(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
 pub struct IncrementalJsonExtractor {
     buffer: String,
     emitted: HashSet<String>,
@@ -308,15 +318,12 @@ async fn call_openai_blocking(
         .text()
         .await
         .map_err(|e| format!("响应读取失败: {e}"))?;
-    eprintln!(
-        "[call_openai_blocking] raw response (first 500 chars): {}",
-        &resp_text[..resp_text.len().min(500)]
-    );
+    eprintln!("[call_openai_blocking] response_len={}", resp_text.len());
 
     let resp_json: Value = serde_json::from_str(&resp_text).map_err(|e| {
         format!(
             "响应JSON解析失败: {e}. 原始响应: {}",
-            &resp_text[..resp_text.len().min(300)]
+            truncate_for_log(&resp_text, 200)
         )
     })?;
 
@@ -390,14 +397,14 @@ async fn call_openai_blocking(
             .and_then(|c| c.get("finish_reason"))
             .and_then(|f| f.as_str())
             .unwrap_or("unknown");
-        let resp_snippet = if resp_text.len() > 300 {
-            format!("{}...", &resp_text[..300])
-        } else {
-            resp_text.clone()
-        };
-        eprintln!("[call_openai_blocking] empty content! full_resp={resp_snippet}");
+        let resp_snippet_len = resp_text.len().min(200);
+        eprintln!(
+            "[call_openai_blocking] empty content! resp_len={} snippet_len={resp_snippet_len}",
+            resp_text.len()
+        );
         return Err(format!(
-            "模型返回空内容 (finish_reason={finish_reason}). 原始响应: {resp_snippet}"
+            "模型返回空内容 (finish_reason={finish_reason}). 原始响应长度: {}",
+            resp_text.len()
         ));
     }
     Ok(content)
@@ -779,7 +786,7 @@ pub fn parse_entry(raw: &str, selection: &str, kind: &str) -> Result<Value, Stri
         .map_err(|e| {
             eprintln!(
                 "[parse_entry] all repair attempts failed. raw_head={}",
-                &json_str[..json_str.len().min(500)]
+                truncate_for_log(&json_str, 500)
             );
             format!("JSON 解析失败: {e}")
         })?;

@@ -14,8 +14,8 @@ const NETWORKS: {value: NetworkMode;label: string;}[] = [
 
 
 const METHODS: {value: CaptureMethod;label: string;}[] = [
-{ value: 'uia', label: 'UI Automation' },
-{ value: 'clipboard', label: '剪贴板回退' }];
+{ value: 'clipboard', label: '剪贴板' },
+{ value: 'manual', label: '手动' }];
 
 
 interface DemoControlsProps {

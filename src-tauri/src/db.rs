@@ -563,6 +563,17 @@ impl Database {
             "clipboardWatch": true,
             "clipboardMode": "smart",
             "clipboardBlacklist": [],
+            "lookupInIde": true,
+            "ideBlacklist": [
+                "code.exe",
+                "devenv.exe",
+                "idea64.exe",
+                "cursor.exe",
+                "cmd.exe",
+                "powershell.exe",
+                "pwsh.exe",
+                "windowsterminal.exe"
+            ],
             "streamingEnabled": true,
             "cacheTtlDays": 30,
             "reviewLimit": 20,
@@ -1861,6 +1872,183 @@ impl Database {
         Ok(())
     }
 
+    pub fn record_local_event(&self, event: &str, extra: &Value) -> Result<(), String> {
+        if event.trim().is_empty() {
+            return Err("事件名不能为空".into());
+        }
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let extra_str = match extra {
+            Value::Object(map) if map.is_empty() => "{}".to_string(),
+            Value::Null => "{}".to_string(),
+            other => {
+                let obj = other.as_object().cloned().unwrap_or_default();
+                // Only keep compact scalar extras; never store free-form prose.
+                let mut filtered = serde_json::Map::new();
+                for (key, value) in obj {
+                    match value {
+                        Value::String(s) if s.len() <= 32 => {
+                            filtered.insert(key, Value::String(s));
+                        }
+                        Value::Number(_) | Value::Bool(_) => {
+                            filtered.insert(key, value);
+                        }
+                        _ => {}
+                    }
+                }
+                serde_json::Value::Object(filtered).to_string()
+            }
+        };
+        self.conn
+            .execute(
+                "INSERT INTO local_events (date, event, count, extra) VALUES (?1, ?2, 1, ?3)
+                 ON CONFLICT(date, event, extra) DO UPDATE SET count = count + 1",
+                params![today, event, extra_str],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn clear_local_metrics(&self) -> Result<(), String> {
+        self.conn
+            .execute("DELETE FROM local_events", [])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn cleanup_local_events(&self, retention_days: i64) -> Result<u64, String> {
+        let retention_days = retention_days.clamp(7, 365);
+        let cutoff = chrono::Local::now()
+            .date_naive()
+            .checked_sub_signed(chrono::Duration::days(retention_days - 1))
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+        let n = self
+            .conn
+            .execute("DELETE FROM local_events WHERE date < ?1", params![cutoff])
+            .map_err(|e| e.to_string())?;
+        Ok(n as u64)
+    }
+
+    pub fn get_local_metrics(&self, days: u32) -> Result<Value, String> {
+        let days = days.clamp(1, 90) as i64;
+        let cutoff = chrono::Local::now()
+            .date_naive()
+            .checked_sub_signed(chrono::Duration::days(days - 1))
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        let event_sum = |event: &str| -> Result<i64, String> {
+            self.conn
+                .query_row(
+                    "SELECT COALESCE(SUM(count), 0) FROM local_events WHERE date >= ?1 AND event = ?2",
+                    params![cutoff, event],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())
+        };
+
+        let today_event = |event: &str| -> Result<i64, String> {
+            self.conn
+                .query_row(
+                    "SELECT COALESCE(SUM(count), 0) FROM local_events WHERE date = ?1 AND event = ?2",
+                    params![today, event],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())
+        };
+
+        let filtered_by_reason = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT extra, COALESCE(SUM(count),0) FROM local_events
+                     WHERE date >= ?1 AND event = 'clipboard_filtered'
+                     GROUP BY extra ORDER BY 2 DESC",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![cutoff], |row| {
+                    let extra: String = row.get(0)?;
+                    let count: i64 = row.get(1)?;
+                    Ok((extra, count))
+                })
+                .map_err(|e| e.to_string())?;
+            let mut map = serde_json::Map::new();
+            for row in rows {
+                let (extra, count) = row.map_err(|e| e.to_string())?;
+                let reason = serde_json::from_str::<Value>(&extra)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("reason")
+                            .and_then(|r| r.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| "unknown".into());
+                map.insert(reason, Value::Number(count.into()));
+            }
+            Value::Object(map)
+        };
+
+        let stream_first = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT extra, COALESCE(SUM(count),0) FROM local_events
+                     WHERE date >= ?1 AND event = 'lookup_stream_first_field'
+                     GROUP BY extra",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![cutoff], |row| {
+                    let extra: String = row.get(0)?;
+                    let count: i64 = row.get(1)?;
+                    Ok((extra, count))
+                })
+                .map_err(|e| e.to_string())?;
+            let mut map = serde_json::Map::new();
+            for row in rows {
+                let (extra, count) = row.map_err(|e| e.to_string())?;
+                let bucket = serde_json::from_str::<Value>(&extra)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("ms_bucket")
+                            .and_then(|r| r.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| "unknown".into());
+                map.insert(bucket, Value::Number(count.into()));
+            }
+            Value::Object(map)
+        };
+
+        let cache_hit = event_sum("lookup_cache_hit")?;
+        let cache_miss = event_sum("lookup_cache_miss")?;
+        let cache_total = cache_hit + cache_miss;
+        let cache_hit_rate = if cache_total > 0 {
+            cache_hit as f64 / cache_total as f64
+        } else {
+            0.0
+        };
+
+        Ok(serde_json::json!({
+            "days": days,
+            "cutoffDate": cutoff,
+            "todayQueries": today_event("clipboard_triggered")?,
+            "queries": event_sum("clipboard_triggered")?,
+            "cacheHit": cache_hit,
+            "cacheMiss": cache_miss,
+            "cacheHitRate": cache_hit_rate,
+            "filtered": event_sum("clipboard_filtered")?,
+            "filteredByReason": filtered_by_reason,
+            "streamFallback": event_sum("lookup_stream_fallback")?,
+            "streamFirstFieldBuckets": stream_first,
+            "reviewAnswered": event_sum("review_card_answered")?,
+            "sessionsViewed": event_sum("reading_session_viewed")?,
+            "glossaryApplied": event_sum("glossary_term_applied")?,
+        }))
+    }
+
     pub fn get_cache(&self, key: &str, ttl_days: i64) -> Result<Option<Value>, String> {
         let result: SqlResult<String> = if ttl_days <= 0 {
             self.conn.query_row(
@@ -2053,6 +2241,7 @@ fn validate_schema_contract(conn: &Connection) -> Result<(), String> {
                 "updated_at",
             ],
         ),
+        ("local_events", &["id", "date", "event", "count", "extra"]),
     ];
 
     for (table, required_columns) in REQUIRED_COLUMNS {
@@ -2559,6 +2748,26 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
+    }
+
+    #[test]
+    fn local_events_aggregate_and_clear() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        db.record_local_event("clipboard_filtered", &serde_json::json!({"reason":"code"}))
+            .unwrap();
+        db.record_local_event("clipboard_filtered", &serde_json::json!({"reason":"code"}))
+            .unwrap();
+        db.record_local_event("lookup_cache_hit", &serde_json::json!({"kind":"word"}))
+            .unwrap();
+        let metrics = db.get_local_metrics(7).unwrap();
+        assert_eq!(metrics["filtered"], 2);
+        assert_eq!(metrics["filteredByReason"]["code"], 2);
+        assert_eq!(metrics["cacheHit"], 1);
+        assert_eq!(metrics["cacheHitRate"].as_f64().unwrap(), 1.0);
+        db.clear_local_metrics().unwrap();
+        let after = db.get_local_metrics(7).unwrap();
+        assert_eq!(after["filtered"], 0);
     }
 
     #[test]
