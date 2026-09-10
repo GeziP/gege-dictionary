@@ -11,6 +11,7 @@ const Settings = React.lazy(() => import('./pages/Settings').then(({ Settings: p
 const Onboarding = React.lazy(() => import('./pages/Onboarding').then(({ Onboarding: page }) => ({ default: page })));
 const Lookup = React.lazy(() => import('./pages/Lookup').then(({ Lookup: page }) => ({ default: page })));
 const Review = React.lazy(() => import('./pages/Review').then(({ Review: page }) => ({ default: page })));
+const OcrSelect = React.lazy(() => import('./pages/OcrSelect').then(({ OcrSelect: page }) => ({ default: page })));
 
 function RouteLoading() {
   return (
@@ -24,6 +25,11 @@ function RouteLoading() {
 function MainRouter() {
   const { onboarded, initState } = useLexNote();
   const isLookup = window.location.pathname === '/lookup';
+  const isOcrSelect = window.location.pathname === '/ocr-select';
+
+  if (isOcrSelect) {
+    return <React.Suspense fallback={<RouteLoading />}><OcrSelect /></React.Suspense>;
+  }
 
   if (isLookup) {
     return <React.Suspense fallback={<RouteLoading />}><Lookup /></React.Suspense>;

@@ -1,3 +1,4 @@
+mod anki;
 mod clipboard_watcher;
 mod content_filter;
 mod db;
@@ -6,6 +7,7 @@ mod dpapi;
 mod glossary;
 mod llm;
 mod migrations;
+mod ocr;
 mod tts;
 mod word_import;
 
@@ -1527,6 +1529,190 @@ async fn copy_text(text: String) -> Result<(), String> {
         .map_err(|e| format!("复制失败: {e}"))
 }
 
+#[tauri::command]
+fn get_ocr_status() -> serde_json::Value {
+    ocr::get_ocr_status()
+}
+
+/// Recognize a screen region (physical pixels) and return text.
+/// Caller then feeds text into the shared lookup pipeline.
+#[tauri::command]
+async fn ocr_recognize_region(
+    state: tauri::State<'_, AppState>,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    language: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let lang = language
+        .as_deref()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+    let text = tokio::task::spawn_blocking(move || {
+        ocr::recognize_screen_region(x, y, width, height, lang.as_deref())
+    })
+    .await
+    .map_err(|e| format!("OCR 任务失败: {e}"))??;
+
+    if let Ok(db) = state.db.lock() {
+        if text.trim().is_empty() {
+            let _ =
+                db.record_local_event("ocr_filtered", &serde_json::json!({ "reason": "empty" }));
+        } else {
+            let _ = db.record_local_event("ocr_triggered", &serde_json::json!({ "kind": "word" }));
+        }
+    }
+
+    let truncated = text.chars().take(ocr::max_ocr_chars()).collect::<String>();
+    let was_truncated = truncated.chars().count() < text.chars().count();
+    Ok(serde_json::json!({
+        "text": truncated,
+        "truncated": was_truncated,
+        "length": truncated.chars().count(),
+    }))
+}
+
+fn open_ocr_select_window(app: &AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("ocr-select") {
+        let _ = win.show();
+        let _ = win.set_focus();
+        return Ok(());
+    }
+    let app_h = app.clone();
+    app.run_on_main_thread(move || {
+        let _ = tauri::WebviewWindowBuilder::new(
+            &app_h,
+            "ocr-select",
+            tauri::WebviewUrl::App("ocr-select".into()),
+        )
+        .title("截图取词")
+        .decorations(false)
+        .always_on_top(true)
+        .fullscreen(true)
+        .transparent(true)
+        .skip_taskbar(true)
+        .focused(true)
+        .build();
+    })
+    .map_err(|e| format!("打开框选窗失败: {e}"))
+}
+
+/// Open the fullscreen region picker overlay.
+#[tauri::command]
+async fn start_ocr_capture(app: tauri::AppHandle) -> Result<(), String> {
+    open_ocr_select_window(&app)
+}
+
+/// Store OCR text as last_capture and open/reuse the lookup window.
+#[tauri::command]
+async fn set_ocr_capture_and_lookup(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    text: String,
+) -> Result<(), String> {
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("空文本".into());
+    }
+    if content_filter::should_reject(&trimmed) {
+        if let Some(reason) = content_filter::reject_reason(&trimmed) {
+            if let Ok(db) = state.db.lock() {
+                let _ = db.record_local_event(
+                    "ocr_filtered",
+                    &serde_json::json!({ "reason": reason.as_str() }),
+                );
+            }
+            return Err(format!("内容被过滤（{}），未发送", reason.as_str()));
+        }
+    }
+    let kind = clipboard_watcher::detect_kind_public(&trimmed);
+    let capture = serde_json::json!({
+        "selection": trimmed,
+        "context": "",
+        "kind": kind,
+        "sourceApp": "screenshot",
+        "sourceTitle": "截图取词",
+        "method": "ocr",
+    });
+    if let Ok(mut lc) = state.last_capture.lock() {
+        *lc = Some(capture);
+    }
+    clipboard_watcher::open_or_reuse_lookup_public(&app, kind == "paragraph");
+    Ok(())
+}
+
+#[tauri::command]
+fn get_anki_config(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let settings = db.get_settings()?;
+    Ok(serde_json::json!(anki::AnkiConfig::from_settings(
+        &settings
+    )))
+}
+
+#[tauri::command]
+async fn test_anki_connection(
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let config = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let settings = db.get_settings()?;
+        anki::AnkiConfig::from_settings(&settings)
+    };
+    anki::test_connection(&config).await
+}
+
+#[tauri::command]
+async fn list_anki_decks(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    let config = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let settings = db.get_settings()?;
+        anki::AnkiConfig::from_settings(&settings)
+    };
+    anki::list_decks(&config).await
+}
+
+#[tauri::command]
+async fn list_anki_models(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    let config = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let settings = db.get_settings()?;
+        anki::AnkiConfig::from_settings(&settings)
+    };
+    anki::list_models(&config).await
+}
+
+#[tauri::command]
+async fn send_words_to_anki(
+    state: tauri::State<'_, AppState>,
+    ids: Vec<String>,
+) -> Result<serde_json::Value, String> {
+    let (config, words) = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let settings = db.get_settings()?;
+        let config = anki::AnkiConfig::from_settings(&settings);
+        let words = db.get_words_by_ids(&ids)?;
+        (config, words)
+    };
+    let report = anki::send_words(&config, &words).await?;
+    if let Ok(db) = state.db.lock() {
+        let added = report.get("added").and_then(|v| v.as_u64()).unwrap_or(0);
+        if added > 0 {
+            let _ = db.record_local_event("anki_send_ok", &serde_json::json!({ "count": added }));
+        }
+        if let Some(errors) = report.get("errors").and_then(|v| v.as_array()) {
+            if !errors.is_empty() {
+                let _ = db.record_local_event(
+                    "anki_send_fail",
+                    &serde_json::json!({ "count": errors.len() }),
+                );
+            }
+        }
+    }
+    Ok(report)
+}
+
 fn setup_tray(
     app: &tauri::App,
     clipboard_enabled: Arc<AtomicBool>,
@@ -1542,12 +1728,20 @@ fn setup_tray(
     let pause30_item = MenuItem::with_id(app, "pause30", "暂停 30 分钟", true, None::<&str>)?;
     let lookup_item =
         MenuItem::with_id(app, "lookup_clip", "查词（读取剪贴板）", true, None::<&str>)?;
+    let ocr_item = MenuItem::with_id(
+        app,
+        "ocr_capture",
+        "截图取词 (Ctrl+Shift+O)",
+        true,
+        None::<&str>,
+    )?;
     let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "退出鸽鸽词典", true, None::<&str>)?;
     let menu = Menu::new(app)?;
     menu.append(&watch_item)?;
     menu.append(&pause30_item)?;
     menu.append(&lookup_item)?;
+    menu.append(&ocr_item)?;
     menu.append(&show_item)?;
     menu.append(&quit_item)?;
 
@@ -1598,6 +1792,9 @@ fn setup_tray(
             "lookup_clip" => {
                 let state = app.state::<AppState>();
                 clipboard_watcher::lookup_clipboard(app, &state.last_capture);
+            }
+            "ocr_capture" => {
+                let _ = open_ocr_select_window(app);
             }
             "show" => {
                 if let Some(win) = app.get_webview_window("main") {
@@ -1937,6 +2134,7 @@ pub fn run() {
             Some(vec!["--minimized"]),
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(AppState {
             db: Mutex::new(database),
             last_capture: Mutex::new(None),
@@ -1998,10 +2196,46 @@ pub fn run() {
             toggle_clipboard_watch,
             get_clipboard_watch_status,
             copy_text,
+            get_ocr_status,
+            ocr_recognize_region,
+            start_ocr_capture,
+            set_ocr_capture_and_lookup,
+            get_anki_config,
+            test_anki_connection,
+            list_anki_decks,
+            list_anki_models,
+            send_words_to_anki,
         ])
         .setup(move |app| {
             let cb = clipboard_enabled.clone();
             setup_tray(app, cb.clone())?;
+            // Register OCR hotkey from settings (default Control+Shift+O).
+            {
+                use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+                let state = app.state::<AppState>();
+                let ocr_enabled = state
+                    .db
+                    .lock()
+                    .ok()
+                    .and_then(|db| db.get_settings().ok())
+                    .and_then(|s| s.get("ocr").cloned())
+                    .map(|ocr| ocr.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true))
+                    .unwrap_or(true);
+                if ocr_enabled {
+                    let shortcut =
+                        "Control+Shift+O".parse::<tauri_plugin_global_shortcut::Shortcut>();
+                    if let Ok(sc) = shortcut {
+                        let app_handle = app.app_handle().clone();
+                        let _ =
+                            app.global_shortcut()
+                                .on_shortcut(sc, move |_app, _shortcut, event| {
+                                    if event.state == ShortcutState::Pressed {
+                                        let _ = open_ocr_select_window(&app_handle);
+                                    }
+                                });
+                    }
+                }
+            }
             let minimized = std::env::args().any(|arg| arg == "--minimized");
             if let Some(window) = app.get_webview_window("main") {
                 if minimized {

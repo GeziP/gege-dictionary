@@ -50,8 +50,14 @@ export function Lookup() {
   const [fontSize, setFontSize] = useState(13);
   const [interleave, setInterleave] = useState(true);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [showContext, setShowContext] = useState(false);
+  const [contextDraft, setContextDraft] = useState('');
   const fontUp = () => setFontSize((s) => Math.min(s + 1, 18));
   const fontDown = () => setFontSize((s) => Math.max(s - 1, 10));
+
+  useEffect(() => {
+    setContextDraft(lookupContext || '');
+  }, [lookupContext]);
 
   useEffect(() => {
     if (lookupStatus !== 'loading' && lookupStatus !== 'streaming') {
@@ -153,14 +159,32 @@ export function Lookup() {
     if (lookupSelection) {
       const wc = lookupSelection.split(/\s+/).length;
       const kind = wc >= 30 ? 'paragraph' : wc >= 6 ? 'sentence' : lookupSelection.includes(' ') ? 'phrase' : 'word';
-      triggerLookup(lookupSelection, lookupContext, kind);
+      triggerLookup(lookupSelection, contextDraft || lookupContext, kind);
     }
   };
 
   const handleReanalyze = () => {
     if (!lookupSelection || !entry) return;
-    triggerLookup(lookupSelection, lookupContext, entry.kind, lookupSourceApp, lookupSourceTitle, true);
+    triggerLookup(lookupSelection, contextDraft || lookupContext, entry.kind, lookupSourceApp, lookupSourceTitle, true);
   };
+
+  const handleContextReparse = () => {
+    if (!lookupSelection) return;
+    const kind = entry?.kind || 'word';
+    triggerLookup(lookupSelection, contextDraft, kind, lookupSourceApp, lookupSourceTitle, true);
+  };
+
+  useEffect(() => {
+    const onReset = () => {
+      setSaved(false);
+      setPinned(false);
+      setTagInput('');
+      setInitDone(false);
+      setEmptyHint(false);
+    };
+    window.addEventListener('gege-lookup-reset', onReset);
+    return () => window.removeEventListener('gege-lookup-reset', onReset);
+  }, []);
 
   return (
     <div className="h-full w-full overflow-hidden bg-surface text-ink">
@@ -207,6 +231,17 @@ export function Lookup() {
           )}
           <button
             type="button"
+            title="编辑上下文并重解析"
+            onClick={() => setShowContext((v) => !v)}
+            className={classNames(
+              'flex h-5 w-5 items-center justify-center rounded transition-colors',
+              showContext ? 'text-accent' : 'text-ink-subtle hover:text-ink'
+            )}
+          >
+            <AlignJustifyIcon size={11} />
+          </button>
+          <button
+            type="button"
             title={pinned ? '取消钉住' : '钉住窗口'}
             onClick={() => setPinned(!pinned)}
             className={classNames(
@@ -225,6 +260,38 @@ export function Lookup() {
             <XIcon size={12} />
           </button>
         </div>
+
+        {showContext && (
+          <div className="border-b border-line bg-sunken/40 px-3 py-2">
+            <p className="mb-1 text-[10px] text-ink-subtle">
+              补充上下文后重新解析（可提高语境义准确度）
+            </p>
+            <textarea
+              value={contextDraft}
+              onChange={(e) => setContextDraft(e.target.value)}
+              rows={3}
+              className="w-full resize-y rounded border border-line bg-surface px-2 py-1 text-[11px] text-ink outline-none focus:border-accent"
+              placeholder="粘贴前后句或相关段落…"
+            />
+            <div className="mt-1 flex justify-end gap-2">
+              <button
+                type="button"
+                className="text-[11px] text-ink-subtle hover:text-ink"
+                onClick={() => setShowContext(false)}
+              >
+                收起
+              </button>
+              <button
+                type="button"
+                className="rounded bg-accent px-2 py-0.5 text-[11px] text-white"
+                onClick={handleContextReparse}
+                disabled={!lookupSelection || lookupStatus === 'loading' || lookupStatus === 'streaming'}
+              >
+                用新上下文重新解析
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Content */}
         <div className="thin-scroll min-h-0 flex-1 overflow-y-auto px-3 py-2.5" style={{ fontSize: `${fontSize}px` }}>

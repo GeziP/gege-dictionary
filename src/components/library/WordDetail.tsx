@@ -21,6 +21,7 @@ import { SpeakButton } from '../card/SpeakButton';
 import { EditableText } from './EditableText';
 import { RichText } from '../ui/RichText';
 import { DomainAnalysis } from '../domain/DomainAnalysis';
+import * as bridge from '../../lib/tauri-bridge';
 
 const MASTERY: { value: Mastery; label: string }[] = [
   { value: 'new', label: '新词' },
@@ -54,6 +55,7 @@ export function WordDetail({
   const [tagDraft, setTagDraft] = useState('');
   const [fontSize, setFontSize] = useState(initialFontSize);
   const [interleave, setInterleave] = useState(true);
+  const [ankiMsg, setAnkiMsg] = useState<string | null>(null);
   const flashTimer = useRef<number>();
 
   useEffect(() => {
@@ -89,6 +91,18 @@ export function WordDetail({
     setSnapshot(null);
   };
 
+  const sendToAnki = async () => {
+    setAnkiMsg(null);
+    try {
+      const report = await bridge.sendWordsToAnki([word.id]);
+      if (report.added > 0) setAnkiMsg(`已发送 ${report.added} 条到 Anki`);
+      else if (report.skipped > 0) setAnkiMsg('Anki 中已存在，已跳过');
+      else setAnkiMsg(report.errors[0] || '发送失败');
+    } catch (e) {
+      setAnkiMsg(String(e));
+    }
+  };
+
   const suggestions = tags.filter(
     (tag) => !word.tags.includes(tag) && tag.startsWith(tagDraft.toLowerCase())
   );
@@ -115,6 +129,19 @@ export function WordDetail({
           <span className="text-[11px] text-ink-subtle">{word.pos}</span>
           <span className="font-ipa text-[12px] text-ink-muted">{word.ipaUS}</span>
           <SpeakButton text={word.lemma} label={`朗读 ${word.lemma}`} size={13} />
+          {settings.anki?.enabled && (
+            <button
+              type="button"
+              title="发送到 Anki"
+              onClick={() => void sendToAnki()}
+              className="rounded border border-line px-1.5 py-0.5 text-[10px] text-ink-muted hover:text-ink"
+            >
+              Anki
+            </button>
+          )}
+          {ankiMsg && (
+            <span className="max-w-[140px] truncate text-[10px] text-ink-subtle">{ankiMsg}</span>
+          )}
           <div className="ml-auto flex items-center gap-1">
             <div className="flex items-center gap-0.5 rounded border border-line px-0.5">
               <button

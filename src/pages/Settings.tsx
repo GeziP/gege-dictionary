@@ -9,6 +9,7 @@ import { ReviewSection } from '../components/settings/ReviewSection';
 import { UpdateSection } from '../components/settings/UpdateSection';
 import { GlossarySection } from '../components/settings/GlossarySection';
 import { LocalStatsSection } from '../components/settings/LocalStatsSection';
+import { AnkiSection } from '../components/settings/AnkiSection';
 import { classNames } from '../utils/format';
 
 const TABS = [
@@ -18,6 +19,7 @@ const TABS = [
   { id: 'glossary', label: '术语与领域' },
   { id: 'appearance', label: '外观与朗读' },
   { id: 'review', label: '复习与会话' },
+  { id: 'anki', label: 'Anki' },
   { id: 'update', label: '应用更新' },
   { id: 'data', label: '数据与隐私' },
   { id: 'stats', label: '本地统计' },
@@ -58,6 +60,7 @@ export function Settings() {
           {tab === 'glossary' ? <GlossarySection /> : null}
           {tab === 'appearance' ? <AppearanceSection /> : null}
           {tab === 'review' ? <ReviewSection /> : null}
+          {tab === 'anki' ? <AnkiSection /> : null}
           {tab === 'update' ? <UpdateSection /> : null}
           {tab === 'data' ? <DataSection /> : null}
           {tab === 'stats' ? <LocalStatsSection /> : null}

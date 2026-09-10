@@ -45,6 +45,19 @@ const DEFAULT_SETTINGS: AppSettings = {
   analysisStyle: 'standard',
   autoCheckUpdates: true,
   skippedUpdateVersion: '',
+  anki: {
+    enabled: false,
+    host: '127.0.0.1',
+    port: 8765,
+    deck: 'Default',
+    model: 'Basic',
+    autoSend: false,
+  },
+  ocr: {
+    enabled: true,
+    hotkey: 'Control+Shift+O',
+    language: 'en-US',
+  },
 };
 
 type SettingsPatch = Omit<Partial<AppSettings>, 'provider'> & {
