@@ -132,25 +132,32 @@ export function Lookup() {
       lookups: (existing?.lookups || 0) + 1,
       note: existing?.note || '',
     };
-    ctxSaveWord(word);
-    setSaved(true);
-    countLookup(0);
-    const timer = setTimeout(() => setUndoTimer(null), 5000);
-    setUndoTimer(timer);
-    if (settings.anki?.enabled && settings.anki.autoSend) {
-      void bridge
-        .sendWordsToAnki([word.id])
-        .then((report) => {
-          if (report.added > 0) {
-            setAnkiFlash(`已同步 Anki（${report.added}）`);
-          } else if (report.skipped > 0) {
-            setAnkiFlash('Anki 已有此词');
-          }
-        })
-        .catch(() => {
-          /* silent; Anki optional */
-        });
-    }
+    ctxSaveWord(word)
+      .then(() => {
+        setSaved(true);
+        countLookup(0);
+        const timer = setTimeout(() => setUndoTimer(null), 5000);
+        setUndoTimer(timer);
+        if (settings.anki?.enabled && settings.anki.autoSend) {
+          return bridge
+            .sendWordsToAnki([word.id])
+            .then((report) => {
+              if (report.added > 0) {
+                setAnkiFlash(`已同步 Anki（${report.added}）`);
+              } else if (report.skipped > 0) {
+                setAnkiFlash('Anki 已有此词');
+              }
+            })
+            .catch(() => {
+              /* Anki optional */
+            });
+        }
+        return undefined;
+      })
+      .catch((e) => {
+        console.error('saveWord failed', e);
+        setSaved(false);
+      });
   }, [entry, existing, lookupContext, lookupSourceApp, lookupSourceTitle, tagInput, ctxSaveWord, countLookup, lookupStatus, settings.anki]);
 
   useEffect(() => {
@@ -196,6 +203,7 @@ export function Lookup() {
       setTagInput('');
       setInitDone(false);
       setEmptyHint(false);
+      setAnkiFlash(null);
     };
     window.addEventListener('gege-lookup-reset', onReset);
     return () => window.removeEventListener('gege-lookup-reset', onReset);
@@ -354,9 +362,19 @@ export function Lookup() {
                   return (
                     <button
                       type="button"
-                      onClick={() => {
-                        void bridge.closeLookupWindow();
-                        window.location.href = '/settings';
+                      onClick={async () => {
+                        await bridge.closeLookupWindow();
+                        await bridge.showMainWindow().catch(() => undefined);
+                        // Main window router opens Settings via query if supported; otherwise library.
+                        try {
+                          const mod = await import('@tauri-apps/api/webviewWindow');
+                          const main = await mod.WebviewWindow.getByLabel('main');
+                          if (main) {
+                            await main.emit('gege://navigate', { path: '/settings' });
+                          }
+                        } catch {
+                          /* ignore */
+                        }
                       }}
                       className="rounded-md border border-line bg-raised px-3 py-1.5 text-[11px] text-ink hover:bg-sunken"
                     >

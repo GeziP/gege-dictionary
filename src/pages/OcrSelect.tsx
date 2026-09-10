@@ -55,8 +55,21 @@ export function OcrSelect() {
           return;
         }
         if (result?.truncated) {
-          // User-visible notice before opening lookup.
+          // Window is hidden; show briefly so the user can see the notice.
+          try {
+            await win.show();
+          } catch {
+            /* ignore */
+          }
           setHint(`文本较长，已截取前 ${result.length} 字`);
+          setPhase('select');
+          setError(null);
+          await new Promise((resolve) => setTimeout(resolve, 900));
+          try {
+            await win.hide();
+          } catch {
+            /* ignore */
+          }
         }
         await bridge.setOcrCaptureAndLookup(text);
         await closeSelf();

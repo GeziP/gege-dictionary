@@ -1529,6 +1529,18 @@ async fn copy_text(text: String) -> Result<(), String> {
         .map_err(|e| format!("复制失败: {e}"))
 }
 
+/// Show and focus the main window (used from lookup empty-state CTA).
+#[tauri::command]
+async fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+        return Ok(());
+    }
+    Err("主窗口不存在".into())
+}
+
 #[tauri::command]
 fn get_ocr_status() -> serde_json::Value {
     ocr::get_ocr_status()
@@ -1567,10 +1579,12 @@ async fn ocr_recognize_region(
 
     let truncated = text.chars().take(ocr::max_ocr_chars()).collect::<String>();
     let was_truncated = truncated.chars().count() < text.chars().count();
+    let kind = clipboard_watcher::detect_kind_public(truncated.trim());
     Ok(serde_json::json!({
         "text": truncated,
         "truncated": was_truncated,
         "length": truncated.chars().count(),
+        "kind": kind,
     }))
 }
 
@@ -2210,6 +2224,7 @@ pub fn run() {
             ocr_recognize_region,
             start_ocr_capture,
             set_ocr_capture_and_lookup,
+            show_main_window,
             get_anki_config,
             test_anki_connection,
             list_anki_decks,
