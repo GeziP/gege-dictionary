@@ -221,9 +221,9 @@ pub async fn send_words(config: &AnkiConfig, words: &[Value]) -> Result<Value, S
             skipped += 1;
             continue;
         }
-        // Dedup: find existing note with same front in deck.
+        // Dedup: exact Front field match in deck.
         let query = format!(
-            "deck:\"{}\" \"{}\"",
+            "deck:\"{}\" Front:\"{}\"",
             config.deck.replace('"', ""),
             front.replace('"', "")
         );
@@ -237,32 +237,51 @@ pub async fn send_words(config: &AnkiConfig, words: &[Value]) -> Result<Value, S
             }
         }
 
-        let note = json!({
-            "deckName": config.deck,
-            "modelName": config.model,
-            "fields": {
-                "Front": front,
-                "Back": back,
-                "Extra": word.get("explanation").and_then(|v| v.as_str()).unwrap_or(""),
-            },
-            "tags": tags,
-        });
-        // Prefer Front/Back for Basic; also try to add Extra if model has it via options.
+        let extra = word
+            .get("explanation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let mut fields = serde_json::Map::new();
+        fields.insert("Front".into(), json!(front.clone()));
+        fields.insert("Back".into(), json!(back.clone()));
+        if !extra.is_empty() {
+            // Basic models ignore unknown fields; models with Extra keep explanation.
+            fields.insert("Extra".into(), json!(extra));
+        }
         let params = json!({
             "note": {
                 "deckName": config.deck,
                 "modelName": config.model,
-                "fields": {
-                    "Front": front,
-                    "Back": back,
-                },
+                "fields": fields,
                 "tags": tags,
+                "options": { "allowDuplicate": false },
             }
         });
-        let _ = note;
         match invoke_action(&endpoint, "addNote", params).await {
             Ok(_) => added += 1,
-            Err(e) => errors.push(format!("{front}: {e}")),
+            Err(e) => {
+                // Retry Front/Back only if model rejected Extra.
+                if extra.is_empty() {
+                    errors.push(format!("{front}: {e}"));
+                } else {
+                    let mut basic = serde_json::Map::new();
+                    basic.insert("Front".into(), json!(front.clone()));
+                    basic.insert("Back".into(), json!(back.clone()));
+                    let fallback = json!({
+                        "note": {
+                            "deckName": config.deck,
+                            "modelName": config.model,
+                            "fields": basic,
+                            "tags": tags,
+                            "options": { "allowDuplicate": false },
+                        }
+                    });
+                    match invoke_action(&endpoint, "addNote", fallback).await {
+                        Ok(_) => added += 1,
+                        Err(e2) => errors.push(format!("{front}: {e2}")),
+                    }
+                }
+            }
         }
     }
 

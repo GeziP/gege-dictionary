@@ -354,6 +354,16 @@ export async function registerOcrHotkey(shortcut = 'Control+Shift+O'): Promise<v
   });
 }
 
+export async function unregisterOcrHotkey(shortcut = 'Control+Shift+O'): Promise<void> {
+  if (!IS_TAURI) return;
+  const plugin = await import('@tauri-apps/plugin-global-shortcut');
+  try {
+    await plugin.unregister(shortcut);
+  } catch {
+    // already unregistered
+  }
+}
+
 export async function testConnection(
   baseUrl: string,
   apiKey: string,

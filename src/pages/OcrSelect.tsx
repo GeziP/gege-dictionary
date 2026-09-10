@@ -29,17 +29,43 @@ export function OcrSelect() {
       }
       setPhase('working');
       setHint('正在本地识别…');
+      // Hide overlay BEFORE BitBlt so the mask/hint is not captured.
+      const win = getCurrentWebviewWindow();
       try {
-        const result = await bridge.ocrRecognizeRegion(r.x, r.y, r.w, r.h);
+        await win.hide();
+      } catch {
+        // continue; capture may still work
+      }
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      try {
+        const language = await bridge
+          .getSettings()
+          .then((s) => s.ocr?.language || 'en-US')
+          .catch(() => 'en-US');
+        const result = await bridge.ocrRecognizeRegion(r.x, r.y, r.w, r.h, language);
         const text = (result?.text || '').trim();
         if (!text) {
+          try {
+            await win.show();
+          } catch {
+            /* ignore */
+          }
           setPhase('error');
           setError('未识别到英文，请换一块更清晰的区域');
           return;
         }
+        if (result?.truncated) {
+          // Inform via toast-less hint after lookup opens.
+          console.warn('OCR text truncated to', result.length);
+        }
         await bridge.setOcrCaptureAndLookup(text);
         await closeSelf();
       } catch (e) {
+        try {
+          await win.show();
+        } catch {
+          /* ignore */
+        }
         setPhase('error');
         setError(String(e));
       }

@@ -168,12 +168,17 @@ export function CaptureSection() {
         <Toggle
           checked={(settings.ocr?.enabled ?? true) !== false}
           onChange={(value) => {
-            const ocr = { ...(settings.ocr || {}), enabled: value };
+            const hotkey = settings.ocr?.hotkey || 'Control+Shift+O';
+            const ocr = { ...(settings.ocr || {}), enabled: value, hotkey };
             updateSettings({ ocr });
             if (value) {
               void bridge
-                .registerOcrHotkey(ocr.hotkey || 'Control+Shift+O')
+                .registerOcrHotkey(hotkey)
                 .catch((e) => console.error('register ocr hotkey', e));
+            } else {
+              void bridge
+                .unregisterOcrHotkey(hotkey)
+                .catch((e) => console.error('unregister ocr hotkey', e));
             }
           }}
           label="启用截图取词"

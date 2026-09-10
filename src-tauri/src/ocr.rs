@@ -164,6 +164,8 @@ mod win {
         }
     }
 
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+
     pub fn recognize_region(
         x: i32,
         y: i32,
@@ -171,6 +173,10 @@ mod win {
         height: i32,
         lang: Option<&str>,
     ) -> Result<String, String> {
+        // WinRT async .get() requires COM/WinRT apartment on this thread.
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
         let bgra = capture_region_bgra(x, y, width, height)?;
         let bitmap = bgra_to_software_bitmap(&bgra, width as u32, height as u32)?;
         let engine = create_engine(lang).or_else(|_| create_engine(None))?;

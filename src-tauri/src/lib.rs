@@ -1660,6 +1660,9 @@ async fn test_anki_connection(
         let settings = db.get_settings()?;
         anki::AnkiConfig::from_settings(&settings)
     };
+    if !config.enabled {
+        return Err("请先启用 Anki Connect".into());
+    }
     anki::test_connection(&config).await
 }
 
@@ -1670,6 +1673,9 @@ async fn list_anki_decks(state: tauri::State<'_, AppState>) -> Result<Vec<String
         let settings = db.get_settings()?;
         anki::AnkiConfig::from_settings(&settings)
     };
+    if !config.enabled {
+        return Err("请先启用 Anki Connect".into());
+    }
     anki::list_decks(&config).await
 }
 
@@ -1680,6 +1686,9 @@ async fn list_anki_models(state: tauri::State<'_, AppState>) -> Result<Vec<Strin
         let settings = db.get_settings()?;
         anki::AnkiConfig::from_settings(&settings)
     };
+    if !config.enabled {
+        return Err("请先启用 Anki Connect".into());
+    }
     anki::list_models(&config).await
 }
 
