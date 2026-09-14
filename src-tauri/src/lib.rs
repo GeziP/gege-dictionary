@@ -155,6 +155,252 @@ fn should_fallback_stream(saw_content: bool) -> bool {
     !saw_content
 }
 
+struct PreparedLookup {
+    base_url: String,
+    api_key: String,
+    model: String,
+    protocol: String,
+    temperature: f64,
+    max_tokens: u32,
+    timeout_secs: u64,
+    template_body: String,
+    template_name: String,
+    cache_key: String,
+    cache_hit: Option<serde_json::Value>,
+}
+
+fn decrypt_provider_api_key(raw_key: &str, log_prefix: &str) -> String {
+    eprintln!(
+        "[{log_prefix}] raw_key starts_with dpapi={}, len={}",
+        raw_key.starts_with("dpapi:"),
+        raw_key.len()
+    );
+    #[cfg(windows)]
+    {
+        match dpapi::decrypt(raw_key) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("[{log_prefix}] DPAPI decrypt FAILED: {e}");
+                raw_key.to_string()
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        raw_key.to_string()
+    }
+}
+
+fn annotate_lookup_entry(entry: &mut serde_json::Value, template_name: &str) {
+    if let Some(obj) = entry.as_object_mut() {
+        obj.insert(
+            "_templateName".to_string(),
+            serde_json::Value::String(template_name.to_string()),
+        );
+    }
+}
+
+fn store_lookup_cache(
+    state: &tauri::State<'_, AppState>,
+    cache_key: &str,
+    model: &str,
+    entry: &serde_json::Value,
+) {
+    let db_path = match state.db.lock() {
+        Ok(db) => db.path().to_string(),
+        Err(_) => return,
+    };
+    if let Ok(db) = db::Database::open(&db_path) {
+        let _ = db.set_cache(cache_key, model, entry);
+    }
+}
+
+/// Shared preflight for non-streaming and streaming lookup commands.
+/// Resolves provider/template/glossary, DPAPI key, cache key, and optional cache hit.
+fn prepare_lookup(
+    state: &tauri::State<'_, AppState>,
+    selection: &str,
+    context: &str,
+    kind: &str,
+    force_refresh: bool,
+    log_prefix: &str,
+) -> Result<PreparedLookup, String> {
+    let (
+        base_url,
+        api_key,
+        model,
+        protocol,
+        temperature,
+        max_tokens,
+        timeout_secs,
+        template_body,
+        template_name,
+        cache_ttl,
+    ) = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let settings = db.get_settings()?;
+        let provider = settings
+            .get("provider")
+            .ok_or("No provider configured")?
+            .clone();
+        let templates = db.get_templates()?;
+        let scope = match kind {
+            "paragraph" => "paragraph",
+            "sentence" => "sentence",
+            _ => "word",
+        };
+        let matched = templates
+            .iter()
+            .find(|t| t.get("scope").and_then(|v| v.as_str()).unwrap_or("") == scope)
+            .or_else(|| {
+                templates
+                    .iter()
+                    .find(|t| t.get("scope").and_then(|v| v.as_str()).unwrap_or("") == "all")
+            })
+            .or(templates.first());
+        let tpl_body = matched
+            .map(|t| {
+                t.get("body")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        let tpl_name = matched
+            .map(|t| {
+                t.get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("未知模板")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "无匹配模板".to_string());
+        let tpl_scope = matched
+            .map(|t| {
+                t.get("scope")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        let domain = settings
+            .get("activeDomainProfile")
+            .and_then(|value| value.as_str())
+            .filter(|value| glossary::DOMAINS.contains(value))
+            .unwrap_or("general");
+        let style = settings
+            .get("analysisStyle")
+            .and_then(|value| value.as_str())
+            .filter(|value| glossary::STYLES.contains(value))
+            .unwrap_or("standard");
+        let glossary_matches = db.find_glossary_matches(selection, context, domain)?;
+        if !glossary_matches.is_empty() {
+            eprintln!(
+                "[{log_prefix}] glossary_term_applied count={}, domain={domain}",
+                glossary_matches.len()
+            );
+            let _ = db.record_local_event(
+                "glossary_term_applied",
+                &serde_json::json!({ "count_bucket": glossary_matches.len().min(10).to_string() }),
+            );
+        }
+        let tpl_body = glossary::enrich_template(&tpl_body, domain, style, &glossary_matches);
+
+        let base_url_value = provider
+            .get("baseUrl")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut mt = provider
+            .get("maxTokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1200) as u32;
+        let mut ts = provider
+            .get("timeoutSeconds")
+            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
+            .unwrap_or(60);
+        if kind == "paragraph" {
+            mt = mt.max(4000);
+            ts = ts.max(120);
+        }
+        if base_url_value.to_ascii_lowercase().contains("deepseek.com") {
+            mt = mt.max(3000);
+        }
+
+        let raw_key = provider
+            .get("apiKey")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let api_key_decrypted = decrypt_provider_api_key(&raw_key, log_prefix);
+
+        (
+            base_url_value,
+            api_key_decrypted,
+            provider
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            provider
+                .get("protocol")
+                .and_then(|v| v.as_str())
+                .unwrap_or("openai")
+                .to_string(),
+            provider
+                .get("temperature")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.3),
+            mt,
+            ts,
+            tpl_body,
+            format!("{} [{}]", tpl_name, tpl_scope),
+            cache_ttl_days(&settings),
+        )
+    };
+
+    if api_key.starts_with("dpapi:") {
+        return Err("API Key 解密失败，请到设置页重新输入".to_string());
+    }
+
+    let cache_key = lookup_cache_key(selection, context, kind, &model, &template_body);
+    let mut cache_hit = None;
+    if !force_refresh {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        if let Some(mut cached) = db.get_cache(&cache_key, cache_ttl)? {
+            let _ = db.record_local_event("lookup_cache_hit", &serde_json::json!({ "kind": kind }));
+            if let Some(obj) = cached.as_object_mut() {
+                obj.insert("fromCache".to_string(), serde_json::Value::Bool(true));
+                obj.insert(
+                    "_templateName".to_string(),
+                    serde_json::Value::String(template_name.clone()),
+                );
+            }
+            cache_hit = Some(cached);
+        } else {
+            let _ =
+                db.record_local_event("lookup_cache_miss", &serde_json::json!({ "kind": kind }));
+        }
+    } else {
+        let _ = state.db.lock().map(|db| {
+            db.record_local_event("lookup_cache_miss", &serde_json::json!({ "kind": kind }))
+        });
+    }
+
+    Ok(PreparedLookup {
+        base_url,
+        api_key,
+        model,
+        protocol,
+        temperature,
+        max_tokens,
+        timeout_secs,
+        template_body,
+        template_name,
+        cache_key,
+        cache_hit,
+    })
+}
+
 #[cfg(windows)]
 fn migrate_api_key_storage(database: &db::Database) -> Result<(), String> {
     let mut settings = database.get_settings()?;
@@ -703,197 +949,41 @@ async fn lookup_word(
     kind: String,
     force_refresh: bool,
 ) -> Result<serde_json::Value, String> {
-    let (
-        base_url,
-        api_key,
-        model,
-        protocol,
-        temperature,
-        max_tokens,
-        timeout_secs,
-        template_body,
-        template_name,
-        cache_ttl,
-    ) = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        let settings = db.get_settings()?;
-        let provider = settings
-            .get("provider")
-            .ok_or("No provider configured")?
-            .clone();
-        let templates = db.get_templates()?;
-        let scope = match kind.as_str() {
-            "paragraph" => "paragraph",
-            "sentence" => "sentence",
-            _ => "word",
-        };
-        let matched = templates
-            .iter()
-            .find(|t| {
-                let s = t.get("scope").and_then(|v| v.as_str()).unwrap_or("");
-                s == scope
-            })
-            .or_else(|| {
-                templates.iter().find(|t| {
-                    let s = t.get("scope").and_then(|v| v.as_str()).unwrap_or("");
-                    s == "all"
-                })
-            })
-            .or(templates.first());
-        let tpl_body = matched
-            .map(|t| {
-                t.get("body")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            })
-            .unwrap_or_default();
-        let tpl_name = matched
-            .map(|t| {
-                t.get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("未知模板")
-                    .to_string()
-            })
-            .unwrap_or_else(|| "无匹配模板".to_string());
-        let tpl_scope = matched
-            .map(|t| {
-                t.get("scope")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            })
-            .unwrap_or_default();
-        let domain = settings
-            .get("activeDomainProfile")
-            .and_then(|value| value.as_str())
-            .filter(|value| glossary::DOMAINS.contains(value))
-            .unwrap_or("general");
-        let style = settings
-            .get("analysisStyle")
-            .and_then(|value| value.as_str())
-            .filter(|value| glossary::STYLES.contains(value))
-            .unwrap_or("standard");
-        let glossary_matches = db.find_glossary_matches(&selection, &context, domain)?;
-        if !glossary_matches.is_empty() {
-            eprintln!(
-                "[lookup_word] glossary_term_applied count={}, domain={domain}",
-                glossary_matches.len()
-            );
-            let _ = db.record_local_event(
-                "glossary_term_applied",
-                &serde_json::json!({ "count_bucket": glossary_matches.len().min(10).to_string() }),
-            );
-        }
-        let tpl_body = glossary::enrich_template(&tpl_body, domain, style, &glossary_matches);
-
-        let base_url_value = provider
-            .get("baseUrl")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let mut mt = provider
-            .get("maxTokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1200) as u32;
-        let mut ts = provider
-            .get("timeoutSeconds")
-            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
-            .unwrap_or(60);
-        if kind == "paragraph" {
-            mt = mt.max(4000);
-            ts = ts.max(120);
-        }
-        if base_url_value.to_ascii_lowercase().contains("deepseek.com") {
-            mt = mt.max(3000);
-        }
-
-        let raw_key = provider
-            .get("apiKey")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        eprintln!(
-            "[lookup_word] raw_key starts_with dpapi={}, len={}",
-            raw_key.starts_with("dpapi:"),
-            raw_key.len()
-        );
-        #[cfg(windows)]
-        let api_key_decrypted = match dpapi::decrypt(&raw_key) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("[lookup_word] DPAPI decrypt FAILED: {e}");
-                raw_key.clone()
-            }
-        };
-        #[cfg(not(windows))]
-        let api_key_decrypted = raw_key;
-
-        (
-            base_url_value,
-            api_key_decrypted,
-            provider
-                .get("model")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            provider
-                .get("protocol")
-                .and_then(|v| v.as_str())
-                .unwrap_or("openai")
-                .to_string(),
-            provider
-                .get("temperature")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.3),
-            mt,
-            ts,
-            tpl_body,
-            format!("{} [{}]", tpl_name, tpl_scope),
-            cache_ttl_days(&settings),
-        )
-    };
-
-    if api_key.starts_with("dpapi:") {
-        return Err("API Key 解密失败，请到设置页重新输入".to_string());
-    }
-    eprintln!(
-        "[lookup_word] {} model={model:?} protocol={protocol:?} timeout={timeout_secs}s tpl_len={}",
-        selection_meta(&selection, &kind),
-        template_body.len()
-    );
-
-    let cache_key = lookup_cache_key(&selection, &context, &kind, &model, &template_body);
-    if !force_refresh {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        if let Some(mut cached) = db.get_cache(&cache_key, cache_ttl)? {
-            eprintln!("[lookup_word] cache HIT");
-            let _ = db.record_local_event("lookup_cache_hit", &serde_json::json!({ "kind": kind }));
-            if let Some(obj) = cached.as_object_mut() {
-                obj.insert("fromCache".to_string(), serde_json::Value::Bool(true));
-            }
-            return Ok(cached);
-        }
-    }
-    eprintln!("[lookup_word] cache miss, calling LLM...");
-    record_event(
+    let prepared = prepare_lookup(
         &state,
-        "lookup_cache_miss",
-        serde_json::json!({ "kind": kind }),
-    );
-
-    let full_text = llm::stream_lookup(
-        &base_url,
-        &api_key,
-        &model,
-        &protocol,
-        temperature,
-        max_tokens,
-        timeout_secs,
         &selection,
         &context,
         &kind,
-        &template_body,
+        force_refresh,
+        "lookup_word",
+    )?;
+
+    if let Some(cached) = prepared.cache_hit {
+        eprintln!("[lookup_word] cache HIT");
+        return Ok(cached);
+    }
+
+    eprintln!(
+        "[lookup_word] {} model={:?} protocol={:?} timeout={}s tpl_len={}, cache miss, calling LLM...",
+        selection_meta(&selection, &kind),
+        prepared.model,
+        prepared.protocol,
+        prepared.timeout_secs,
+        prepared.template_body.len()
+    );
+
+    let full_text = llm::stream_lookup(
+        &prepared.base_url,
+        &prepared.api_key,
+        &prepared.model,
+        &prepared.protocol,
+        prepared.temperature,
+        prepared.max_tokens,
+        prepared.timeout_secs,
+        &selection,
+        &context,
+        &kind,
+        &prepared.template_body,
     )
     .await
     .map_err(|e| {
@@ -907,21 +997,8 @@ async fn lookup_word(
         eprintln!("[lookup_word] parse FAIL: {e}");
         format!("JSON 解析失败: {e}")
     })?;
-
-    if let Some(obj) = entry.as_object_mut() {
-        obj.insert(
-            "_templateName".to_string(),
-            serde_json::Value::String(template_name.clone()),
-        );
-    }
-
-    let db_path = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        db.path().to_string()
-    };
-    if let Ok(db) = db::Database::open(&db_path) {
-        let _ = db.set_cache(&cache_key, &model, &entry);
-    }
+    annotate_lookup_entry(&mut entry, &prepared.template_name);
+    store_lookup_cache(&state, &prepared.cache_key, &prepared.model, &entry);
 
     eprintln!("[lookup_word] done, returning entry");
     Ok(entry)
@@ -937,192 +1014,32 @@ async fn lookup_word_stream(
     request_id: String,
     force_refresh: bool,
 ) -> Result<(), String> {
-    let (
-        base_url,
-        api_key,
-        model,
-        protocol,
-        temperature,
-        max_tokens,
-        timeout_secs,
-        template_body,
-        template_name,
-        cache_ttl,
-    ) = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        let settings = db.get_settings()?;
-        let provider = settings
-            .get("provider")
-            .ok_or("No provider configured")?
-            .clone();
-        let templates = db.get_templates()?;
-        let scope = match kind.as_str() {
-            "paragraph" => "paragraph",
-            "sentence" => "sentence",
-            _ => "word",
-        };
-        let matched = templates
-            .iter()
-            .find(|t| t.get("scope").and_then(|v| v.as_str()).unwrap_or("") == scope)
-            .or_else(|| {
-                templates
-                    .iter()
-                    .find(|t| t.get("scope").and_then(|v| v.as_str()).unwrap_or("") == "all")
-            })
-            .or(templates.first());
-        let tpl_body = matched
-            .map(|t| {
-                t.get("body")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            })
-            .unwrap_or_default();
-        let tpl_name = matched
-            .map(|t| {
-                t.get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("未知模板")
-                    .to_string()
-            })
-            .unwrap_or_else(|| "无匹配模板".to_string());
-        let tpl_scope = matched
-            .map(|t| {
-                t.get("scope")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            })
-            .unwrap_or_default();
-        let domain = settings
-            .get("activeDomainProfile")
-            .and_then(|value| value.as_str())
-            .filter(|value| glossary::DOMAINS.contains(value))
-            .unwrap_or("general");
-        let style = settings
-            .get("analysisStyle")
-            .and_then(|value| value.as_str())
-            .filter(|value| glossary::STYLES.contains(value))
-            .unwrap_or("standard");
-        let glossary_matches = db.find_glossary_matches(&selection, &context, domain)?;
-        if !glossary_matches.is_empty() {
-            eprintln!(
-                "[lookup_stream] glossary_term_applied count={}, domain={domain}",
-                glossary_matches.len()
-            );
-            let _ = db.record_local_event(
-                "glossary_term_applied",
-                &serde_json::json!({ "count_bucket": glossary_matches.len().min(10).to_string() }),
-            );
-        }
-        let tpl_body = glossary::enrich_template(&tpl_body, domain, style, &glossary_matches);
+    let prepared = prepare_lookup(
+        &state,
+        &selection,
+        &context,
+        &kind,
+        force_refresh,
+        "lookup_stream",
+    )?;
 
-        let base_url_value = provider
-            .get("baseUrl")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let mut mt = provider
-            .get("maxTokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1200) as u32;
-        let mut ts = provider
-            .get("timeoutSeconds")
-            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
-            .unwrap_or(60);
-        if kind == "paragraph" {
-            mt = mt.max(4000);
-            ts = ts.max(120);
-        }
-        if base_url_value.to_ascii_lowercase().contains("deepseek.com") {
-            mt = mt.max(3000);
-        }
-
-        let raw_key = provider
-            .get("apiKey")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        eprintln!(
-            "[lookup_stream] raw_key starts_with dpapi={}, len={}",
-            raw_key.starts_with("dpapi:"),
-            raw_key.len()
+    if let Some(cached) = prepared.cache_hit {
+        eprintln!("[lookup_stream] cache HIT");
+        let _ = app.emit(
+            "lookup://done",
+            serde_json::json!({
+                "requestId": request_id,
+                "entry": cached,
+                "fromCache": true,
+            }),
         );
-        #[cfg(windows)]
-        let api_key_decrypted = match dpapi::decrypt(&raw_key) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("[lookup_stream] DPAPI decrypt FAILED: {e}");
-                raw_key.clone()
-            }
-        };
-        #[cfg(not(windows))]
-        let api_key_decrypted = raw_key;
-
-        (
-            base_url_value,
-            api_key_decrypted,
-            provider
-                .get("model")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            provider
-                .get("protocol")
-                .and_then(|v| v.as_str())
-                .unwrap_or("openai")
-                .to_string(),
-            provider
-                .get("temperature")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.3),
-            mt,
-            ts,
-            tpl_body,
-            format!("{} [{}]", tpl_name, tpl_scope),
-            cache_ttl_days(&settings),
-        )
-    };
-
-    if api_key.starts_with("dpapi:") {
-        return Err("API Key 解密失败，请到设置页重新输入".to_string());
-    }
-
-    // Check cache
-    let cache_key = lookup_cache_key(&selection, &context, &kind, &model, &template_body);
-    if !force_refresh {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        if let Some(mut cached) = db.get_cache(&cache_key, cache_ttl)? {
-            let _ = db.record_local_event("lookup_cache_hit", &serde_json::json!({ "kind": kind }));
-            if let Some(obj) = cached.as_object_mut() {
-                obj.insert("fromCache".to_string(), serde_json::Value::Bool(true));
-                obj.insert(
-                    "_templateName".to_string(),
-                    serde_json::Value::String(template_name.clone()),
-                );
-            }
-            let _ = app.emit(
-                "lookup://done",
-                serde_json::json!({
-                    "requestId": request_id,
-                    "entry": cached,
-                    "fromCache": true,
-                }),
-            );
-            return Ok(());
-        }
-        let _ = db.record_local_event("lookup_cache_miss", &serde_json::json!({ "kind": kind }));
-    } else {
-        record_event_handle(
-            &app,
-            "lookup_cache_miss",
-            serde_json::json!({ "kind": kind }),
-        );
+        return Ok(());
     }
 
     eprintln!(
-        "[lookup_stream] starting SSE, key_len={}, url={base_url}",
-        api_key.len()
+        "[lookup_stream] starting SSE, key_len={}, url={}",
+        prepared.api_key.len(),
+        prepared.base_url
     );
 
     let rid = request_id.clone();
@@ -1133,19 +1050,20 @@ async fn lookup_word_stream(
     let mut first_field_logged = false;
     let app_for_metrics = app.clone();
     let kind_for_metrics = kind.clone();
+    let template_name = prepared.template_name.clone();
 
     let result = llm::stream_lookup_sse(
-        &base_url,
-        &api_key,
-        &model,
-        &protocol,
-        temperature,
-        max_tokens,
-        timeout_secs,
+        &prepared.base_url,
+        &prepared.api_key,
+        &prepared.model,
+        &prepared.protocol,
+        prepared.temperature,
+        prepared.max_tokens,
+        prepared.timeout_secs,
         &selection,
         &context,
         &kind,
-        &template_body,
+        &prepared.template_body,
         |delta| {
             if !delta.is_empty() {
                 saw_stream_content = true;
@@ -1186,19 +1104,8 @@ async fn lookup_word_stream(
     match result {
         Ok(full_text) => match llm::parse_entry(&full_text, &selection, &kind) {
             Ok(mut entry) => {
-                if let Some(obj) = entry.as_object_mut() {
-                    obj.insert(
-                        "_templateName".to_string(),
-                        serde_json::Value::String(template_name),
-                    );
-                }
-                let db_path = {
-                    let db = state.db.lock().map_err(|e| e.to_string())?;
-                    db.path().to_string()
-                };
-                if let Ok(db) = db::Database::open(&db_path) {
-                    let _ = db.set_cache(&cache_key, &model, &entry);
-                }
+                annotate_lookup_entry(&mut entry, &template_name);
+                store_lookup_cache(&state, &prepared.cache_key, &prepared.model, &entry);
                 let _ = app.emit(
                     "lookup://done",
                     serde_json::json!({
@@ -1230,35 +1137,29 @@ async fn lookup_word_stream(
                 eprintln!("[lookup_stream] falling back to one non-streaming request");
                 record_event_handle(&app, "lookup_stream_fallback", serde_json::json!({}));
                 match llm::stream_lookup(
-                    &base_url,
-                    &api_key,
-                    &model,
-                    &protocol,
-                    temperature,
-                    max_tokens,
-                    timeout_secs,
+                    &prepared.base_url,
+                    &prepared.api_key,
+                    &prepared.model,
+                    &prepared.protocol,
+                    prepared.temperature,
+                    prepared.max_tokens,
+                    prepared.timeout_secs,
                     &selection,
                     &context,
                     &kind,
-                    &template_body,
+                    &prepared.template_body,
                 )
                 .await
                 {
                     Ok(full_text) => match llm::parse_entry(&full_text, &selection, &kind) {
                         Ok(mut entry) => {
-                            if let Some(obj) = entry.as_object_mut() {
-                                obj.insert(
-                                    "_templateName".to_string(),
-                                    serde_json::Value::String(template_name),
-                                );
-                            }
-                            let db_path = {
-                                let db = state.db.lock().map_err(|e| e.to_string())?;
-                                db.path().to_string()
-                            };
-                            if let Ok(db) = db::Database::open(&db_path) {
-                                let _ = db.set_cache(&cache_key, &model, &entry);
-                            }
+                            annotate_lookup_entry(&mut entry, &template_name);
+                            store_lookup_cache(
+                                &state,
+                                &prepared.cache_key,
+                                &prepared.model,
+                                &entry,
+                            );
                             let _ = app.emit(
                                 "lookup://done",
                                 serde_json::json!({
@@ -2425,6 +2326,14 @@ mod tests {
             normalize_selection("  Hello\n  World  ", "sentence"),
             "Hello World"
         );
+    }
+
+    #[test]
+    fn annotate_lookup_entry_sets_template_name() {
+        let mut entry = serde_json::json!({ "lemma": "resilient" });
+        annotate_lookup_entry(&mut entry, "单词解析 [word]");
+        assert_eq!(entry["_templateName"], "单词解析 [word]");
+        assert_eq!(entry["lemma"], "resilient");
     }
 
     #[test]
