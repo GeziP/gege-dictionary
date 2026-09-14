@@ -2337,6 +2337,42 @@ mod tests {
     }
 
     #[test]
+    fn cache_round_trip_preserves_entry_and_hit_annotation() {
+        let dir =
+            std::env::temp_dir().join(format!("gege-dic-cache-verify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("gege.db");
+        let db = db::Database::open(&db_path.to_string_lossy()).unwrap();
+        db.initialize().unwrap();
+
+        let mut entry = serde_json::json!({
+            "lemma": "resilient",
+            "translation": "有韧性的",
+            "kind": "word"
+        });
+        annotate_lookup_entry(&mut entry, "标准模板 [word]");
+        db.set_cache("k1", "gpt-test", &entry).unwrap();
+
+        let mut hit = db.get_cache("k1", 30).unwrap().expect("cache should hit");
+        assert_eq!(hit["lemma"], "resilient");
+        // prepare_lookup injects these on hit
+        if let Some(obj) = hit.as_object_mut() {
+            obj.insert("fromCache".into(), serde_json::Value::Bool(true));
+            obj.insert(
+                "_templateName".into(),
+                serde_json::Value::String("标准模板 [word]".into()),
+            );
+        }
+        assert_eq!(hit["fromCache"], true);
+        assert_eq!(hit["_templateName"], "标准模板 [word]");
+
+        // force_refresh path must ignore cache
+        assert!(db.get_cache("missing", 30).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn cache_key_tracks_context_and_enrichment() {
         let base = lookup_cache_key("deadlock", "thread A", "word", "model", "standard");
         assert_ne!(
