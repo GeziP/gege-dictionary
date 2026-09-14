@@ -343,25 +343,15 @@ export async function sendWordsToAnki(
 
 export async function registerOcrHotkey(shortcut = 'Control+Shift+O'): Promise<void> {
   if (!IS_TAURI) return;
-  const plugin = await import('@tauri-apps/plugin-global-shortcut');
-  try {
-    await plugin.unregister(shortcut);
-  } catch {
-    // not registered
-  }
-  await plugin.register(shortcut, () => {
-    void invoke('start_ocr_capture');
-  });
+  // Backend owns registration so startup and UI toggles share one path.
+  void shortcut;
+  await invoke('apply_ocr_hotkey_from_settings');
 }
 
 export async function unregisterOcrHotkey(shortcut = 'Control+Shift+O'): Promise<void> {
   if (!IS_TAURI) return;
-  const plugin = await import('@tauri-apps/plugin-global-shortcut');
-  try {
-    await plugin.unregister(shortcut);
-  } catch {
-    // already unregistered
-  }
+  void shortcut;
+  await invoke('apply_ocr_hotkey_from_settings');
 }
 
 export async function testConnection(

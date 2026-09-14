@@ -69,7 +69,7 @@ export function LocalStatsSection() {
               <StatCard label="流式降级" value={String(metrics.streamFallback)} />
               <StatCard label="复习答题" value={String(metrics.reviewAnswered)} />
             </div>
-            <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3">
+            <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
               <StatCard label="阅读会话查看" value={String(metrics.sessionsViewed)} />
               <StatCard label="术语命中" value={String(metrics.glossaryApplied)} />
               <StatCard
@@ -78,6 +78,22 @@ export function LocalStatsSection() {
                   (metrics.streamFirstFieldBuckets?.['0-500'] || 0) +
                     (metrics.streamFirstFieldBuckets?.['500-1000'] || 0)
                 )}
+              />
+              <StatCard label="OCR 触发" value={String(metrics.ocrTriggered ?? 0)} />
+            </div>
+            <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
+              <StatCard label="OCR 过滤" value={String(metrics.ocrFiltered ?? 0)} />
+              <StatCard label="Anki 发送成功" value={String(metrics.ankiSendOk ?? 0)} />
+              <StatCard label="Anki 发送失败" value={String(metrics.ankiSendFail ?? 0)} />
+              <StatCard
+                label="OCR 识别成功率"
+                value={(() => {
+                  const ok = metrics.ocrTriggered ?? 0;
+                  const bad = metrics.ocrFiltered ?? 0;
+                  const total = ok + bad;
+                  if (!total) return '—';
+                  return `${Math.round((ok / total) * 100)}%`;
+                })()}
               />
             </div>
             {Object.keys(metrics.streamFirstFieldBuckets || {}).length > 0 && (

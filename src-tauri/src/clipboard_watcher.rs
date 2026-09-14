@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 use crate::content_filter;
 use crate::AppState;

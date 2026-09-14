@@ -17,13 +17,23 @@ mod win {
         GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
         RGBQUAD, SRCCOPY,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
 
     pub fn capture_region_bgra(x: i32, y: i32, width: i32, height: i32) -> Result<Vec<u8>, String> {
         if width <= 0 || height <= 0 || width > 8192 || height > 8192 {
             return Err("选区尺寸无效".into());
         }
         unsafe {
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            if x + width <= vx || y + height <= vy || x >= vx + vw || y >= vy + vh {
+                return Err("选区不在屏幕范围内".into());
+            }
             let screen = GetDC(HWND::default());
             if screen.is_invalid() {
                 return Err("无法获取屏幕 DC".into());
@@ -31,6 +41,7 @@ mod win {
             let mem = CreateCompatibleDC(screen);
             let bmp = CreateCompatibleBitmap(screen, width, height);
             let prev = SelectObject(mem, bmp);
+            // GetDC(NULL) uses the virtual-screen coordinate space (origin may be negative).
             let ok = BitBlt(mem, 0, 0, width, height, screen, x, y, SRCCOPY);
             SelectObject(mem, prev);
             let _ = ReleaseDC(HWND::default(), screen);
@@ -164,6 +175,22 @@ mod win {
         }
     }
 
+    pub fn foreground_window_title() -> String {
+        use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW};
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.is_invalid() {
+                return String::new();
+            }
+            let mut buf = [0u16; 256];
+            let len = GetWindowTextW(hwnd, &mut buf);
+            if len <= 0 {
+                return String::new();
+            }
+            String::from_utf16_lossy(&buf[..len as usize])
+        }
+    }
+
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
     pub fn recognize_region(
@@ -188,10 +215,6 @@ mod win {
         let text = result.Text().map_err(|e| e.to_string())?;
         Ok(text.to_string())
     }
-
-    pub fn _screen_size() -> (i32, i32) {
-        unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
-    }
 }
 
 #[cfg(not(windows))]
@@ -214,6 +237,10 @@ mod win {
         _lang: Option<&str>,
     ) -> Result<String, String> {
         Err("当前平台不支持系统 OCR".into())
+    }
+
+    pub fn foreground_window_title() -> String {
+        String::new()
     }
 }
 
@@ -244,6 +271,10 @@ pub fn recognize_screen_region(
 
 pub fn max_ocr_chars() -> usize {
     2000
+}
+
+pub fn foreground_window_title() -> String {
+    win::foreground_window_title()
 }
 
 #[cfg(test)]

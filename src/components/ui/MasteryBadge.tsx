@@ -19,7 +19,7 @@ interface MasteryBadgeProps {
 }
 
 export function MasteryBadge({ mastery, compact = false }: MasteryBadgeProps) {
-  const meta = MASTERY_META[mastery];
+  const meta = MASTERY_META[mastery] ?? MASTERY_META.new;
   const Icon = meta.icon;
   return (
     <span

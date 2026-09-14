@@ -79,6 +79,57 @@ fn cache_ttl_days(settings: &serde_json::Value) -> i64 {
         .unwrap_or(30)
 }
 
+fn ocr_settings(settings: &serde_json::Value) -> (bool, String) {
+    let ocr = settings.get("ocr");
+    let enabled = ocr
+        .and_then(|o| o.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let hotkey = ocr
+        .and_then(|o| o.get("hotkey"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Control+Shift+O")
+        .to_string();
+    (enabled, hotkey)
+}
+
+fn apply_ocr_hotkey(app: &AppHandle) -> Result<(), String> {
+    use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+    let (enabled, hotkey) = {
+        let state = app.state::<AppState>();
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let settings = db.get_settings()?;
+        ocr_settings(&settings)
+    };
+    // Drop the well-known default and the configured combo so re-apply is idempotent.
+    for candidate in ["Control+Shift+O", hotkey.as_str()] {
+        if let Ok(sc) = candidate.parse::<tauri_plugin_global_shortcut::Shortcut>() {
+            let _ = app.global_shortcut().unregister(sc);
+        }
+    }
+    if !enabled {
+        return Ok(());
+    }
+    let sc = hotkey
+        .parse::<tauri_plugin_global_shortcut::Shortcut>()
+        .map_err(|e| format!("无效热键「{hotkey}」: {e}"))?;
+    let app_handle = app.clone();
+    app.global_shortcut()
+        .on_shortcut(sc, move |_app, _shortcut, event| {
+            if event.state == ShortcutState::Pressed {
+                let _ = open_ocr_select_window(&app_handle);
+            }
+        })
+        .map_err(|e| format!("注册 OCR 热键失败: {e}"))
+}
+
+#[tauri::command]
+async fn apply_ocr_hotkey_from_settings(app: AppHandle) -> Result<(), String> {
+    apply_ocr_hotkey(&app)
+}
+
 fn lookup_cache_key(
     selection: &str,
     context: &str,
@@ -1589,6 +1640,17 @@ async fn ocr_recognize_region(
 }
 
 fn open_ocr_select_window(app: &AppHandle) -> Result<(), String> {
+    {
+        let state = app.state::<AppState>();
+        let settings = {
+            let db = state.db.lock().map_err(|e| e.to_string())?;
+            db.get_settings()?
+        };
+        let (enabled, _) = ocr_settings(&settings);
+        if !enabled {
+            return Err("截图取词已关闭，请在设置中启用".into());
+        }
+    }
     if let Some(win) = app.get_webview_window("ocr-select") {
         let _ = win.show();
         let _ = win.set_focus();
@@ -1596,7 +1658,7 @@ fn open_ocr_select_window(app: &AppHandle) -> Result<(), String> {
     }
     let app_h = app.clone();
     app.run_on_main_thread(move || {
-        let _ = tauri::WebviewWindowBuilder::new(
+        let built = tauri::WebviewWindowBuilder::new(
             &app_h,
             "ocr-select",
             tauri::WebviewUrl::App("ocr-select".into()),
@@ -1604,11 +1666,23 @@ fn open_ocr_select_window(app: &AppHandle) -> Result<(), String> {
         .title("截图取词")
         .decorations(false)
         .always_on_top(true)
-        .fullscreen(true)
         .transparent(true)
         .skip_taskbar(true)
         .focused(true)
         .build();
+        if let Ok(win) = built {
+            // Fullscreen the monitor under the cursor so multi-display capture
+            // and client→physical mapping stay on the same screen.
+            if let Ok(cursor) = app_h.cursor_position() {
+                if let Ok(Some(monitor)) = app_h.monitor_from_point(cursor.x, cursor.y) {
+                    let origin = monitor.position();
+                    let size = monitor.size();
+                    let _ = win.set_position(tauri::PhysicalPosition::new(origin.x, origin.y));
+                    let _ = win.set_size(tauri::PhysicalSize::new(size.width, size.height));
+                }
+            }
+            let _ = win.set_fullscreen(true);
+        }
     })
     .map_err(|e| format!("打开框选窗失败: {e}"))
 }
@@ -1642,12 +1716,20 @@ async fn set_ocr_capture_and_lookup(
         }
     }
     let kind = clipboard_watcher::detect_kind_public(&trimmed);
+    let source_title = {
+        let title = ocr::foreground_window_title();
+        if title.trim().is_empty() {
+            "截图取词".to_string()
+        } else {
+            title
+        }
+    };
     let capture = serde_json::json!({
         "selection": trimmed,
         "context": "",
         "kind": kind,
         "sourceApp": "screenshot",
-        "sourceTitle": "截图取词",
+        "sourceTitle": source_title,
         "method": "ocr",
     });
     if let Ok(mut lc) = state.last_capture.lock() {
@@ -1740,6 +1822,7 @@ async fn send_words_to_anki(
 fn setup_tray(
     app: &tauri::App,
     clipboard_enabled: Arc<AtomicBool>,
+    ocr_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let watch_item = CheckMenuItem::with_id(
         app,
@@ -1756,7 +1839,7 @@ fn setup_tray(
         app,
         "ocr_capture",
         "截图取词 (Ctrl+Shift+O)",
-        true,
+        ocr_enabled,
         None::<&str>,
     )?;
     let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
@@ -1765,7 +1848,9 @@ fn setup_tray(
     menu.append(&watch_item)?;
     menu.append(&pause30_item)?;
     menu.append(&lookup_item)?;
-    menu.append(&ocr_item)?;
+    if ocr_enabled {
+        menu.append(&ocr_item)?;
+    }
     menu.append(&show_item)?;
     menu.append(&quit_item)?;
 
@@ -1817,9 +1902,12 @@ fn setup_tray(
                 let state = app.state::<AppState>();
                 clipboard_watcher::lookup_clipboard(app, &state.last_capture);
             }
-            "ocr_capture" => {
-                let _ = open_ocr_select_window(app);
-            }
+            "ocr_capture" => match open_ocr_select_window(app) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("ocr_capture: {e}");
+                }
+            },
             "show" => {
                 if let Some(win) = app.get_webview_window("main") {
                     let _ = win.show();
@@ -2230,37 +2318,20 @@ pub fn run() {
             list_anki_decks,
             list_anki_models,
             send_words_to_anki,
+            apply_ocr_hotkey_from_settings,
         ])
         .setup(move |app| {
             let cb = clipboard_enabled.clone();
-            setup_tray(app, cb.clone())?;
-            // Register OCR hotkey from settings (default Control+Shift+O).
-            {
-                use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
-                let state = app.state::<AppState>();
-                let ocr_enabled = state
-                    .db
-                    .lock()
-                    .ok()
-                    .and_then(|db| db.get_settings().ok())
-                    .and_then(|s| s.get("ocr").cloned())
-                    .map(|ocr| ocr.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true))
-                    .unwrap_or(true);
-                if ocr_enabled {
-                    let shortcut =
-                        "Control+Shift+O".parse::<tauri_plugin_global_shortcut::Shortcut>();
-                    if let Ok(sc) = shortcut {
-                        let app_handle = app.app_handle().clone();
-                        let _ =
-                            app.global_shortcut()
-                                .on_shortcut(sc, move |_app, _shortcut, event| {
-                                    if event.state == ShortcutState::Pressed {
-                                        let _ = open_ocr_select_window(&app_handle);
-                                    }
-                                });
-                    }
-                }
-            }
+            let ocr_enabled = app
+                .state::<AppState>()
+                .db
+                .lock()
+                .ok()
+                .and_then(|db| db.get_settings().ok())
+                .map(|settings| ocr_settings(&settings).0)
+                .unwrap_or(true);
+            setup_tray(app, cb.clone(), ocr_enabled)?;
+            let _ = apply_ocr_hotkey(app.handle());
             let minimized = std::env::args().any(|arg| arg == "--minimized");
             if let Some(window) = app.get_webview_window("main") {
                 if minimized {

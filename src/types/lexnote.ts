@@ -236,6 +236,10 @@ export interface LocalMetrics {
   reviewAnswered: number;
   sessionsViewed: number;
   glossaryApplied: number;
+  ocrTriggered: number;
+  ocrFiltered: number;
+  ankiSendOk: number;
+  ankiSendFail: number;
 }
 
 export interface AnkiSettings {

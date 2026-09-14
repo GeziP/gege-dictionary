@@ -86,6 +86,37 @@ export function OcrSelect() {
     [closeSelf]
   );
 
+  const toPhysicalRect = useCallback(async (css: {
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  }) => {
+    // Prefer the overlay window's real outer position + scale so multi-monitor
+    // and mixed-DPI setups map into the virtual-screen space BitBlt expects.
+    try {
+      const win = getCurrentWebviewWindow();
+      const [pos, scaleFactor] = await Promise.all([win.outerPosition(), win.scaleFactor()]);
+      const scale = scaleFactor || window.devicePixelRatio || 1;
+      return {
+        x: Math.round(pos.x + css.x * scale),
+        y: Math.round(pos.y + css.y * scale),
+        w: Math.round(css.w * scale),
+        h: Math.round(css.h * scale),
+      };
+    } catch {
+      const dpr = window.devicePixelRatio || 1;
+      const originX = typeof window.screenX === 'number' ? window.screenX : 0;
+      const originY = typeof window.screenY === 'number' ? window.screenY : 0;
+      return {
+        x: Math.round(originX + css.x * dpr),
+        y: Math.round(originY + css.y * dpr),
+        w: Math.round(css.w * dpr),
+        h: Math.round(css.h * dpr),
+      };
+    }
+  }, []);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -120,14 +151,10 @@ export function OcrSelect() {
     if (!draggingRef.current) return;
     draggingRef.current = false;
     if (!rect) return;
-    // Convert CSS pixels to physical via devicePixelRatio.
-    const dpr = window.devicePixelRatio || 1;
-    void finishCapture({
-      x: Math.round(rect.x * dpr),
-      y: Math.round(rect.y * dpr),
-      w: Math.round(rect.w * dpr),
-      h: Math.round(rect.h * dpr),
-    });
+    void (async () => {
+      const physical = await toPhysicalRect(rect);
+      await finishCapture(physical);
+    })();
   };
 
   return (

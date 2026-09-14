@@ -136,7 +136,8 @@ pub async fn list_models(config: &AnkiConfig) -> Result<Vec<String>, String> {
         .unwrap_or_default())
 }
 
-fn build_note_fields(word: &Value) -> (String, String, Vec<String>) {
+/// Returns (front, back, extra, tags). `extra` carries explanation + examples.
+fn build_note_fields(word: &Value) -> (String, String, String, Vec<String>) {
     let lemma = word
         .get("lemma")
         .and_then(|v| v.as_str())
@@ -169,7 +170,10 @@ fn build_note_fields(word: &Value) -> (String, String, Vec<String>) {
             let en = ex.get("en").and_then(|v| v.as_str()).unwrap_or("");
             let zh = ex.get("zh").and_then(|v| v.as_str()).unwrap_or("");
             if !en.is_empty() {
-                extra.push_str("\n• ");
+                if !extra.is_empty() {
+                    extra.push('\n');
+                }
+                extra.push_str("• ");
                 extra.push_str(en);
                 if !zh.is_empty() {
                     extra.push_str(" — ");
@@ -200,7 +204,7 @@ fn build_note_fields(word: &Value) -> (String, String, Vec<String>) {
             }
         }
     }
-    (lemma, back, tags)
+    (lemma, back, extra, tags)
 }
 
 pub async fn send_words(config: &AnkiConfig, words: &[Value]) -> Result<Value, String> {
@@ -216,7 +220,7 @@ pub async fn send_words(config: &AnkiConfig, words: &[Value]) -> Result<Value, S
     let mut errors: Vec<String> = Vec::new();
 
     for word in words {
-        let (front, back, tags) = build_note_fields(word);
+        let (front, back, extra, tags) = build_note_fields(word);
         if front.is_empty() {
             skipped += 1;
             continue;
@@ -237,16 +241,12 @@ pub async fn send_words(config: &AnkiConfig, words: &[Value]) -> Result<Value, S
             }
         }
 
-        let extra = word
-            .get("explanation")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
         let mut fields = serde_json::Map::new();
         fields.insert("Front".into(), json!(front.clone()));
         fields.insert("Back".into(), json!(back.clone()));
         if !extra.is_empty() {
-            // Basic models ignore unknown fields; models with Extra keep explanation.
-            fields.insert("Extra".into(), json!(extra));
+            // Basic models ignore unknown fields; models with Extra keep explanation + examples.
+            fields.insert("Extra".into(), json!(extra.clone()));
         }
         let params = json!({
             "note": {
@@ -322,10 +322,13 @@ mod tests {
             "tags": ["cpp"],
             "examples": [{"en": "const int x = 1;", "zh": "常量"}]
         });
-        let (front, back, tags) = build_note_fields(&word);
+        let (front, back, extra, tags) = build_note_fields(&word);
         assert_eq!(front, "constant");
         assert!(back.contains("恒定的"));
         assert!(back.contains("常量"));
+        assert!(extra.contains("语言层面"));
+        assert!(extra.contains("const int x = 1;"));
+        assert!(extra.contains("常量"));
         assert!(tags.iter().any(|t| t == "cpp"));
         assert!(tags.iter().any(|t| t.starts_with("src_")));
     }

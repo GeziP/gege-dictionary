@@ -429,6 +429,17 @@ fn is_ip_address(text: &str) -> bool {
     if t.contains(' ') {
         return false;
     }
+    // Clock times like 12:30:45 are not IPv6.
+    if t.matches(':').count() == 2 {
+        let parts: Vec<&str> = t.split(':').collect();
+        if parts.len() == 3
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.len() <= 2 && p.chars().all(|c| c.is_ascii_digit()))
+        {
+            return false;
+        }
+    }
     let ip_part = t.split(':').next().unwrap_or(t);
     let parts: Vec<&str> = ip_part.split('.').collect();
     if parts.len() == 4 {
@@ -507,6 +518,13 @@ mod tests {
     fn test_rejects_ip() {
         assert!(should_reject("192.168.1.1"));
         assert!(should_reject("10.0.0.1:8080"));
+    }
+
+    #[test]
+    fn test_allows_clock_times_not_ipv6() {
+        assert!(!should_reject("12:30:45"));
+        assert!(!should_reject("09:05:01"));
+        assert!(!is_ip_address("12:30:45"));
     }
 
     #[test]

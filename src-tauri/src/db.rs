@@ -2046,6 +2046,10 @@ impl Database {
             "reviewAnswered": event_sum("review_card_answered")?,
             "sessionsViewed": event_sum("reading_session_viewed")?,
             "glossaryApplied": event_sum("glossary_term_applied")?,
+            "ocrTriggered": event_sum("ocr_triggered")?,
+            "ocrFiltered": event_sum("ocr_filtered")?,
+            "ankiSendOk": event_sum("anki_send_ok")?,
+            "ankiSendFail": event_sum("anki_send_fail")?,
         }))
     }
 
@@ -2760,14 +2764,27 @@ mod tests {
             .unwrap();
         db.record_local_event("lookup_cache_hit", &serde_json::json!({"kind":"word"}))
             .unwrap();
+        db.record_local_event("ocr_triggered", &serde_json::json!({"kind":"word"}))
+            .unwrap();
+        db.record_local_event("ocr_filtered", &serde_json::json!({"reason":"empty"}))
+            .unwrap();
+        db.record_local_event("anki_send_ok", &serde_json::json!({"count":1}))
+            .unwrap();
+        db.record_local_event("anki_send_fail", &serde_json::json!({"count":1}))
+            .unwrap();
         let metrics = db.get_local_metrics(7).unwrap();
         assert_eq!(metrics["filtered"], 2);
         assert_eq!(metrics["filteredByReason"]["code"], 2);
         assert_eq!(metrics["cacheHit"], 1);
         assert_eq!(metrics["cacheHitRate"].as_f64().unwrap(), 1.0);
+        assert_eq!(metrics["ocrTriggered"], 1);
+        assert_eq!(metrics["ocrFiltered"], 1);
+        assert_eq!(metrics["ankiSendOk"], 1);
+        assert_eq!(metrics["ankiSendFail"], 1);
         db.clear_local_metrics().unwrap();
         let after = db.get_local_metrics(7).unwrap();
         assert_eq!(after["filtered"], 0);
+        assert_eq!(after["ocrTriggered"], 0);
     }
 
     #[test]

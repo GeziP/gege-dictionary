@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { CheckIcon, ClipboardCopyIcon, ShieldIcon } from 'lucide-react';
+import { ClipboardCopyIcon, ShieldIcon } from 'lucide-react';
 import { useLexNote } from '../../contexts/LexNoteContext';
 import { Toggle } from '../ui/Toggle';
 import { SegmentedControl } from '../ui/SegmentedControl';
@@ -171,19 +171,33 @@ export function CaptureSection() {
             const hotkey = settings.ocr?.hotkey || 'Control+Shift+O';
             const ocr = { ...(settings.ocr || {}), enabled: value, hotkey };
             updateSettings({ ocr });
-            if (value) {
-              void bridge
-                .registerOcrHotkey(hotkey)
-                .catch((e) => console.error('register ocr hotkey', e));
-            } else {
-              void bridge
-                .unregisterOcrHotkey(hotkey)
-                .catch((e) => console.error('unregister ocr hotkey', e));
-            }
+            void bridge
+              .registerOcrHotkey(hotkey)
+              .catch((e) => console.error('apply ocr hotkey', e));
           }}
           label="启用截图取词"
-          description="关闭后不注册热键；托盘菜单仍可手动触发。"
+          description="关闭后注销热键并隐藏托盘入口；可在下方立即框选做单次测试。"
         />
+        <div className="mt-2">
+          <label className="mb-1 block text-[11px] text-ink-muted">热键</label>
+          <input
+            className="w-full rounded-md border border-line bg-raised px-2 py-1.5 text-[12px] text-ink"
+            value={settings.ocr?.hotkey || 'Control+Shift+O'}
+            onChange={(e) => {
+              const hotkey = e.target.value.trim() || 'Control+Shift+O';
+              updateSettings({ ocr: { ...(settings.ocr || {}), hotkey } });
+            }}
+            onBlur={() => {
+              void bridge
+                .registerOcrHotkey(settings.ocr?.hotkey || 'Control+Shift+O')
+                .catch((e) => console.error('apply ocr hotkey', e));
+            }}
+            spellCheck={false}
+          />
+          <p className="mt-1 text-[10px] text-ink-subtle">
+            例如 Control+Shift+O。修改后失焦即生效；关闭启用开关会一并注销。
+          </p>
+        </div>
         <div className="mt-2 flex items-center gap-2">
           <button
             type="button"
@@ -231,10 +245,6 @@ export function CaptureSection() {
           description="托盘常驻时，划词即查不受主窗口是否打开影响。" />
 
         {autostartError && <p className="mt-1 text-[11px] text-danger">开机自启设置失败，系统状态未更新：{autostartError}</p>}
-
-        <p className="mt-1 inline-flex items-center gap-1.5 text-[11px] text-positive">
-          <CheckIcon size={12} /> 当前常驻内存约 138 MB · 冷启动 1.4s
-        </p>
       </SettingsSection>
     </div>
   );
