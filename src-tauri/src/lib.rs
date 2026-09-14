@@ -155,6 +155,29 @@ fn should_fallback_stream(saw_content: bool) -> bool {
     !saw_content
 }
 
+/// Prefix LLM errors with a stable machine-readable code for empty-state UI.
+fn classify_lookup_error(err: &str) -> String {
+    let lower = err.to_lowercase();
+    if lower.contains("401")
+        || lower.contains("unauthorized")
+        || lower.contains("invalid api key")
+        || lower.contains("authentication")
+    {
+        format!("[auth] {err}")
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        format!("[timeout] {err}")
+    } else if lower.contains("connection")
+        || lower.contains("dns")
+        || lower.contains("connect")
+        || lower.contains("network")
+        || lower.contains("socket")
+    {
+        format!("[network] {err}")
+    } else {
+        format!("[network] {err}")
+    }
+}
+
 struct PreparedLookup {
     base_url: String,
     api_key: String,
@@ -358,8 +381,11 @@ fn prepare_lookup(
         )
     };
 
+    if api_key.trim().is_empty() {
+        return Err("[no_key] 尚未配置 API Key，请到设置页填写".to_string());
+    }
     if api_key.starts_with("dpapi:") {
-        return Err("API Key 解密失败，请到设置页重新输入".to_string());
+        return Err("[no_key] API Key 解密失败，请到设置页重新输入".to_string());
     }
 
     let cache_key = lookup_cache_key(selection, context, kind, &model, &template_body);
@@ -987,8 +1013,9 @@ async fn lookup_word(
     )
     .await
     .map_err(|e| {
-        eprintln!("[lookup_word] LLM ERROR: {e}");
-        e
+        let classified = classify_lookup_error(&e);
+        eprintln!("[lookup_word] LLM ERROR: {classified}");
+        classified
     })?;
 
     eprintln!("[lookup_word] LLM OK, len={}", full_text.len());
@@ -1099,7 +1126,8 @@ async fn lookup_word_stream(
             }
         },
     )
-    .await;
+    .await
+    .map_err(|e| classify_lookup_error(&e));
 
     match result {
         Ok(full_text) => match llm::parse_entry(&full_text, &selection, &kind) {
@@ -1695,14 +1723,18 @@ async fn send_words_to_anki(
     state: tauri::State<'_, AppState>,
     ids: Vec<String>,
 ) -> Result<serde_json::Value, String> {
-    let (config, words) = {
+    let (config, items) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let settings = db.get_settings()?;
         let config = anki::AnkiConfig::from_settings(&settings);
         let words = db.get_words_by_ids(&ids)?;
-        (config, words)
+        let items = ids
+            .into_iter()
+            .zip(words.into_iter())
+            .collect::<Vec<(String, serde_json::Value)>>();
+        (config, items)
     };
-    let report = anki::send_words(&config, &words).await?;
+    let report = anki::send_words(&config, &items).await?;
     if let Ok(db) = state.db.lock() {
         let added = report.get("added").and_then(|v| v.as_u64()).unwrap_or(0);
         if added > 0 {
@@ -1714,6 +1746,25 @@ async fn send_words_to_anki(
                     "anki_send_fail",
                     &serde_json::json!({ "count": errors.len() }),
                 );
+            }
+        }
+        // Persist Anki note ids onto local words for re-send dedup.
+        if let Some(results) = report.get("results").and_then(|v| v.as_array()) {
+            for item in results {
+                let (Some(word_id), Some(note_id)) = (
+                    item.get("wordId").and_then(|v| v.as_str()),
+                    item.get("noteId").and_then(|v| v.as_i64()),
+                ) else {
+                    continue;
+                };
+                if let Ok(list) = db.get_words_by_ids(&[word_id.to_string()]) {
+                    if let Some(mut word) = list.into_iter().next() {
+                        if let Some(obj) = word.as_object_mut() {
+                            obj.insert("ankiNoteId".into(), serde_json::json!(note_id));
+                        }
+                        let _ = db.save_word(&word);
+                    }
+                }
             }
         }
     }
@@ -2334,6 +2385,14 @@ mod tests {
         annotate_lookup_entry(&mut entry, "单词解析 [word]");
         assert_eq!(entry["_templateName"], "单词解析 [word]");
         assert_eq!(entry["lemma"], "resilient");
+    }
+
+    #[test]
+    fn classify_lookup_error_prefixes_stable_codes() {
+        assert!(classify_lookup_error("401 Unauthorized").starts_with("[auth]"));
+        assert!(classify_lookup_error("request timed out").starts_with("[timeout]"));
+        assert!(classify_lookup_error("connection refused").starts_with("[network]"));
+        assert!(classify_lookup_error("something else").starts_with("[network]"));
     }
 
     #[test]

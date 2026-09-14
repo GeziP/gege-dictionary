@@ -217,8 +217,14 @@ export function Onboarding() {
                 {autostartError && <p className="mt-1 text-[11px] text-danger">开机自启设置失败：{autostartError}</p>}
 
                 <Toggle
-                checked={settings.captureContext}
-                onChange={(value) => updateSettings({ captureContext: value })}
+                checked={
+                  settings.captureContext === true ||
+                  settings.captureContext === 'selection_only' ||
+                  settings.captureContext === 'surrounding'
+                }
+                onChange={(value) =>
+                  updateSettings({ captureContext: value ? 'selection_only' : 'off' })
+                }
                 label="抓取上下文句子"
                 description="显著提升解析准确度；处理敏感文本时可随时关闭。" />
               

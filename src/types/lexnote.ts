@@ -242,6 +242,13 @@ export interface LocalMetrics {
   ankiSendFail: number;
 }
 
+export interface AnkiFieldMap {
+  front: string;
+  back: string;
+  extra: string;
+  examples: string;
+}
+
 export interface AnkiSettings {
   enabled: boolean;
   host: string;
@@ -249,7 +256,11 @@ export interface AnkiSettings {
   deck: string;
   model: string;
   autoSend: boolean;
+  fieldMap?: AnkiFieldMap;
+  includeExamplesInExtra?: boolean;
 }
+
+export type CaptureContextMode = 'off' | 'selection_only' | 'surrounding';
 
 export interface OcrSettings {
   enabled?: boolean;
@@ -276,7 +287,9 @@ export interface AppSettings {
   apiKeyError?: string;
   theme: 'light' | 'dark' | 'system';
   cardScale: 'compact' | 'default' | 'large';
-  captureContext: boolean;
+  /** boolean is legacy: true→selection_only, false→off */
+  captureContext: boolean | CaptureContextMode;
+  contextHeuristicEnabled?: boolean;
   launchAtLogin: boolean;
   dataDir: string;
   autoBackup: boolean;

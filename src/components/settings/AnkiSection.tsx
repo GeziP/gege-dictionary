@@ -98,6 +98,54 @@ export function AnkiSection() {
             label="收藏后自动发送"
             description="开启后，查词窗点「加入生词库」会尝试同步到 Anki（Anki 未开则静默失败）。"
           />
+          <details className="rounded-md border border-line bg-sunken/40 px-2.5 py-2">
+            <summary className="cursor-pointer text-[11px] text-ink-muted">高级 · 字段映射</summary>
+            <div className="mt-2 grid grid-cols-2 gap-2">
+              {(
+                [
+                  ['front', 'Front 字段'],
+                  ['back', 'Back 字段'],
+                  ['extra', 'Extra 字段'],
+                  ['examples', 'Example 字段（可空）'],
+                ] as const
+              ).map(([key, label]) => (
+                <div key={key}>
+                  <p className="mb-1 text-[10px] text-ink-subtle">{label}</p>
+                  <input
+                    className="w-full rounded border border-line bg-raised px-2 py-1 text-[11px] text-ink"
+                    value={
+                      (anki.fieldMap?.[key] ??
+                        (key === 'front' ? 'Front' : key === 'back' ? 'Back' : key === 'extra' ? 'Extra' : '')) as string
+                    }
+                    onChange={(e) =>
+                      patch({
+                        fieldMap: {
+                          front: anki.fieldMap?.front || 'Front',
+                          back: anki.fieldMap?.back || 'Back',
+                          extra: anki.fieldMap?.extra || 'Extra',
+                          examples: anki.fieldMap?.examples || '',
+                          [key]: e.target.value,
+                        },
+                      })
+                    }
+                    spellCheck={false}
+                  />
+                </div>
+              ))}
+            </div>
+            <label className="mt-2 flex items-center gap-2 text-[11px] text-ink-muted">
+              <input
+                type="checkbox"
+                className="h-3 w-3"
+                checked={anki.includeExamplesInExtra !== false}
+                onChange={(e) => patch({ includeExamplesInExtra: e.target.checked })}
+              />
+              未配置 Example 字段时，把例句写入 Extra
+            </label>
+            <p className="mt-1 text-[10px] text-ink-subtle">
+              Basic 模型忽略未知字段；发送失败会自动回退仅 Front/Back。
+            </p>
+          </details>
           <div className="flex items-center gap-2">
             <Button size="sm" onClick={() => void test()} disabled={busy}>
               {busy ? '连接中…' : '测试连接并刷新列表'}

@@ -230,11 +230,43 @@ export function CaptureSection() {
         title="上下文设置"
         description="控制发送给 LLM 的上下文信息。">
 
-        <Toggle
-          checked={settings.captureContext}
-          onChange={(value) => updateSettings({ captureContext: value })}
-          label="发送上下文句子"
-          description="目前剪贴板模式下仅发送复制的文本本身。关闭后可减少 token 消耗。" />
+        <div className="space-y-2">
+          <p className="text-[11px] font-medium text-ink-muted">上下文模式</p>
+          <SegmentedControl
+            label="上下文模式"
+            value={(() => {
+              const raw = settings.captureContext;
+              if (raw === false || raw === 'off') return 'off';
+              if (raw === 'surrounding') return 'surrounding';
+              return 'selection_only';
+            })()}
+            onChange={(value) => {
+              const mode = value as 'off' | 'selection_only' | 'surrounding';
+              updateSettings({ captureContext: mode });
+            }}
+            options={[
+              { value: 'off', label: '关闭' },
+              { value: 'selection_only', label: '仅选中文本' },
+              { value: 'surrounding', label: '尽力扩展' },
+            ]}
+          />
+          <p className="text-[10px] text-ink-subtle">
+            默认「仅选中文本」与 v1.6 一致，token 消耗最低。关闭可省 token。「尽力扩展」会尝试合并邻近复制，默认仍偏保守。
+          </p>
+          {(() => {
+            const raw = settings.captureContext;
+            const mode = raw === false || raw === 'off' ? 'off' : raw === 'surrounding' ? 'surrounding' : 'selection_only';
+            if (mode !== 'surrounding') return null;
+            return (
+              <Toggle
+                checked={settings.contextHeuristicEnabled !== true ? false : true}
+                onChange={(value) => updateSettings({ contextHeuristicEnabled: value })}
+                label="启用邻近复制合并（启发式）"
+                description="开启后，短时间内相邻复制会尝试拼接上下文；可能略增 token。"
+              />
+            );
+          })()}
+        </div>
       </SettingsSection>
 
       <SettingsSection title="常驻行为">

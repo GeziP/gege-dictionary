@@ -32,6 +32,7 @@ export function Library() {
   const [batchTag, setBatchTag] = useState('');
   const [toast, setToast] = useState<ToastMessage | null>(null);
   const [viewMode, setViewMode] = useState<'words' | 'sessions'>('words');
+  const [ankiBusy, setAnkiBusy] = useState(false);
   const toastId = useRef(0);
 
   useEffect(() => {
@@ -151,6 +152,8 @@ export function Library() {
               <SelectionBar
                 count={selectedIds.length}
                 batchTag={batchTag}
+                ankiEnabled={Boolean(settings.anki?.enabled)}
+                ankiBusy={ankiBusy}
                 onBatchTagChange={setBatchTag}
                 onApplyTag={() => {
                   const tag = batchTag.trim().toLowerCase();
@@ -160,6 +163,25 @@ export function Library() {
                   setBatchTag('');
                 }}
                 onExport={() => setExportOpen(true)}
+                onSendAnki={async () => {
+                  setAnkiBusy(true);
+                  try {
+                    const { sendWordsToAnki } = await import('../lib/tauri-bridge');
+                    const report = await sendWordsToAnki(selectedIds);
+                    const added = report.added ?? 0;
+                    const skipped = report.skipped ?? 0;
+                    const failed = report.errors?.length ?? 0;
+                    if (failed > 0) {
+                      showToast(`Anki：成功 ${added} · 跳过 ${skipped} · 失败 ${failed}`, 'error');
+                    } else {
+                      showToast(`已发送 ${added} 条到 Anki（跳过 ${skipped}）`, 'success');
+                    }
+                  } catch (e) {
+                    showToast(String(e), 'error');
+                  } finally {
+                    setAnkiBusy(false);
+                  }
+                }}
                 onDelete={() => {
                   removeWords(selectedIds);
                   showToast(`已删除 ${selectedIds.length} 条生词`, 'info');

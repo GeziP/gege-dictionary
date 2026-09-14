@@ -187,7 +187,9 @@ export function LookupCard({
         null}
         {contextOpen ?
         <p className="mt-1.5 rounded border border-line bg-sunken p-2 font-serif text-[11px] leading-relaxed text-ink-subtle">
-            {settings.captureContext ? request.context : '上下文抓取已在设置中关闭，本次仅发送选中文本。'}
+            {settings.captureContext === false || settings.captureContext === 'off'
+              ? '上下文抓取已在设置中关闭，本次仅发送选中文本。'
+              : request.context}
           </p> :
         null}
       </div>

@@ -18,6 +18,32 @@ fn should_skip_lookup(last: Option<&ClipboardFingerprint>, sequence: u32, text: 
     last.is_some_and(|previous| previous.sequence == sequence && previous.text == text)
 }
 
+/// Weak surrounding-context merge: if the previous selection overlaps or contains
+/// the new one, keep the longer span (capped). Otherwise fall back to selection-only.
+pub fn merge_nearby_context(prev: &str, current: &str) -> String {
+    let prev = prev.trim();
+    let current = current.trim();
+    if prev.is_empty() {
+        return current.to_string();
+    }
+    if current.is_empty() {
+        return prev.to_string();
+    }
+    let merged = if prev == current || prev.contains(current) {
+        prev.to_string()
+    } else if current.contains(prev) {
+        current.to_string()
+    } else {
+        return current.to_string();
+    };
+    const MAX: usize = 500;
+    if merged.chars().count() > MAX {
+        merged.chars().take(MAX).collect()
+    } else {
+        merged
+    }
+}
+
 fn initial_clipboard_fingerprint(sequence: u32, text: String) -> ClipboardFingerprint {
     ClipboardFingerprint { sequence, text }
 }
@@ -41,6 +67,17 @@ mod tests {
     fn startup_fingerprint_skips_existing_clipboard_content() {
         let initial = initial_clipboard_fingerprint(12, "already copied".into());
         assert!(should_skip_lookup(Some(&initial), 12, "already copied"));
+    }
+
+    #[test]
+    fn merge_nearby_context_prefers_longer_overlap() {
+        assert_eq!(merge_nearby_context("", "hello"), "hello");
+        assert_eq!(merge_nearby_context("hello world", "world"), "hello world");
+        assert_eq!(merge_nearby_context("world", "hello world"), "hello world");
+        assert_eq!(merge_nearby_context("foo", "bar"), "bar");
+        let long = "a".repeat(600);
+        let also_long = "a".repeat(600);
+        assert_eq!(merge_nearby_context(&long, &also_long).chars().count(), 500);
     }
 }
 
@@ -385,13 +422,63 @@ fn poll_once(
         "[clipboard] detected len={} kind={kind} app={proc_name:?}",
         last_text.len()
     );
+
+    let context_mode = {
+        let mode = state
+            .db
+            .lock()
+            .ok()
+            .and_then(|db| db.get_settings().ok())
+            .and_then(|s| {
+                let raw = s.get("captureContext")?;
+                match raw {
+                    serde_json::Value::Bool(true) => Some("selection_only".to_string()),
+                    serde_json::Value::Bool(false) => Some("off".to_string()),
+                    other => other.as_str().map(|s| s.to_string()),
+                }
+            })
+            .unwrap_or_else(|| "selection_only".to_string());
+        mode
+    };
+    let heuristic = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| db.get_settings().ok())
+        .and_then(|s| {
+            s.get("contextHeuristicEnabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                .then_some(true)
+        })
+        .unwrap_or(false);
+
+    let context = match context_mode.as_str() {
+        "off" => String::new(),
+        "surrounding" if heuristic => {
+            let prev = state
+                .last_capture
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .and_then(|c| {
+                    c.get("selection")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_default();
+            merge_nearby_context(&prev, last_text)
+        }
+        _ => last_text.to_string(),
+    };
+
     if let Ok(db) = state.db.lock() {
         let _ = db.record_local_event("clipboard_triggered", &serde_json::json!({ "kind": kind }));
     }
 
     let capture_data = serde_json::json!({
         "selection": *last_text,
-        "context": *last_text,
+        "context": context,
         "sourceApp": proc_name,
         "sourceTitle": win_title,
         "kind": kind,

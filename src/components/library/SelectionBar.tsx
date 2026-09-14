@@ -1,15 +1,18 @@
 import React from 'react';
 import { motion } from 'framer-motion';
-import { DownloadIcon, TagIcon, Trash2Icon, XIcon } from 'lucide-react';
+import { BookMarkedIcon, DownloadIcon, TagIcon, Trash2Icon, XIcon } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { TextInput } from '../ui/TextInput';
 
 interface SelectionBarProps {
   count: number;
   batchTag: string;
+  ankiEnabled?: boolean;
+  ankiBusy?: boolean;
   onBatchTagChange: (value: string) => void;
   onApplyTag: () => void;
   onExport: () => void;
+  onSendAnki?: () => void;
   onDelete: () => void;
   onClear: () => void;
 }
@@ -17,9 +20,12 @@ interface SelectionBarProps {
 export function SelectionBar({
   count,
   batchTag,
+  ankiEnabled = false,
+  ankiBusy = false,
   onBatchTagChange,
   onApplyTag,
   onExport,
+  onSendAnki,
   onDelete,
   onClear,
 }: SelectionBarProps) {
@@ -52,6 +58,16 @@ export function SelectionBar({
       <Button size="sm" icon={<DownloadIcon size={13} aria-hidden="true" />} onClick={onExport}>
         导出所选
       </Button>
+      {ankiEnabled && onSendAnki ? (
+        <Button
+          size="sm"
+          icon={<BookMarkedIcon size={13} aria-hidden="true" />}
+          onClick={onSendAnki}
+          disabled={ankiBusy}
+        >
+          {ankiBusy ? '发送中…' : '发送到 Anki'}
+        </Button>
+      ) : null}
       <Button size="sm" variant="danger" icon={<Trash2Icon size={13} aria-hidden="true" />} onClick={onDelete}>
         删除
       </Button>

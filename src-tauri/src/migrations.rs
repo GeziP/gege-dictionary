@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const LATEST_SCHEMA_VERSION: i64 = 4;
+pub const LATEST_SCHEMA_VERSION: i64 = 5;
 
 const REVIEW_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS review_state (
@@ -50,6 +50,12 @@ CREATE TABLE IF NOT EXISTS local_events (
 CREATE INDEX IF NOT EXISTS idx_local_events_date ON local_events(date);
 "#;
 
+const ANKI_NOTE_ID_SCHEMA: &str = r#"
+ALTER TABLE words ADD COLUMN anki_note_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_words_anki ON words(anki_note_id)
+WHERE anki_note_id IS NOT NULL;
+"#;
+
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, REVIEW_SCHEMA),
     (
@@ -65,6 +71,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     (3, GLOSSARY_SCHEMA),
     (4, LOCAL_EVENTS_SCHEMA),
+    (5, ANKI_NOTE_ID_SCHEMA),
 ];
 
 pub fn current_version(conn: &Connection) -> Result<i64, String> {
@@ -77,6 +84,19 @@ pub fn initialize_latest(conn: &Connection) -> Result<(), String> {
         "{REVIEW_SCHEMA}\n{GLOSSARY_SCHEMA}\n{LOCAL_EVENTS_SCHEMA}"
     ))
     .map_err(|e| format!("创建最新 schema 失败: {e}"))?;
+    // v5 column may already exist on fresh DBs created via db.rs contract.
+    let has_anki = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('words') WHERE name='anki_note_id'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !has_anki {
+        conn.execute_batch(ANKI_NOTE_ID_SCHEMA)
+            .map_err(|e| format!("创建 anki_note_id 失败: {e}"))?;
+    }
     conn.pragma_update(None, "user_version", LATEST_SCHEMA_VERSION)
         .map_err(|e| format!("写入 schema 版本失败: {e}"))
 }
@@ -167,7 +187,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE words (id TEXT PRIMARY KEY, kind TEXT, saved_at TEXT);")
             .unwrap();
         migrate(&conn, "").unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 4);
+        assert_eq!(current_version(&conn).unwrap(), 5);
         let first_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM review_state", [], |row| row.get(0))
             .unwrap();
@@ -184,6 +204,14 @@ mod tests {
             )
             .unwrap();
         assert!(events_exists);
+        let anki_col: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('words') WHERE name='anki_note_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(anki_col, 1);
     }
 
     #[test]
@@ -232,7 +260,7 @@ mod tests {
         .unwrap();
         conn.pragma_update(None, "user_version", 2).unwrap();
         migrate(&conn, "").unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 4);
+        assert_eq!(current_version(&conn).unwrap(), 5);
         assert_eq!(
             conn.query_row(
                 "SELECT box FROM review_state WHERE word_id='kept'",
@@ -264,7 +292,7 @@ mod tests {
         .unwrap();
         conn.pragma_update(None, "user_version", 3).unwrap();
         migrate(&conn, "").unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 4);
+        assert_eq!(current_version(&conn).unwrap(), 5);
         let exists: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_events')",
@@ -273,6 +301,27 @@ mod tests {
             )
             .unwrap();
         assert!(exists);
+    }
+
+    #[test]
+    fn upgrades_v4_with_anki_note_id_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE words (id TEXT PRIMARY KEY, kind TEXT, saved_at TEXT);
+             INSERT INTO words VALUES ('kept', 'word', '2026-08-01');",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        migrate(&conn, "").unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 5);
+        let col: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('words') WHERE name='anki_note_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(col, 1);
     }
 
     #[test]

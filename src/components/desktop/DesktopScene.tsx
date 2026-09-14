@@ -103,7 +103,10 @@ export function DesktopScene() {
       setEmptyHint(null);
       setRequest({
         selection: text,
-        context: settings.captureContext ? contextText : '',
+        context:
+          settings.captureContext === false || settings.captureContext === 'off'
+            ? ''
+            : contextText,
         kind: detectKind(text),
         method,
         sourceApp: source.app,

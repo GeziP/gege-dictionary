@@ -38,6 +38,7 @@ export function Lookup() {
     saveWord: ctxSaveWord,
     triggerLookup,
     countLookup,
+    clearLookup,
   } = useLexNote();
 
   const [saved, setSaved] = useState(false);
@@ -204,10 +205,12 @@ export function Lookup() {
       setInitDone(false);
       setEmptyHint(false);
       setAnkiFlash(null);
+      // Clear previous result immediately so the next capture cannot flash stale content.
+      clearLookup();
     };
     window.addEventListener('gege-lookup-reset', onReset);
     return () => window.removeEventListener('gege-lookup-reset', onReset);
-  }, []);
+  }, [clearLookup]);
 
   return (
     <div className="h-full w-full overflow-hidden bg-surface text-ink">
@@ -350,22 +353,33 @@ export function Lookup() {
             <div className="flex flex-col items-center gap-3 py-8 text-center">
               <p className="text-[12px] text-danger">{lookupError}</p>
               {(() => {
-                const msg = (lookupError || '').toLowerCase();
+                const raw = lookupError || '';
+                const codeMatch = raw.match(/^\[([a-z_]+)\]\s*/i);
+                const code = codeMatch?.[1]?.toLowerCase() || '';
+                const msg = raw.toLowerCase();
                 const noKey =
+                  code === 'no_key' ||
                   msg.includes('api key') ||
                   msg.includes('apikey') ||
                   msg.includes('未配置') ||
                   msg.includes('unauthorized') ||
                   msg.includes('401');
-                const filtered = msg.includes('被过滤') || msg.includes('filtered');
-                if (noKey) {
+                const auth = code === 'auth' || msg.includes('401') || msg.includes('unauthorized');
+                const timeout = code === 'timeout' || msg.includes('timed out') || msg.includes('超时');
+                const network =
+                  code === 'network' ||
+                  msg.includes('connection') ||
+                  msg.includes('network') ||
+                  msg.includes('连接失败');
+                const filtered =
+                  code === 'filtered' || msg.includes('被过滤') || msg.includes('filtered');
+                if (noKey || auth) {
                   return (
                     <button
                       type="button"
                       onClick={async () => {
                         await bridge.closeLookupWindow();
                         await bridge.showMainWindow().catch(() => undefined);
-                        // Main window router opens Settings via query if supported; otherwise library.
                         try {
                           const mod = await import('@tauri-apps/api/webviewWindow');
                           const main = await mod.WebviewWindow.getByLabel('main');
@@ -378,7 +392,7 @@ export function Lookup() {
                       }}
                       className="rounded-md border border-line bg-raised px-3 py-1.5 text-[11px] text-ink hover:bg-sunken"
                     >
-                      去设置配置 API Key
+                      {auth ? '检查 API Key 与额度' : '去设置配置 API Key'}
                     </button>
                   );
                 }
@@ -387,6 +401,22 @@ export function Lookup() {
                     <p className="text-[11px] text-ink-subtle">
                       该内容不会发送给模型。可关闭智能过滤或改用双击 Ctrl+C 强制查词。
                     </p>
+                  );
+                }
+                if (timeout || network) {
+                  return (
+                    <div className="flex flex-col items-center gap-2">
+                      <p className="text-[11px] text-ink-subtle">
+                        {timeout ? '请求超时，可增大设置中的超时秒数后重试。' : '网络连接失败，请检查网络或模型服务地址。'}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={handleRetry}
+                        className="inline-flex items-center gap-1.5 rounded-md border border-line bg-raised px-3 py-1.5 text-[11px] text-ink hover:bg-sunken"
+                      >
+                        <RefreshCwIcon size={12} /> 重试
+                      </button>
+                    </div>
                   );
                 }
                 return (

@@ -5,6 +5,26 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AnkiFieldMap {
+    pub front: String,
+    pub back: String,
+    pub extra: String,
+    pub examples: String,
+}
+
+impl Default for AnkiFieldMap {
+    fn default() -> Self {
+        Self {
+            front: "Front".into(),
+            back: "Back".into(),
+            extra: "Extra".into(),
+            examples: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnkiConfig {
     #[serde(default = "default_enabled")]
@@ -19,6 +39,10 @@ pub struct AnkiConfig {
     pub model: String,
     #[serde(default = "default_auto_send")]
     pub auto_send: bool,
+    #[serde(default)]
+    pub field_map: AnkiFieldMap,
+    #[serde(default = "default_include_examples_in_extra")]
+    pub include_examples_in_extra: bool,
 }
 
 fn default_enabled() -> bool {
@@ -33,6 +57,9 @@ fn default_port() -> u16 {
 fn default_auto_send() -> bool {
     false
 }
+fn default_include_examples_in_extra() -> bool {
+    true
+}
 
 impl Default for AnkiConfig {
     fn default() -> Self {
@@ -43,6 +70,8 @@ impl Default for AnkiConfig {
             deck: "Default".into(),
             model: "Basic".into(),
             auto_send: false,
+            field_map: AnkiFieldMap::default(),
+            include_examples_in_extra: true,
         }
     }
 }
@@ -136,8 +165,12 @@ pub async fn list_models(config: &AnkiConfig) -> Result<Vec<String>, String> {
         .unwrap_or_default())
 }
 
-/// Returns (front, back, extra, tags). `extra` carries explanation + examples.
-fn build_note_fields(word: &Value) -> (String, String, String, Vec<String>) {
+/// Returns (front, back, extra, example_only, tags).
+/// `example_only` is non-empty only when a dedicated examples field is configured.
+fn build_note_fields(
+    word: &Value,
+    config: &AnkiConfig,
+) -> (String, String, String, String, Vec<String>) {
     let lemma = word
         .get("lemma")
         .and_then(|v| v.as_str())
@@ -164,24 +197,41 @@ fn build_note_fields(word: &Value) -> (String, String, String, Vec<String>) {
         }
         back.push_str(context);
     }
-    let mut extra = explanation.to_string();
+
+    let mut examples_block = String::new();
     if let Some(examples) = word.get("examples").and_then(|v| v.as_array()) {
         for ex in examples.iter().take(3) {
             let en = ex.get("en").and_then(|v| v.as_str()).unwrap_or("");
             let zh = ex.get("zh").and_then(|v| v.as_str()).unwrap_or("");
             if !en.is_empty() {
-                if !extra.is_empty() {
-                    extra.push('\n');
+                if !examples_block.is_empty() {
+                    examples_block.push('\n');
                 }
-                extra.push_str("• ");
-                extra.push_str(en);
+                examples_block.push_str("• ");
+                examples_block.push_str(en);
                 if !zh.is_empty() {
-                    extra.push_str(" — ");
-                    extra.push_str(zh);
+                    examples_block.push_str(" — ");
+                    examples_block.push_str(zh);
                 }
             }
         }
     }
+
+    let dedicated_examples = !config.field_map.examples.trim().is_empty();
+    let mut extra = explanation.to_string();
+    if dedicated_examples {
+        // examples go to their own field
+    } else if config.include_examples_in_extra && !examples_block.is_empty() {
+        if !extra.is_empty() {
+            extra.push('\n');
+        }
+        extra.push_str(&examples_block);
+    }
+    let example_only = if dedicated_examples {
+        examples_block
+    } else {
+        String::new()
+    };
 
     let mut tags = vec!["gege-dictionary".to_string()];
     if let Some(app) = word.get("sourceApp").and_then(|v| v.as_str()) {
@@ -204,27 +254,61 @@ fn build_note_fields(word: &Value) -> (String, String, String, Vec<String>) {
             }
         }
     }
-    (lemma, back, extra, tags)
+    (lemma, back, extra, example_only, tags)
 }
 
-pub async fn send_words(config: &AnkiConfig, words: &[Value]) -> Result<Value, String> {
+fn insert_field(fields: &mut serde_json::Map<String, Value>, name: &str, value: String) {
+    let key = name.trim();
+    if key.is_empty() || value.is_empty() {
+        return;
+    }
+    fields.insert(key.to_string(), json!(value));
+}
+
+/// Send words to Anki. `items` are `(word_id, word_json)`.
+/// Returns report including `results: [{wordId, noteId, lemma}]` for persistence.
+pub async fn send_words(config: &AnkiConfig, items: &[(String, Value)]) -> Result<Value, String> {
     if !config.enabled {
-        return Err("Anki 同步未开启".into());
+        return Err("[anki_disabled] Anki 同步未开启".into());
     }
     if config.deck.is_empty() || config.model.is_empty() {
-        return Err("请先选择 Anki 牌组与笔记类型".into());
+        return Err("[anki_config] 请先选择 Anki 牌组与笔记类型".into());
     }
     let endpoint = config.endpoint();
     let mut added = 0u32;
     let mut skipped = 0u32;
     let mut errors: Vec<String> = Vec::new();
+    let mut results: Vec<Value> = Vec::new();
 
-    for word in words {
-        let (front, back, extra, tags) = build_note_fields(word);
+    for (word_id, word) in items {
+        let (front, back, extra, example_only, tags) = build_note_fields(word, config);
         if front.is_empty() {
             skipped += 1;
             continue;
         }
+        // Skip if we already stored a local note id and Anki still has it.
+        if let Some(existing_id) = word.get("ankiNoteId").and_then(|v| v.as_i64()) {
+            let info =
+                invoke_action(&endpoint, "notesInfo", json!({ "notes": [existing_id] })).await;
+            if let Ok(Value::Array(arr)) = info {
+                if arr
+                    .first()
+                    .and_then(|n| n.get("noteId"))
+                    .and_then(|v| v.as_i64())
+                    .is_some()
+                {
+                    skipped += 1;
+                    results.push(json!({
+                        "wordId": word_id,
+                        "noteId": existing_id,
+                        "lemma": front,
+                        "status": "skipped",
+                    }));
+                    continue;
+                }
+            }
+        }
+
         // Dedup: exact Front field match in deck.
         let query = format!(
             "deck:\"{}\" Front:\"{}\"",
@@ -234,20 +318,28 @@ pub async fn send_words(config: &AnkiConfig, words: &[Value]) -> Result<Value, S
         let existing = invoke_action(&endpoint, "findNotes", json!({ "query": query })).await;
         if let Ok(ids) = &existing {
             if let Some(arr) = ids.as_array() {
-                if !arr.is_empty() {
+                if let Some(first) = arr.first().and_then(|v| v.as_i64()) {
                     skipped += 1;
+                    results.push(json!({
+                        "wordId": word_id,
+                        "noteId": first,
+                        "lemma": front,
+                        "status": "skipped",
+                    }));
                     continue;
                 }
             }
         }
 
         let mut fields = serde_json::Map::new();
-        fields.insert("Front".into(), json!(front.clone()));
-        fields.insert("Back".into(), json!(back.clone()));
-        if !extra.is_empty() {
-            // Basic models ignore unknown fields; models with Extra keep explanation + examples.
-            fields.insert("Extra".into(), json!(extra.clone()));
-        }
+        insert_field(&mut fields, &config.field_map.front, front.clone());
+        insert_field(&mut fields, &config.field_map.back, back.clone());
+        insert_field(&mut fields, &config.field_map.extra, extra.clone());
+        insert_field(
+            &mut fields,
+            &config.field_map.examples,
+            example_only.clone(),
+        );
         let params = json!({
             "note": {
                 "deckName": config.deck,
@@ -258,15 +350,23 @@ pub async fn send_words(config: &AnkiConfig, words: &[Value]) -> Result<Value, S
             }
         });
         match invoke_action(&endpoint, "addNote", params).await {
-            Ok(_) => added += 1,
+            Ok(note_id) => {
+                added += 1;
+                results.push(json!({
+                    "wordId": word_id,
+                    "noteId": note_id.as_i64().or_else(|| note_id.as_u64().map(|v| v as i64)),
+                    "lemma": front,
+                    "status": "added",
+                }));
+            }
             Err(e) => {
-                // Retry Front/Back only if model rejected Extra.
-                if extra.is_empty() {
+                // Retry Front/Back only if model rejected extra fields.
+                if extra.is_empty() && example_only.is_empty() {
                     errors.push(format!("{front}: {e}"));
                 } else {
                     let mut basic = serde_json::Map::new();
-                    basic.insert("Front".into(), json!(front.clone()));
-                    basic.insert("Back".into(), json!(back.clone()));
+                    insert_field(&mut basic, &config.field_map.front, front.clone());
+                    insert_field(&mut basic, &config.field_map.back, back.clone());
                     let fallback = json!({
                         "note": {
                             "deckName": config.deck,
@@ -277,7 +377,15 @@ pub async fn send_words(config: &AnkiConfig, words: &[Value]) -> Result<Value, S
                         }
                     });
                     match invoke_action(&endpoint, "addNote", fallback).await {
-                        Ok(_) => added += 1,
+                        Ok(note_id) => {
+                            added += 1;
+                            results.push(json!({
+                                "wordId": word_id,
+                                "noteId": note_id.as_i64().or_else(|| note_id.as_u64().map(|v| v as i64)),
+                                "lemma": front,
+                                "status": "added",
+                            }));
+                        }
                         Err(e2) => errors.push(format!("{front}: {e2}")),
                     }
                 }
@@ -289,6 +397,7 @@ pub async fn send_words(config: &AnkiConfig, words: &[Value]) -> Result<Value, S
         "added": added,
         "skipped": skipped,
         "errors": errors,
+        "results": results,
     }))
 }
 
@@ -322,14 +431,31 @@ mod tests {
             "tags": ["cpp"],
             "examples": [{"en": "const int x = 1;", "zh": "常量"}]
         });
-        let (front, back, extra, tags) = build_note_fields(&word);
+        let config = AnkiConfig::default();
+        let (front, back, extra, example_only, tags) = build_note_fields(&word, &config);
         assert_eq!(front, "constant");
         assert!(back.contains("恒定的"));
         assert!(back.contains("常量"));
         assert!(extra.contains("语言层面"));
         assert!(extra.contains("const int x = 1;"));
-        assert!(extra.contains("常量"));
+        assert!(example_only.is_empty());
         assert!(tags.iter().any(|t| t == "cpp"));
         assert!(tags.iter().any(|t| t.starts_with("src_")));
+    }
+
+    #[test]
+    fn build_note_fields_dedicated_examples_field() {
+        let word = json!({
+            "lemma": "constant",
+            "translation": "恒定的",
+            "explanation": "语言层面…",
+            "examples": [{"en": "const int x = 1;", "zh": "常量"}]
+        });
+        let mut config = AnkiConfig::default();
+        config.field_map.examples = "Example".into();
+        let (_, _, extra, example_only, _) = build_note_fields(&word, &config);
+        assert!(extra.contains("语言层面"));
+        assert!(!extra.contains("const int x = 1;"));
+        assert!(example_only.contains("const int x = 1;"));
     }
 }
