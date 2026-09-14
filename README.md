@@ -198,9 +198,12 @@ gege-dictionary/
 | [v1.4 开发规格](docs/PRD-v1.4-spec.md) | 计算机 / IVD 结构化专业解析、代码与流程展示、低门槛术语维护 | 想了解领域深化设计 |
 | [v1.5 开发规格](docs/PRD-v1.5-spec.md) | IDE 主场景、过滤误杀治理、CSP/日志/Key 隐私运行时、本地统计 | 想参与 v1.5+ 开发 |
 | [v1.6 开发规格](docs/PRD-v1.6-spec.md) | 截图 OCR、Anki Connect、上下文重解析、查词窗体验 | 想参与 v1.6 开发 |
+| [v1.7 开发规格](docs/PRD-v1.7-spec.md) | lookup 双路径合并、Anki 批量/映射/noteId、上下文三档与空态 | 想参与 v1.7 开发 |
+| [v1.6 实机验收清单](docs/QA-machine-checklist-v1.6.md) | 原生 OCR / Anki / 多屏 / 更新通道真机步骤 | 发布与 QA |
 | [v1.4.3 发布说明](docs/RELEASE-NOTES-v1.4.3.md) | 数据安全、迁移/恢复、导入、剪贴板与发布门禁 | 维护者与升级用户 |
 | [v1.4.4 发布说明](docs/RELEASE-NOTES-v1.4.4.md) | 可靠性回归、真实 API 验证、首屏性能与依赖安全 | 维护者与升级用户 |
 | [v1.5.0 发布说明](docs/RELEASE-NOTES-v1.5.0.md) | 主场景可用、隐私运行时、本地统计、PR CI | 维护者与升级用户 |
+| [v1.6.0 发布说明](docs/RELEASE-NOTES-v1.6.0.md) | 截图 OCR、Anki Connect、查词窗体验 | 维护者与升级用户 |
 | [发布说明](docs/RELEASE.md) | updater 私钥保管、GitHub Secrets 与签名发布流程 | 版本维护者 |
 
 开发任务已拆解为 [Issues](https://github.com/GeziP/gege-dictionary/issues)，每个都附带验收清单，欢迎认领。
