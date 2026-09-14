@@ -204,6 +204,7 @@ gege-dictionary/
 | [v1.4.4 发布说明](docs/RELEASE-NOTES-v1.4.4.md) | 可靠性回归、真实 API 验证、首屏性能与依赖安全 | 维护者与升级用户 |
 | [v1.5.0 发布说明](docs/RELEASE-NOTES-v1.5.0.md) | 主场景可用、隐私运行时、本地统计、PR CI | 维护者与升级用户 |
 | [v1.6.0 发布说明](docs/RELEASE-NOTES-v1.6.0.md) | 截图 OCR、Anki Connect、查词窗体验 | 维护者与升级用户 |
+| [v1.7.0 发布说明](docs/RELEASE-NOTES-v1.7.0.md) | 双路径合并、Anki 批量/映射、上下文三档与空态 | 维护者与升级用户 |
 | [发布说明](docs/RELEASE.md) | updater 私钥保管、GitHub Secrets 与签名发布流程 | 版本维护者 |
 
 开发任务已拆解为 [Issues](https://github.com/GeziP/gege-dictionary/issues)，每个都附带验收清单，欢迎认领。
