@@ -1,17 +1,31 @@
 import React from 'react';
+import { ArrowDownIcon, ArrowUpIcon, ArrowUpDownIcon } from 'lucide-react';
 import type { SavedWord } from '../../types/lexnote';
 import { classNames, relativeTime } from '../../utils/format';
 import { Chip } from '../ui/Chip';
 import { MasteryBadge } from '../ui/MasteryBadge';
+
+export type SortField = 'savedAt' | 'lemma' | 'mastery' | 'lookups';
+export type SortDir = 'asc' | 'desc';
+export interface SortState { field: SortField; dir: SortDir }
 
 interface WordTableProps {
   words: SavedWord[];
   density: 'table' | 'cards';
   selectedIds: string[];
   activeId: string | null;
+  sort?: SortState;
+  onSortChange?: (sort: SortState) => void;
   onToggleSelect: (id: string) => void;
   onToggleAll: () => void;
   onActivate: (id: string) => void;
+}
+
+function SortIcon({ field, sort }: { field: SortField; sort?: SortState }) {
+  if (!sort || sort.field !== field) return <ArrowUpDownIcon size={11} className="ml-0.5 inline opacity-30" />;
+  return sort.dir === 'asc'
+    ? <ArrowUpIcon size={11} className="ml-0.5 inline text-accent" />
+    : <ArrowDownIcon size={11} className="ml-0.5 inline text-accent" />;
 }
 
 export function WordTable({
@@ -19,10 +33,20 @@ export function WordTable({
   density,
   selectedIds,
   activeId,
+  sort,
+  onSortChange,
   onToggleSelect,
   onToggleAll,
   onActivate
 }: WordTableProps) {
+  const cycle = (field: SortField) => {
+    if (!onSortChange) return;
+    if (!sort || sort.field !== field) {
+      onSortChange({ field, dir: field === 'lemma' ? 'asc' : 'desc' });
+    } else {
+      onSortChange({ field, dir: sort.dir === 'asc' ? 'desc' : 'asc' });
+    }
+  };
   if (words.length === 0) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-1 p-8 text-center">
@@ -83,13 +107,29 @@ export function WordTable({
                 className="h-3.5 w-3.5 accent-[color:var(--accent)]"
               />
             </th>
-            <th scope="col" className="py-2 pr-3 font-medium">单词</th>
+            <th scope="col" className="py-2 pr-3 font-medium">
+              <button type="button" onClick={() => cycle('lemma')} className="inline-flex items-center hover:text-ink">
+                单词<SortIcon field="lemma" sort={sort} />
+              </button>
+            </th>
             <th scope="col" className="py-2 pr-3 font-medium">翻译</th>
             <th scope="col" className="hidden py-2 pr-3 font-medium xl:table-cell">标签</th>
             <th scope="col" className="hidden py-2 pr-3 font-medium lg:table-cell">来源</th>
-            <th scope="col" className="py-2 pr-3 font-medium">收藏时间</th>
-            <th scope="col" className="py-2 pr-3 text-right font-medium">查询次数</th>
-            <th scope="col" className="py-2 pr-3 font-medium">掌握度</th>
+            <th scope="col" className="py-2 pr-3 font-medium">
+              <button type="button" onClick={() => cycle('savedAt')} className="inline-flex items-center hover:text-ink">
+                收藏时间<SortIcon field="savedAt" sort={sort} />
+              </button>
+            </th>
+            <th scope="col" className="py-2 pr-3 text-right font-medium">
+              <button type="button" onClick={() => cycle('lookups')} className="inline-flex items-center justify-end hover:text-ink">
+                查询次数<SortIcon field="lookups" sort={sort} />
+              </button>
+            </th>
+            <th scope="col" className="py-2 pr-3 font-medium">
+              <button type="button" onClick={() => cycle('mastery')} className="inline-flex items-center hover:text-ink">
+                掌握度<SortIcon field="mastery" sort={sort} />
+              </button>
+            </th>
           </tr>
         </thead>
         <tbody>

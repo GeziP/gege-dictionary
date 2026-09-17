@@ -126,6 +126,7 @@ interface LexNoteValue {
   removeWords: (ids: string[]) => void;
   updateWord: (id: string, patch: Partial<SavedWord>) => void;
   tagWords: (ids: string[], tags: string[]) => void;
+  batchSetMastery: (ids: string[], mastery: SavedWord['mastery']) => void;
   findByLemma: (lemma: string) => SavedWord | undefined;
   countLookup: (tokens: number) => void;
   saveTemplate: (template: PromptTemplate) => void;
@@ -371,6 +372,20 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
     [isTauri, words]
   );
 
+  const batchSetMastery = useCallback(
+    (ids: string[], mastery: SavedWord['mastery']) => {
+      setWords((prev) =>
+        prev.map((w) => (ids.includes(w.id) ? { ...w, mastery } : w))
+      );
+      if (isTauri) {
+        ids.forEach((id) => {
+          bridge.updateWord(id, { mastery } as Partial<SavedWord>).catch(console.error);
+        });
+      }
+    },
+    [isTauri]
+  );
+
   const findByLemma = useCallback(
     (lemma: string) => words.find((w) => w.lemma.toLowerCase() === lemma.toLowerCase()),
     [words]
@@ -576,6 +591,7 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
     removeWords,
     updateWord,
     tagWords,
+    batchSetMastery,
     findByLemma,
     countLookup,
     saveTemplate,
