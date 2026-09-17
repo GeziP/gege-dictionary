@@ -6,7 +6,7 @@ import { WindowFrame } from '../components/shell/WindowFrame';
 import { FilterPanel } from '../components/library/FilterPanel';
 import { LibraryToolbar, READER_MAX, READER_MIN } from '../components/library/LibraryToolbar';
 import { SelectionBar } from '../components/library/SelectionBar';
-import { WordTable } from '../components/library/WordTable';
+import { WordTable, type SortState } from '../components/library/WordTable';
 import { WordDetail } from '../components/library/WordDetail';
 import { ExportDialog } from '../components/library/ExportDialog';
 import { ImportDialog } from '../components/library/ImportDialog';
@@ -15,6 +15,8 @@ import type { Mastery } from '../types/lexnote';
 import { classNames } from '../utils/format';
 import { ReviewOverview } from '../components/review/ReviewOverview';
 import { ReadingSessions } from '../components/library/ReadingSessions';
+
+const MASTERY_ORDER: Record<string, number> = { new: 0, learning: 1, familiar: 2, mastered: 3 };
 
 export function Library() {
   const { words, removeWords, tagWords, refreshWords, settings, updateSettings } = useLexNote();
@@ -33,6 +35,7 @@ export function Library() {
   const [toast, setToast] = useState<ToastMessage | null>(null);
   const [viewMode, setViewMode] = useState<'words' | 'sessions'>('words');
   const [ankiBusy, setAnkiBusy] = useState(false);
+  const [sort, setSort] = useState<SortState>({ field: 'savedAt', dir: 'desc' });
   const toastId = useRef(0);
 
   useEffect(() => {
@@ -88,6 +91,27 @@ export function Library() {
     });
   }, [words, query, tagFilters, sourceFilters, masteryFilters, range]);
 
+  const sorted = useMemo(() => {
+    const list = [...filtered];
+    const { field, dir } = sort;
+    const mul = dir === 'asc' ? 1 : -1;
+    list.sort((a, b) => {
+      switch (field) {
+        case 'lemma':
+          return mul * a.lemma.localeCompare(b.lemma, 'en', { sensitivity: 'base' });
+        case 'savedAt':
+          return mul * (new Date(a.savedAt).getTime() - new Date(b.savedAt).getTime());
+        case 'lookups':
+          return mul * (a.lookups - b.lookups);
+        case 'mastery':
+          return mul * ((MASTERY_ORDER[a.mastery] ?? 0) - (MASTERY_ORDER[b.mastery] ?? 0));
+        default:
+          return 0;
+      }
+    });
+    return list;
+  }, [filtered, sort]);
+
   const active = words.find((word) => word.id === activeId) ?? null;
   const selectedWords = words.filter((word) => selectedIds.includes(word.id));
 
@@ -136,13 +160,15 @@ export function Library() {
           />
 
           <WordTable
-            words={filtered}
+            words={sorted}
             density={density}
             selectedIds={selectedIds}
             activeId={activeId}
+            sort={sort}
+            onSortChange={setSort}
             onToggleSelect={(id) => setSelectedIds((prev) => toggle(prev, id))}
             onToggleAll={() =>
-            setSelectedIds(selectedIds.length === filtered.length ? [] : filtered.map((word) => word.id))
+            setSelectedIds(selectedIds.length === sorted.length ? [] : sorted.map((word) => word.id))
             }
             onActivate={setActiveId} />
           
