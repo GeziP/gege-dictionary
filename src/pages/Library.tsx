@@ -19,7 +19,7 @@ import { ReadingSessions } from '../components/library/ReadingSessions';
 const MASTERY_ORDER: Record<string, number> = { new: 0, learning: 1, familiar: 2, mastered: 3 };
 
 export function Library() {
-  const { words, removeWords, tagWords, refreshWords, settings, updateSettings } = useLexNote();
+  const { words, removeWords, tagWords, batchSetMastery, refreshWords, settings, updateSettings } = useLexNote();
   const fontSize = settings.fontSize ?? 13;
   const [query, setQuery] = useState('');
   const [tagFilters, setTagFilters] = useState<string[]>([]);
@@ -189,6 +189,11 @@ export function Library() {
                   setBatchTag('');
                 }}
                 onExport={() => setExportOpen(true)}
+                onSetMastery={(mastery) => {
+                  batchSetMastery(selectedIds, mastery);
+                  const labels: Record<string, string> = { new: '新词', learning: '巩固中', familiar: '熟悉', mastered: '已掌握' };
+                  showToast(`已将 ${selectedIds.length} 条生词设为「${labels[mastery] || mastery}」`, 'success');
+                }}
                 onSendAnki={async () => {
                   setAnkiBusy(true);
                   try {

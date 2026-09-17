@@ -1,8 +1,10 @@
 import React from 'react';
 import { motion } from 'framer-motion';
-import { BookMarkedIcon, DownloadIcon, TagIcon, Trash2Icon, XIcon } from 'lucide-react';
+import { BookMarkedIcon, DownloadIcon, GraduationCapIcon, TagIcon, Trash2Icon, XIcon } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { TextInput } from '../ui/TextInput';
+import { MASTERY_META } from '../ui/MasteryBadge';
+import type { Mastery } from '../../types/lexnote';
 
 interface SelectionBarProps {
   count: number;
@@ -13,6 +15,7 @@ interface SelectionBarProps {
   onApplyTag: () => void;
   onExport: () => void;
   onSendAnki?: () => void;
+  onSetMastery?: (mastery: Mastery) => void;
   onDelete: () => void;
   onClear: () => void;
 }
@@ -26,6 +29,7 @@ export function SelectionBar({
   onApplyTag,
   onExport,
   onSendAnki,
+  onSetMastery,
   onDelete,
   onClear,
 }: SelectionBarProps) {
@@ -58,6 +62,27 @@ export function SelectionBar({
       <Button size="sm" icon={<DownloadIcon size={13} aria-hidden="true" />} onClick={onExport}>
         导出所选
       </Button>
+      {onSetMastery && (
+        <div className="relative flex items-center">
+          <GraduationCapIcon size={13} className="mr-1 text-ink-subtle" aria-hidden="true" />
+          <select
+            aria-label="批量设置掌握度"
+            className="h-6 rounded border border-line bg-surface px-1.5 text-[11px] text-ink outline-none hover:border-line-strong focus:border-accent"
+            defaultValue=""
+            onChange={(e) => {
+              if (e.target.value) {
+                onSetMastery(e.target.value as Mastery);
+                e.target.value = '';
+              }
+            }}
+          >
+            <option value="" disabled>掌握度</option>
+            {(Object.keys(MASTERY_META) as Mastery[]).map((m) => (
+              <option key={m} value={m}>{MASTERY_META[m].label}</option>
+            ))}
+          </select>
+        </div>
+      )}
       {ankiEnabled && onSendAnki ? (
         <Button
           size="sm"
