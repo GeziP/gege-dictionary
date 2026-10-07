@@ -5,7 +5,7 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -205,6 +205,242 @@ fn normalize_import_lemma(value: &str) -> String {
         .to_lowercase()
 }
 
+/// `words.anki_note_id` mirrors the `ankiNoteId` key of the JSON document so an
+/// "already sent to Anki" check can use the index instead of parsing every
+/// row. Anki ids are 64-bit, hence the TEXT column.
+fn anki_note_id_column(word: &Value) -> Option<String> {
+    match word.get("ankiNoteId") {
+        Some(Value::Number(number)) => Some(number.to_string()),
+        Some(Value::String(text)) if !text.trim().is_empty() => Some(text.trim().to_string()),
+        _ => None,
+    }
+}
+
+fn str_field<'a>(word: &'a Value, key: &str) -> &'a str {
+    word.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// Trimmed, de-duplicated (order preserving) tags of a word document.
+fn tags_of(word: &Value) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::new();
+    for tag in word
+        .get("tags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        let tag = tag.trim();
+        if !tag.is_empty() && !tags.iter().any(|existing| existing == tag) {
+            tags.push(tag.to_string());
+        }
+    }
+    tags
+}
+
+fn tags_value(tags: Vec<String>) -> Value {
+    Value::Array(tags.into_iter().map(Value::String).collect())
+}
+
+fn word_json_by_id(conn: &Connection, id: &str) -> Result<Option<Value>, String> {
+    let raw: Option<String> = conn
+        .query_row("SELECT data FROM words WHERE id = ?1", params![id], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
+    raw.map(|raw| serde_json::from_str(&raw).map_err(|e| format!("词条数据损坏 ({id}): {e}")))
+        .transpose()
+}
+
+/// Find the saved word a lookup refers to: the same normalised lemma and, when
+/// given, the same kind. If legacy data already holds duplicates the earliest
+/// saved one wins, because it is the one carrying the user's history.
+fn find_word_with_connection(
+    conn: &Connection,
+    lemma: &str,
+    kind: Option<&str>,
+) -> Result<Option<Value>, String> {
+    let key = normalize_import_lemma(lemma);
+    if key.is_empty() {
+        return Ok(None);
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, lemma, COALESCE(kind, 'word') FROM words ORDER BY saved_at ASC, id ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let id: String = row.get(0).map_err(|e| e.to_string())?;
+        let row_lemma: String = row.get(1).map_err(|e| e.to_string())?;
+        let row_kind: String = row.get(2).map_err(|e| e.to_string())?;
+        let same_kind = match kind {
+            Some(wanted) => wanted == row_kind,
+            None => true,
+        };
+        if same_kind && normalize_import_lemma(&row_lemma) == key {
+            return word_json_by_id(conn, &id);
+        }
+    }
+    Ok(None)
+}
+
+/// Combine a freshly looked-up entry with the word the user already saved. The
+/// lookup refreshes the *content*; everything the user owns (identity,
+/// progress, note, tags, Anki link) and where/when the word was first
+/// collected stays with the stored word, and the lookup counter goes up by one.
+///
+/// The first source is kept because reading sessions group words by
+/// `sourceApp` and `savedAt`; letting a later lookup change either would make
+/// words hop between sessions.
+fn merged_lookup_word(existing: &Value, incoming: &Value) -> Value {
+    let existing_fields = existing.as_object().cloned().unwrap_or_default();
+    let mut merged = incoming.as_object().cloned().unwrap_or_default();
+
+    for key in ["id", "mastery", "savedAt", "ankiNoteId"] {
+        if let Some(value) = existing_fields.get(key).filter(|value| !value.is_null()) {
+            merged.insert(key.to_string(), value.clone());
+        }
+    }
+    for key in ["sourceApp", "sourceTitle"] {
+        if !str_field(existing, key).trim().is_empty() {
+            merged.insert(
+                key.to_string(),
+                Value::String(str_field(existing, key).to_string()),
+            );
+        }
+    }
+    let same_lemma = normalize_import_lemma(str_field(existing, "lemma"))
+        == normalize_import_lemma(str_field(incoming, "lemma"));
+    if same_lemma {
+        merged.insert(
+            "lemma".into(),
+            Value::String(str_field(existing, "lemma").to_string()),
+        );
+    }
+    if !str_field(existing, "note").trim().is_empty() {
+        merged.insert(
+            "note".into(),
+            Value::String(str_field(existing, "note").to_string()),
+        );
+    }
+    let mut tags = tags_of(existing);
+    for tag in tags_of(incoming) {
+        if !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
+    merged.insert("tags".into(), tags_value(tags));
+    let previous = existing.get("lookups").and_then(Value::as_u64).unwrap_or(1);
+    merged.insert("lookups".into(), Value::from(previous.saturating_add(1)));
+    // Keep any other stored field the incoming payload does not know about.
+    for (key, value) in existing_fields {
+        merged.entry(key).or_insert(value);
+    }
+    Value::Object(merged)
+}
+
+fn ensure_text(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    default: impl FnOnce() -> String,
+) {
+    let present = object
+        .get(key)
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.trim().is_empty());
+    if !present {
+        object.insert(key.to_string(), Value::String(default()));
+    }
+}
+
+/// A looked-up entry that is not saved yet, with every field the rest of the
+/// app relies on filled in.
+fn new_lookup_word(incoming: &Value) -> Value {
+    let tags = tags_of(incoming);
+    let mut word = incoming.as_object().cloned().unwrap_or_default();
+    ensure_text(&mut word, "id", || uuid::Uuid::new_v4().to_string());
+    ensure_text(&mut word, "savedAt", || chrono::Utc::now().to_rfc3339());
+    ensure_text(&mut word, "mastery", || "new".to_string());
+    ensure_text(&mut word, "kind", || "word".to_string());
+    if !word.get("note").is_some_and(Value::is_string) {
+        word.insert("note".into(), Value::String(String::new()));
+    }
+    let lookups = word
+        .get("lookups")
+        .and_then(Value::as_u64)
+        .filter(|count| *count > 0)
+        .unwrap_or(1);
+    word.insert("lookups".into(), Value::from(lookups));
+    word.insert("tags".into(), tags_value(tags));
+    Value::Object(word)
+}
+
+const MASTERY_LEVELS: [&str; 4] = ["new", "learning", "familiar", "mastered"];
+const MAX_TAGS_PER_BATCH: usize = 20;
+const MAX_TAG_CHARS: usize = 32;
+
+/// A change applied to many words at once. Tags are added or removed, never
+/// replaced, so every word keeps whatever else the user attached to it.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct BatchWordPatch {
+    pub mastery: Option<String>,
+    pub add_tags: Vec<String>,
+    pub remove_tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct BatchUpdateReport {
+    pub updated: u32,
+    pub missing: u32,
+}
+
+struct ValidatedPatch<'a> {
+    mastery: Option<&'a str>,
+    add_tags: Vec<String>,
+    remove_tags: Vec<String>,
+}
+
+fn clean_tag_list(tags: &[String]) -> Result<Vec<String>, String> {
+    let mut cleaned: Vec<String> = Vec::new();
+    for tag in tags {
+        let tag = tag.trim();
+        if tag.is_empty() || cleaned.iter().any(|existing| existing == tag) {
+            continue;
+        }
+        if tag.chars().count() > MAX_TAG_CHARS {
+            return Err(format!("标签过长（最多 {MAX_TAG_CHARS} 个字符）: {tag}"));
+        }
+        cleaned.push(tag.to_string());
+    }
+    if cleaned.len() > MAX_TAGS_PER_BATCH {
+        return Err(format!("一次最多处理 {MAX_TAGS_PER_BATCH} 个标签"));
+    }
+    Ok(cleaned)
+}
+
+impl BatchWordPatch {
+    fn validated(&self) -> Result<ValidatedPatch<'_>, String> {
+        let mastery = match self.mastery.as_deref() {
+            Some(level) if MASTERY_LEVELS.contains(&level) => Some(level),
+            Some(level) => return Err(format!("无效的掌握度: {level}")),
+            None => None,
+        };
+        let add_tags = clean_tag_list(&self.add_tags)?;
+        let remove_tags = clean_tag_list(&self.remove_tags)?;
+        if mastery.is_none() && add_tags.is_empty() && remove_tags.is_empty() {
+            return Err("没有需要应用的修改".into());
+        }
+        Ok(ValidatedPatch {
+            mastery,
+            add_tags,
+            remove_tags,
+        })
+    }
+}
+
 fn save_word_with_connection(
     conn: &Connection,
     word: &Value,
@@ -236,16 +472,17 @@ fn save_word_with_connection(
     let lookups = word.get("lookups").and_then(Value::as_u64).unwrap_or(1) as i64;
     let now = chrono::Utc::now().to_rfc3339();
     let saved = if saved_at.is_empty() { &now } else { saved_at };
+    let anki_note_id = anki_note_id_column(word);
     conn.execute(
-        "INSERT INTO words (id, lemma, translation, pos, context_meaning, explanation, source_app, source_title, mastery, kind, saved_at, updated_at, lookups, data)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        "INSERT INTO words (id, lemma, translation, pos, context_meaning, explanation, source_app, source_title, mastery, kind, saved_at, updated_at, lookups, data, anki_note_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(id) DO UPDATE SET
            lemma=excluded.lemma, translation=excluded.translation, pos=excluded.pos,
            context_meaning=excluded.context_meaning, explanation=excluded.explanation,
            source_app=excluded.source_app, source_title=excluded.source_title,
            mastery=excluded.mastery, kind=excluded.kind, updated_at=excluded.updated_at,
-           lookups=excluded.lookups, data=excluded.data",
-        params![id, lemma, translation, pos, context_meaning, explanation, source_app, source_title, mastery, kind, saved, now, lookups, word.to_string()],
+           lookups=excluded.lookups, data=excluded.data, anki_note_id=excluded.anki_note_id",
+        params![id, lemma, translation, pos, context_meaning, explanation, source_app, source_title, mastery, kind, saved, now, lookups, word.to_string(), anki_note_id],
     )
     .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM word_tags WHERE word_id = ?1", params![id])
@@ -281,29 +518,13 @@ impl Database {
         })
     }
 
+    /// In-memory database for tests. Foreign keys are enforced like in the
+    /// real database, so cascading deletes are exercised too.
     #[cfg(test)]
-    pub(crate) fn open_read_only(path: &str) -> Result<Self, String> {
-        // `immutable=1` prevents SQLite from creating WAL/SHM sidecars while
-        // the live smoke test inspects the user's real database.
-        let uri_path = path.replace('\\', "/");
-        let uri = if uri_path.contains(':') {
-            format!("file:///{uri_path}?immutable=1")
-        } else {
-            format!("file:{uri_path}?immutable=1")
-        };
-        let conn = Connection::open_with_flags(
-            &uri,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        )
-        .map_err(|e| format!("DB read-only open error: {e}"))?;
-        Ok(Self {
-            conn,
-            path: path.to_string(),
-        })
-    }
-
-    pub fn open_memory() -> Result<Self, String> {
+    pub(crate) fn open_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory().map_err(|e| format!("Memory DB error: {e}"))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .map_err(|e| format!("Memory DB pragma error: {e}"))?;
         Ok(Self {
             conn,
             path: String::new(),
@@ -797,17 +1018,181 @@ impl Database {
         Ok(words)
     }
 
-    pub fn save_word(&self, word: &Value) -> Result<(), String> {
-        let include_long_form = self
-            .get_settings()
+    fn include_long_form_review(&self) -> bool {
+        self.get_settings()
             .ok()
             .and_then(|settings| {
                 settings
                     .get("includeLongFormReview")
                     .and_then(Value::as_bool)
             })
-            .unwrap_or(false);
-        save_word_with_connection(&self.conn, word, include_long_form)
+            .unwrap_or(false)
+    }
+
+    /// Raw upsert: the stored document becomes exactly `word`. Use
+    /// [`Database::save_lookup_result`] for saving a fresh lookup.
+    pub fn save_word(&self, word: &Value) -> Result<(), String> {
+        save_word_with_connection(&self.conn, word, self.include_long_form_review())
+    }
+
+    /// Save the outcome of a dictionary lookup.
+    ///
+    /// Unlike [`Database::save_word`], which replaces the stored document with
+    /// whatever it is handed, this merges: looking a word up again refreshes
+    /// its content but never resets what the user owns (mastery, note, tags,
+    /// review progress, Anki link, first-saved date). A word is recognised by
+    /// its id or, failing that, by normalised lemma and kind, so a second
+    /// lookup of "Hello  World" cannot create a duplicate of "hello world".
+    /// Returns the document as stored.
+    pub fn save_lookup_result(&self, incoming: &Value) -> Result<Value, String> {
+        let lemma = str_field(incoming, "lemma").trim();
+        if lemma.is_empty() {
+            return Err("词条缺少 lemma，无法保存".into());
+        }
+        let kind = Some(str_field(incoming, "kind"))
+            .filter(|kind| !kind.trim().is_empty())
+            .unwrap_or("word");
+        let include_long_form = self.include_long_form_review();
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let by_id = match str_field(incoming, "id").trim() {
+            "" => None,
+            id => word_json_by_id(&tx, id)?,
+        };
+        let existing = match by_id {
+            Some(word) => Some(word),
+            None => find_word_with_connection(&tx, lemma, Some(kind))?,
+        };
+        let word = match &existing {
+            Some(existing) => merged_lookup_word(existing, incoming),
+            None => new_lookup_word(incoming),
+        };
+        save_word_with_connection(&tx, &word, include_long_form)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(word)
+    }
+
+    /// The saved word for a lemma (compared after trimming, collapsing
+    /// whitespace and lower-casing), optionally restricted to one kind.
+    pub fn find_word_by_lemma(
+        &self,
+        lemma: &str,
+        kind: Option<&str>,
+    ) -> Result<Option<Value>, String> {
+        find_word_with_connection(&self.conn, lemma, kind)
+    }
+
+    /// Words in the order the ids were asked for, skipping unknown and
+    /// repeated ids. Unlike [`Database::get_words_by_ids`], an empty request
+    /// yields nothing rather than the whole library, and callers can pair the
+    /// result with their own list without guessing.
+    pub fn get_words_in_order(&self, ids: &[String]) -> Result<Vec<Value>, String> {
+        let mut seen = HashSet::new();
+        let unique: Vec<&str> = ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| seen.insert(*id))
+            .collect();
+        let mut by_id: HashMap<String, Value> = HashMap::with_capacity(unique.len());
+        for chunk in unique.chunks(500) {
+            let sql = format!(
+                "SELECT id, data FROM words WHERE id IN ({})",
+                vec!["?"; chunk.len()].join(",")
+            );
+            let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                let (id, data) = row.map_err(|e| e.to_string())?;
+                if let Ok(value) = serde_json::from_str::<Value>(&data) {
+                    by_id.insert(id, value);
+                }
+            }
+        }
+        Ok(unique
+            .into_iter()
+            .filter_map(|id| by_id.remove(id))
+            .collect())
+    }
+
+    /// Record which Anki note each word became. One transaction for the whole
+    /// batch; both the JSON document and the indexed column are updated, and
+    /// ids that no longer exist are ignored. Returns the number of words
+    /// updated.
+    pub fn set_anki_note_ids(&self, pairs: &[(String, i64)]) -> Result<u32, String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let mut updated = 0_u32;
+        for (id, note_id) in pairs {
+            let Some(mut word) = word_json_by_id(&tx, id)? else {
+                continue;
+            };
+            if let Some(object) = word.as_object_mut() {
+                object.insert("ankiNoteId".into(), Value::from(*note_id));
+            }
+            tx.execute(
+                "UPDATE words SET data = ?2, anki_note_id = ?3 WHERE id = ?1",
+                params![id, word.to_string(), note_id.to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+            updated += 1;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(updated)
+    }
+
+    /// Apply one change to many words in a single transaction: either every
+    /// existing word is updated or none is. Unknown ids are counted, not fatal.
+    pub fn batch_update_words(
+        &self,
+        ids: &[String],
+        patch: &BatchWordPatch,
+    ) -> Result<BatchUpdateReport, String> {
+        let patch = patch.validated()?;
+        let touches_tags = !patch.add_tags.is_empty() || !patch.remove_tags.is_empty();
+        let include_long_form = self.include_long_form_review();
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let mut seen = HashSet::new();
+        let mut report = BatchUpdateReport {
+            updated: 0,
+            missing: 0,
+        };
+        for id in ids.iter().filter(|id| seen.insert(id.as_str())) {
+            let Some(mut word) = word_json_by_id(&tx, id)? else {
+                report.missing += 1;
+                continue;
+            };
+            let mut tags = tags_of(&word);
+            tags.retain(|tag| !patch.remove_tags.contains(tag));
+            for tag in &patch.add_tags {
+                if !tags.contains(tag) {
+                    tags.push(tag.clone());
+                }
+            }
+            let object = word
+                .as_object_mut()
+                .ok_or_else(|| format!("词条数据损坏 ({id})"))?;
+            if let Some(level) = patch.mastery {
+                object.insert("mastery".into(), Value::String(level.to_string()));
+            }
+            if touches_tags {
+                object.insert("tags".into(), tags_value(tags));
+            }
+            save_word_with_connection(&tx, &word, include_long_form)?;
+            report.updated += 1;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(report)
     }
 
     pub fn import_words(
@@ -817,35 +1202,31 @@ impl Database {
         mapping: &std::collections::HashMap<String, String>,
     ) -> Result<crate::word_import::WordImportResult, String> {
         let (rows, mut errors) = crate::word_import::parse_import_rows(content, format, mapping)?;
-        let include_long_form = self
-            .get_settings()
-            .ok()
-            .and_then(|settings| {
-                settings
-                    .get("includeLongFormReview")
-                    .and_then(Value::as_bool)
-            })
-            .unwrap_or(false);
-        let existing = self.get_all_words()?;
+        let include_long_form = self.include_long_form_review();
+        let mut known = self.get_all_words()?;
+        // Normalised lemma -> position in `known`. The first occurrence wins,
+        // exactly as a linear scan would have found it. The scan itself made
+        // big imports quadratic: 3000 rows into 3000 words took about 10 s.
+        let mut index_by_lemma: HashMap<String, usize> = HashMap::with_capacity(known.len());
+        for (position, word) in known.iter().enumerate() {
+            if let Some(lemma) = word.get("lemma").and_then(Value::as_str) {
+                index_by_lemma
+                    .entry(normalize_import_lemma(lemma))
+                    .or_insert(position);
+            }
+        }
         let tx = self
             .conn
             .unchecked_transaction()
             .map_err(|e| e.to_string())?;
-        let mut known = existing;
         let mut inserted = 0_u32;
         let mut merged = 0_u32;
         let mut skipped = errors.len() as u32;
         for row in rows {
             let imported_lemma = row.fields.get("lemma").cloned().unwrap_or_default();
             let key = normalize_import_lemma(&imported_lemma);
-            let existing_index = known.iter().position(|word| {
-                word.get("lemma")
-                    .and_then(Value::as_str)
-                    .map(normalize_import_lemma)
-                    .as_deref()
-                    == Some(key.as_str())
-            });
-            let mut word = if let Some(index) = existing_index {
+            let existing_index = index_by_lemma.get(&key).copied();
+            let word = if let Some(index) = existing_index {
                 let mut current = known[index].clone();
                 let object = current.as_object_mut().ok_or("已有词条格式无效")?;
                 for (field, value) in &row.fields {
@@ -928,7 +1309,8 @@ impl Database {
             if let Some(index) = existing_index {
                 known[index] = word;
             } else {
-                known.push(std::mem::take(&mut word));
+                index_by_lemma.insert(key, known.len());
+                known.push(word);
             }
         }
         tx.commit().map_err(|e| e.to_string())?;
@@ -939,110 +1321,6 @@ impl Database {
             errors,
         })
     }
-
-    /*
-     * The implementation below is shared by normal saves and the import
-     * transaction so review_state and user-owned JSON fields are untouched.
-     */
-    /* old implementation removed by the helper below */
-    /*
-        let id = word.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        let lemma = word.get("lemma").and_then(|v| v.as_str()).unwrap_or("");
-        let translation = word
-            .get("translation")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let pos = word.get("pos").and_then(|v| v.as_str()).unwrap_or("");
-        let context_meaning = word
-            .get("contextMeaning")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let explanation = word
-            .get("explanation")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let source_app = word.get("sourceApp").and_then(|v| v.as_str()).unwrap_or("");
-        let source_title = word
-            .get("sourceTitle")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let mastery = word
-            .get("mastery")
-            .and_then(|v| v.as_str())
-            .unwrap_or("new");
-        let kind = word.get("kind").and_then(|v| v.as_str()).unwrap_or("word");
-        let saved_at = word.get("savedAt").and_then(|v| v.as_str()).unwrap_or("");
-        let lookups = word.get("lookups").and_then(|v| v.as_u64()).unwrap_or(1) as i64;
-        let now = chrono::Utc::now().to_rfc3339();
-        let saved = if saved_at.is_empty() { &now } else { saved_at };
-
-        self.conn
-            .execute(
-                "INSERT INTO words (id, lemma, translation, pos, context_meaning, explanation, source_app, source_title, mastery, kind, saved_at, updated_at, lookups, data)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-                 ON CONFLICT(id) DO UPDATE SET
-                   lemma=excluded.lemma, translation=excluded.translation, pos=excluded.pos,
-                   context_meaning=excluded.context_meaning, explanation=excluded.explanation,
-                   source_app=excluded.source_app, source_title=excluded.source_title,
-                   mastery=excluded.mastery, kind=excluded.kind, updated_at=excluded.updated_at,
-                   lookups=excluded.lookups, data=excluded.data",
-                params![
-                    id,
-                    lemma,
-                    translation,
-                    pos,
-                    context_meaning,
-                    explanation,
-                    source_app,
-                    source_title,
-                    mastery,
-                    kind,
-                    saved,
-                    now,
-                    lookups,
-                    word.to_string(),
-                ],
-            )
-            .map_err(|e| e.to_string())?;
-
-        self.conn
-            .execute("DELETE FROM word_tags WHERE word_id = ?1", params![id])
-            .map_err(|e| e.to_string())?;
-
-        if let Some(tags) = word.get("tags").and_then(|v| v.as_array()) {
-            for tag in tags {
-                if let Some(tag_str) = tag.as_str() {
-                    self.conn
-                        .execute(
-                            "INSERT OR IGNORE INTO word_tags (word_id, tag) VALUES (?1, ?2)",
-                            params![id, tag_str],
-                        )
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-        }
-
-        let include_long_form = self
-            .get_settings()
-            .ok()
-            .and_then(|settings| {
-                settings
-                    .get("includeLongFormReview")
-                    .and_then(|value| value.as_bool())
-            })
-            .unwrap_or(false);
-        if matches!(kind, "word" | "phrase") || include_long_form {
-            self.conn
-                .execute(
-                    "INSERT OR IGNORE INTO review_state (word_id, box, due_at, created_at)
-                     VALUES (?1, 1, date('now', 'localtime', '+1 day'), datetime('now'))",
-                    params![id],
-                )
-                .map_err(|e| format!("创建复习记录失败: {e}"))?;
-        }
-
-        Ok(())
-    */
 
     pub fn get_review_queue(&self, limit: Option<u32>) -> Result<Vec<Value>, String> {
         let requested = limit.unwrap_or_else(|| {
@@ -1377,30 +1655,16 @@ impl Database {
     }
 
     pub fn tag_session(&self, session_id: &str, tags: &[String]) -> Result<u32, String> {
-        let ids = self.session_word_ids(session_id)?;
-        for id in &ids {
-            let raw: String = self
-                .conn
-                .query_row("SELECT data FROM words WHERE id=?1", params![id], |row| {
-                    row.get(0)
-                })
-                .map_err(|e| e.to_string())?;
-            let mut word: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-            let mut merged = word
-                .get("tags")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            for tag in tags {
-                if !merged.iter().any(|value| value.as_str() == Some(tag)) {
-                    merged.push(Value::String(tag.clone()));
-                }
-            }
-            word.as_object_mut()
-                .map(|object| object.insert("tags".into(), Value::Array(merged)));
-            self.save_word(&word)?;
+        let add_tags = clean_tag_list(tags)?;
+        if add_tags.is_empty() {
+            return Ok(0);
         }
-        Ok(ids.len() as u32)
+        let ids = self.session_word_ids(session_id)?;
+        let patch = BatchWordPatch {
+            add_tags,
+            ..BatchWordPatch::default()
+        };
+        Ok(self.batch_update_words(&ids, &patch)?.updated)
     }
 
     pub fn add_session_to_review(&self, session_id: &str) -> Result<u32, String> {
@@ -1426,13 +1690,19 @@ impl Database {
         self.save_word(&word)
     }
 
+    /// Delete words (and, through the foreign keys, their tags and review
+    /// state) in one transaction, so a failure cannot leave a half-deleted
+    /// selection and a large selection costs one commit instead of one each.
     pub fn delete_words(&self, ids: &[String]) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
         for id in ids {
-            self.conn
-                .execute("DELETE FROM words WHERE id = ?1", params![id])
+            tx.execute("DELETE FROM words WHERE id = ?1", params![id])
                 .map_err(|e| e.to_string())?;
         }
-        Ok(())
+        tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn get_all_tags(&self) -> Result<Vec<String>, String> {
@@ -3143,6 +3413,459 @@ mod tests {
             )
             .unwrap();
         assert_eq!(box_number, 3);
+    }
+
+    #[test]
+    fn saving_a_lookup_inserts_a_complete_new_word() {
+        let db = new_db();
+        let saved = db
+            .save_lookup_result(&lookup_entry("Idempotent", "word", "幂等的"))
+            .unwrap();
+        let id = saved["id"].as_str().unwrap();
+        assert!(!id.is_empty());
+        assert!(!saved["savedAt"].as_str().unwrap().is_empty());
+        assert_eq!(saved["mastery"], "new");
+        assert_eq!(saved["lookups"], 1);
+        assert_eq!(saved["note"], "");
+        assert_eq!(saved["tags"], serde_json::json!([]));
+        assert_eq!(db.get_all_words().unwrap(), vec![saved.clone()]);
+        let reviews: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM review_state WHERE word_id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reviews, 1);
+    }
+
+    #[test]
+    fn saving_a_lookup_again_keeps_everything_the_user_owns() {
+        let db = new_db();
+        let first = db
+            .save_lookup_result(&lookup_entry("idempotent", "word", "旧释义"))
+            .unwrap();
+        let id = first["id"].as_str().unwrap().to_string();
+        db.update_word(
+            &id,
+            &serde_json::json!({"mastery": "familiar", "note": "我的笔记", "tags": ["cs"]}),
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "UPDATE review_state SET box=3 WHERE word_id=?1",
+                params![id],
+            )
+            .unwrap();
+        db.set_anki_note_ids(&[(id.clone(), 1_700_000_000_123)])
+            .unwrap();
+
+        // The lookup window only knows the entry it fetched: no user state.
+        let mut again = lookup_entry("idempotent", "word", "新释义");
+        again["id"] = Value::String(id.clone());
+        again["mastery"] = Value::String("new".into());
+        again["tags"] = serde_json::json!(["ai"]);
+        again["savedAt"] = Value::String("2099-01-01T00:00:00Z".into());
+        again["sourceApp"] = Value::String("Browser".into());
+        again["context"] = Value::String("a newer sentence".into());
+        again["lookups"] = Value::from(1);
+        let merged = db.save_lookup_result(&again).unwrap();
+
+        // The content follows the newest lookup ...
+        assert_eq!(merged["translation"], "新释义");
+        assert_eq!(merged["context"], "a newer sentence");
+        // ... while everything the user owns, and the first source, is kept.
+        assert_eq!(merged["id"], id.as_str());
+        assert_eq!(merged["mastery"], "familiar");
+        assert_eq!(merged["note"], "我的笔记");
+        assert_eq!(merged["tags"], serde_json::json!(["cs", "ai"]));
+        assert_eq!(merged["savedAt"], first["savedAt"]);
+        assert_eq!(merged["sourceApp"], "Reader");
+        assert_eq!(merged["lookups"], 2);
+        assert_eq!(merged["ankiNoteId"], 1_700_000_000_123_i64);
+
+        // One row, and what was returned is what is stored.
+        assert_eq!(db.get_all_words().unwrap(), vec![merged.clone()]);
+        let box_number: i64 = db
+            .conn
+            .query_row(
+                "SELECT box FROM review_state WHERE word_id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(box_number, 3, "review progress must survive a re-lookup");
+        let anki: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT anki_note_id FROM words WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(anki.as_deref(), Some("1700000000123"));
+        let mut stmt = db
+            .conn
+            .prepare("SELECT tag FROM word_tags WHERE word_id=?1 ORDER BY tag")
+            .unwrap();
+        let tags: Vec<String> = stmt
+            .query_map(params![id], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(tags, ["ai", "cs"]);
+    }
+
+    #[test]
+    fn a_second_lookup_with_a_new_id_merges_by_normalised_lemma_and_kind() {
+        let db = new_db();
+        let first = db
+            .save_lookup_result(&lookup_entry("Hello  World", "phrase", "你好世界"))
+            .unwrap();
+        let mut again = lookup_entry(" hello world ", "phrase", "世界你好");
+        again["id"] = Value::String("w-brand-new-id".into());
+        let merged = db.save_lookup_result(&again).unwrap();
+        assert_eq!(merged["id"], first["id"]);
+        assert_eq!(merged["lemma"], "Hello  World", "stored spelling is kept");
+        assert_eq!(merged["translation"], "世界你好");
+        assert_eq!(merged["lookups"], 2);
+        assert_eq!(db.get_all_words().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn lookups_of_different_kinds_stay_separate_words() {
+        let db = new_db();
+        db.save_lookup_result(&lookup_entry("run", "word", "跑"))
+            .unwrap();
+        db.save_lookup_result(&lookup_entry("run", "sentence", "跑。"))
+            .unwrap();
+        assert_eq!(db.get_all_words().unwrap().len(), 2);
+        assert!(db
+            .find_word_by_lemma("RUN", Some("sentence"))
+            .unwrap()
+            .is_some());
+        assert!(db
+            .find_word_by_lemma("run", Some("phrase"))
+            .unwrap()
+            .is_none());
+        assert!(db.find_word_by_lemma("  Run ", None).unwrap().is_some());
+        assert!(db.find_word_by_lemma("   ", None).unwrap().is_none());
+    }
+
+    #[test]
+    fn lemma_matching_folds_non_ascii_case_like_the_importer() {
+        // SQLite's own lower() only understands ASCII, so this would have been
+        // missed by a purely SQL-side comparison.
+        let db = new_db();
+        db.save_lookup_result(&lookup_entry("Über", "word", "over"))
+            .unwrap();
+        let merged = db
+            .save_lookup_result(&lookup_entry("über", "word", "above"))
+            .unwrap();
+        assert_eq!(merged["lookups"], 2);
+        assert_eq!(db.get_all_words().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn saving_a_lookup_without_a_lemma_is_rejected_and_stores_nothing() {
+        let db = new_db();
+        assert!(db
+            .save_lookup_result(&lookup_entry("   ", "word", "x"))
+            .is_err());
+        assert!(db
+            .save_lookup_result(&serde_json::json!("not an object"))
+            .is_err());
+        assert!(db.get_all_words().unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_duplicates_resolve_to_the_earliest_saved_word() {
+        let db = new_db();
+        let mut early = sample_word("early", "Reader", "2026-08-01T10:00:00+08:00");
+        early["lemma"] = Value::String("dup".into());
+        let mut late = sample_word("late", "Reader", "2026-08-02T10:00:00+08:00");
+        late["lemma"] = Value::String("Dup".into());
+        db.save_word(&late).unwrap();
+        db.save_word(&early).unwrap();
+        let merged = db
+            .save_lookup_result(&lookup_entry("dup", "word", "新"))
+            .unwrap();
+        assert_eq!(merged["id"], "early");
+        assert_eq!(
+            db.get_all_words().unwrap().len(),
+            2,
+            "existing duplicates are never silently deleted"
+        );
+    }
+
+    #[test]
+    fn words_in_order_follow_the_request_and_skip_unknown_and_repeated_ids() {
+        let db = new_db();
+        for (id, saved_at) in [
+            ("a", "2026-08-01T10:00:00+08:00"),
+            ("b", "2026-08-02T10:00:00+08:00"),
+            ("c", "2026-08-03T10:00:00+08:00"),
+        ] {
+            db.save_word(&sample_word(id, "Reader", saved_at)).unwrap();
+        }
+        let ids: Vec<String> = ["a", "c", "missing", "b", "a"].map(String::from).to_vec();
+        assert_eq!(
+            ids_of(&db.get_words_in_order(&ids).unwrap()),
+            ["a", "c", "b"]
+        );
+        // The older helper sorts newest first, so pairing its output with the
+        // requested ids by position (what the Anki export did) mixed words up.
+        let legacy = db
+            .get_words_by_ids(&["a".to_string(), "c".to_string()])
+            .unwrap();
+        assert_eq!(ids_of(&legacy), ["c", "a"]);
+        assert!(db.get_words_in_order(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn anki_note_ids_are_stored_in_the_document_and_the_indexed_column() {
+        let db = new_db();
+        for id in ["a", "b", "c"] {
+            db.save_word(&sample_word(id, "Reader", "2026-08-01T10:00:00+08:00"))
+                .unwrap();
+        }
+        let updated = db
+            .set_anki_note_ids(&[("a".into(), 11), ("ghost".into(), 99), ("b".into(), 22)])
+            .unwrap();
+        assert_eq!(updated, 2);
+        let words = db
+            .get_words_in_order(&["a".to_string(), "b".to_string()])
+            .unwrap();
+        assert_eq!(words[0]["ankiNoteId"], 11);
+        assert_eq!(words[1]["ankiNoteId"], 22);
+        let column = |id: &str| -> Option<String> {
+            db.conn
+                .query_row(
+                    "SELECT anki_note_id FROM words WHERE id=?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(column("a").as_deref(), Some("11"));
+        assert_eq!(column("b").as_deref(), Some("22"));
+        assert_eq!(column("c"), None, "a word never sent has no link");
+        // An ordinary edit keeps the link in the document and the column.
+        db.update_word("a", &serde_json::json!({"note": "edited"}))
+            .unwrap();
+        assert_eq!(column("a").as_deref(), Some("11"));
+    }
+
+    #[test]
+    fn batch_update_changes_mastery_and_edits_tags_on_every_word() {
+        let db = new_db();
+        for (id, tags) in [
+            ("a", serde_json::json!(["x"])),
+            ("b", serde_json::json!([])),
+            ("c", serde_json::json!(["x", "y"])),
+        ] {
+            let mut word = sample_word(id, "Reader", "2026-08-01T10:00:00+08:00");
+            word["tags"] = tags;
+            db.save_word(&word).unwrap();
+        }
+        let ids: Vec<String> = ["a", "b", "c", "ghost", "a"].map(String::from).to_vec();
+        let report = db
+            .batch_update_words(
+                &ids,
+                &BatchWordPatch {
+                    mastery: Some("learning".into()),
+                    add_tags: vec![" fresh ".into(), "x".into()],
+                    remove_tags: vec!["y".into()],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            report,
+            BatchUpdateReport {
+                updated: 3,
+                missing: 1
+            }
+        );
+        let words = db
+            .get_words_in_order(&["a".to_string(), "b".to_string(), "c".to_string()])
+            .unwrap();
+        let tags: Vec<Value> = words.iter().map(|word| word["tags"].clone()).collect();
+        assert_eq!(
+            tags,
+            vec![
+                serde_json::json!(["x", "fresh"]),
+                serde_json::json!(["fresh", "x"]),
+                serde_json::json!(["x", "fresh"]),
+            ]
+        );
+        assert!(words.iter().all(|word| word["mastery"] == "learning"));
+        let mut stmt = db
+            .conn
+            .prepare("SELECT tag FROM word_tags WHERE word_id='c' ORDER BY tag")
+            .unwrap();
+        let indexed: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(indexed, ["fresh", "x"]);
+        let reviews: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM review_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(reviews, 3, "batch edits must not reset review state");
+    }
+
+    #[test]
+    fn batch_mastery_change_leaves_tags_untouched() {
+        let db = new_db();
+        let mut word = sample_word("a", "Reader", "2026-08-01T10:00:00+08:00");
+        word["tags"] = serde_json::json!(["  spaced ", "dup", "dup"]);
+        db.save_word(&word).unwrap();
+        db.batch_update_words(
+            &["a".to_string()],
+            &BatchWordPatch {
+                mastery: Some("mastered".into()),
+                ..BatchWordPatch::default()
+            },
+        )
+        .unwrap();
+        let stored = db.get_words_in_order(&["a".to_string()]).unwrap();
+        assert_eq!(stored[0]["mastery"], "mastered");
+        assert_eq!(stored[0]["tags"], word["tags"]);
+    }
+
+    #[test]
+    fn batch_update_rejects_bad_patches_before_touching_any_word() {
+        let db = new_db();
+        db.save_word(&sample_word("a", "Reader", "2026-08-01T10:00:00+08:00"))
+            .unwrap();
+        let ids = vec!["a".to_string()];
+        let bad_patches = [
+            BatchWordPatch {
+                mastery: Some("expert".into()),
+                ..BatchWordPatch::default()
+            },
+            BatchWordPatch::default(),
+            BatchWordPatch {
+                add_tags: vec!["x".repeat(33)],
+                ..BatchWordPatch::default()
+            },
+            BatchWordPatch {
+                add_tags: (0..21).map(|n| format!("t{n}")).collect(),
+                ..BatchWordPatch::default()
+            },
+        ];
+        for patch in &bad_patches {
+            assert!(db.batch_update_words(&ids, patch).is_err(), "{patch:?}");
+        }
+        let stored = db.get_words_in_order(&ids).unwrap();
+        assert_eq!(stored[0]["mastery"], "new");
+        assert_eq!(stored[0]["tags"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn deleting_words_removes_their_tags_and_review_state_together() {
+        let db = new_db();
+        for id in ["a", "b", "c"] {
+            let mut word = sample_word(id, "Reader", "2026-08-01T10:00:00+08:00");
+            word["tags"] = serde_json::json!(["t"]);
+            db.save_word(&word).unwrap();
+        }
+        db.delete_words(&["a".to_string(), "b".to_string(), "ghost".to_string()])
+            .unwrap();
+        assert_eq!(ids_of(&db.get_all_words().unwrap()), ["c"]);
+        let count = |table: &str| -> i64 {
+            db.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(count("word_tags"), 1);
+        assert_eq!(count("review_state"), 1);
+    }
+
+    fn new_db() -> Database {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        db
+    }
+
+    /// What the lookup window hands over: the entry content, no user state.
+    fn lookup_entry(lemma: &str, kind: &str, translation: &str) -> Value {
+        serde_json::json!({
+            "selection": lemma,
+            "lemma": lemma,
+            "translation": translation,
+            "pos": "n.",
+            "contextMeaning": "context meaning",
+            "explanation": "explanation",
+            "kind": kind,
+            "sourceApp": "Reader",
+            "sourceTitle": "Doc",
+            "context": "context",
+            "tags": [],
+            "examples": [],
+            "associations": [],
+            "senses": [],
+            "collocations": []
+        })
+    }
+
+    fn ids_of(words: &[Value]) -> Vec<String> {
+        words
+            .iter()
+            .map(|word| word["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn importing_thousands_of_rows_stays_fast() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        const EXISTING: usize = 3_000;
+        const ROWS: usize = 3_000;
+        {
+            let tx = db.conn.unchecked_transaction().unwrap();
+            for index in 0..EXISTING {
+                let word = sample_word(
+                    &format!("seed{index}"),
+                    "Reader",
+                    "2026-08-01T10:00:00+08:00",
+                );
+                save_word_with_connection(&tx, &word, false).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        // Even rows hit an existing word (case-insensitively), odd rows are new.
+        let mut csv = String::from("lemma,translation\n");
+        for index in 0..ROWS {
+            if index % 2 == 0 {
+                csv.push_str(&format!("SEED{index},合并{index}\n"));
+            } else {
+                csv.push_str(&format!("fresh{index},新词{index}\n"));
+            }
+        }
+        let mapping = [
+            ("lemma".to_string(), "lemma".to_string()),
+            ("translation".to_string(), "translation".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let started = std::time::Instant::now();
+        let result = db.import_words(&csv, "csv", &mapping).unwrap();
+        let elapsed = started.elapsed();
+        // A quadratic lemma lookup took ~10 s for this size; the hash index
+        // needs well under a second. The budget leaves room for slow CI hosts.
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "importing {ROWS} rows into {EXISTING} words took {elapsed:?}"
+        );
+        assert_eq!(result.merged as usize, ROWS / 2);
+        assert_eq!(result.inserted as usize, ROWS / 2);
+        assert_eq!(db.get_all_words().unwrap().len(), EXISTING + ROWS / 2);
     }
 
     #[test]

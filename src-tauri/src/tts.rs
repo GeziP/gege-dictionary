@@ -145,15 +145,11 @@ fn start(text: &str, voice: &str, rate: f64) -> Result<Option<u64>, String> {
         return Ok(None);
     };
     let mut command = speak_command(&text, voice, rate);
-    let mut slot = PLAYBACK
-        .lock()
-        .map_err(|_| "朗读状态不可用".to_string())?;
+    let mut slot = PLAYBACK.lock().map_err(|_| "朗读状态不可用".to_string())?;
     if let Some(mut previous) = slot.take() {
         let _ = previous.child.kill();
     }
-    let child = command
-        .spawn()
-        .map_err(|e| format!("TTS 启动失败: {e}"))?;
+    let child = command.spawn().map_err(|e| format!("TTS 启动失败: {e}"))?;
     let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
     *slot = Some(Playback { token, child });
     Ok(Some(token))
@@ -169,9 +165,7 @@ pub fn speak_blocking(text: &str, voice: &str, rate: f64) -> Result<(), String> 
     };
     loop {
         std::thread::sleep(POLL_INTERVAL);
-        let mut slot = PLAYBACK
-            .lock()
-            .map_err(|_| "朗读状态不可用".to_string())?;
+        let mut slot = PLAYBACK.lock().map_err(|_| "朗读状态不可用".to_string())?;
         let state = match slot.as_mut() {
             Some(playback) if playback.token == token => playback.child.try_wait(),
             // Superseded by a newer request or stopped explicitly.
@@ -308,7 +302,10 @@ mod tests {
             );
         }
         for placeholder in ["{text}", "{voice}", "{rate}", "{0}", "{1}"] {
-            assert!(!SPEAK_SCRIPT.contains(placeholder), "template marker {placeholder}");
+            assert!(
+                !SPEAK_SCRIPT.contains(placeholder),
+                "template marker {placeholder}"
+            );
             assert!(!LIST_VOICES_SCRIPT.contains(placeholder));
         }
     }

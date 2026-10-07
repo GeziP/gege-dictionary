@@ -256,13 +256,39 @@ async fn search_words(
     )
 }
 
+/// Saves the outcome of a lookup. A word that is already in the library is
+/// merged with it (the user's mastery, note, tags and Anki link survive) rather
+/// than overwritten, and the document as stored is returned.
 #[tauri::command]
 async fn save_word(
     state: tauri::State<'_, AppState>,
     word: serde_json::Value,
-) -> Result<(), String> {
+) -> Result<serde_json::Value, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.save_word(&word)
+    db.save_lookup_result(&word)
+}
+
+/// The saved word for a lemma (case/whitespace-insensitive), if any. Lets the
+/// lookup window ask about one word instead of loading the whole library.
+#[tauri::command]
+async fn find_word_by_lemma(
+    state: tauri::State<'_, AppState>,
+    lemma: String,
+    kind: Option<String>,
+) -> Result<Option<serde_json::Value>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.find_word_by_lemma(&lemma, kind.as_deref())
+}
+
+/// One transactional change (mastery, tags to add/remove) for many words.
+#[tauri::command]
+async fn batch_update_words(
+    state: tauri::State<'_, AppState>,
+    ids: Vec<String>,
+    patch: db::BatchWordPatch,
+) -> Result<db::BatchUpdateReport, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.batch_update_words(&ids, &patch)
 }
 
 #[tauri::command]
@@ -1132,15 +1158,37 @@ async fn send_words_to_anki(
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let settings = db.get_settings()?;
         let config = anki::AnkiConfig::from_settings(&settings);
-        let words = db.get_words_by_ids(&ids)?;
-        let items = ids
+        // Pair every word with its *own* id. The words found need not line up
+        // with `ids` (unknown ids are skipped and the library sorts by date),
+        // and the note ids Anki reports are saved under whichever id sits in
+        // the pair, so pairing by position wrote them onto the wrong words.
+        let items = db
+            .get_words_in_order(&ids)?
             .into_iter()
-            .zip(words.into_iter())
+            .filter_map(|word| {
+                let id = word.get("id")?.as_str()?.to_string();
+                Some((id, word))
+            })
             .collect::<Vec<(String, serde_json::Value)>>();
         (config, items)
     };
-    let report = anki::send_words(&config, &items).await?;
+    if items.is_empty() {
+        return Err("没有可发送的词条：所选词条不存在或已被删除".into());
+    }
+    let mut report = anki::send_words(&config, &items).await?;
     if let Ok(db) = state.db.lock() {
+        // Remember which note each word became, so sending it again is
+        // recognised as a duplicate. One transaction for the whole batch, and
+        // a failure is reported instead of silently dropped.
+        let pairs = anki_note_pairs(&report);
+        if !pairs.is_empty() {
+            if let Err(error) = db.set_anki_note_ids(&pairs) {
+                push_report_error(
+                    &mut report,
+                    format!("已发送到 Anki，但未能记录笔记 ID，再次发送可能产生重复: {error}"),
+                );
+            }
+        }
         let added = report.get("added").and_then(|v| v.as_u64()).unwrap_or(0);
         if added > 0 {
             let _ = db.record_local_event("anki_send_ok", &serde_json::json!({ "count": added }));
@@ -1153,27 +1201,39 @@ async fn send_words_to_anki(
                 );
             }
         }
-        // Persist Anki note ids onto local words for re-send dedup.
-        if let Some(results) = report.get("results").and_then(|v| v.as_array()) {
-            for item in results {
-                let (Some(word_id), Some(note_id)) = (
-                    item.get("wordId").and_then(|v| v.as_str()),
-                    item.get("noteId").and_then(|v| v.as_i64()),
-                ) else {
-                    continue;
-                };
-                if let Ok(list) = db.get_words_by_ids(&[word_id.to_string()]) {
-                    if let Some(mut word) = list.into_iter().next() {
-                        if let Some(obj) = word.as_object_mut() {
-                            obj.insert("ankiNoteId".into(), serde_json::json!(note_id));
-                        }
-                        let _ = db.save_word(&word);
-                    }
-                }
-            }
-        }
     }
     Ok(report)
+}
+
+/// The `(wordId, noteId)` pairs of an Anki send report; entries Anki gave no
+/// note id for (failures) are left out.
+fn anki_note_pairs(report: &serde_json::Value) -> Vec<(String, i64)> {
+    report
+        .get("results")
+        .and_then(|results| results.as_array())
+        .map(|results| {
+            results
+                .iter()
+                .filter_map(|item| {
+                    Some((
+                        item.get("wordId")?.as_str()?.to_string(),
+                        item.get("noteId")?.as_i64()?,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn push_report_error(report: &mut serde_json::Value, message: String) {
+    if let Some(object) = report.as_object_mut() {
+        let errors = object
+            .entry("errors")
+            .or_insert_with(|| serde_json::json!([]));
+        if let Some(list) = errors.as_array_mut() {
+            list.push(serde_json::Value::String(message));
+        }
+    }
 }
 
 fn setup_tray(
@@ -1615,6 +1675,8 @@ pub fn run() {
             get_all_words,
             search_words,
             save_word,
+            find_word_by_lemma,
+            batch_update_words,
             update_word,
             delete_words,
             get_review_queue,
@@ -1772,6 +1834,34 @@ mod tests {
         );
         PRAGMA user_version = 0;
     "#;
+
+    #[test]
+    fn anki_note_pairs_keep_only_results_that_have_a_note_id() {
+        let report = serde_json::json!({
+            "added": 2,
+            "errors": [],
+            "results": [
+                { "wordId": "a", "noteId": 11, "lemma": "a", "status": "added" },
+                { "wordId": "b", "noteId": null, "lemma": "b", "status": "failed" },
+                { "noteId": 33 },
+                { "wordId": "d", "noteId": 44 }
+            ]
+        });
+        assert_eq!(
+            anki_note_pairs(&report),
+            vec![("a".to_string(), 11), ("d".to_string(), 44)]
+        );
+        assert!(anki_note_pairs(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn report_errors_are_appended_even_when_the_report_had_none() {
+        let mut report = serde_json::json!({ "added": 1 });
+        push_report_error(&mut report, "first".into());
+        push_report_error(&mut report, "second".into());
+        assert_eq!(report["errors"], serde_json::json!(["first", "second"]));
+        assert_eq!(report["added"], 1);
+    }
 
     #[test]
     fn cache_normalization_preserves_sentence_case() {
