@@ -5,16 +5,17 @@ mod db;
 #[cfg(windows)]
 mod dpapi;
 mod glossary;
+mod insights;
 mod llm;
 mod lookup;
 mod migrations;
 mod ocr;
 mod tts;
+mod watch_switch;
 mod word_import;
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{
@@ -24,12 +25,38 @@ use tauri::{
     AppHandle, Manager,
 };
 
+/// Puts the position of the "划词即查" switch (`true` is on) on the tray menu's check mark.
+type WatchMarker = Arc<dyn Fn(bool) + Send + Sync>;
+
 pub(crate) struct AppState {
     pub db: Mutex<db::Database>,
     pub last_capture: Mutex<Option<serde_json::Value>>,
-    pub clipboard_enabled: Arc<AtomicBool>,
+    /// "划词即查" on or off, and the pause that can be running on it.
+    pub watch: watch_switch::WatchSwitch,
+    /// Set once the tray exists. It is a closure, not the menu item itself: the item carries
+    /// the whole Tauri runtime with it, which would make every test binary load the system
+    /// dialogs (and fail to start without the manifest an installed app has).
+    pub show_watch_mark: Mutex<Option<WatchMarker>>,
     pub last_looked_up: Mutex<Option<clipboard_watcher::ClipboardFingerprint>>,
     pub startup_warnings: Mutex<Vec<db::StartupWarning>>,
+}
+
+impl AppState {
+    /// Makes the tray menu's check mark say where the "划词即查" switch is. Clicking the item
+    /// flips the mark by itself, but nothing else does (a pause, the settings page), and
+    /// `AppHandle::menu` is the app-wide menu, not the tray's.
+    pub(crate) fn show_watch_state(&self) {
+        // Cloned out of the lock first: setting the mark waits for the UI thread, which may
+        // itself be waiting for this lock.
+        let show = self
+            .show_watch_mark
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(show) = show {
+            show(self.watch.is_on());
+        }
+    }
 }
 
 fn default_data_dir_from(app_data: Option<PathBuf>, known_data_dir: Option<PathBuf>) -> PathBuf {
@@ -351,6 +378,16 @@ async fn submit_review(
         serde_json::json!({ "result": if correct { "correct" } else { "wrong" } }),
     );
     Ok(result)
+}
+
+/// Streak, activity chart, mastery and review figures, and a few short rankings.
+#[tauri::command]
+async fn get_learning_insights(
+    state: tauri::State<'_, AppState>,
+    days: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.learning_insights(days.unwrap_or(30))
 }
 
 #[tauri::command]
@@ -987,15 +1024,14 @@ async fn save_file_dialog(
 
 #[tauri::command]
 async fn toggle_clipboard_watch(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    let prev = state.clipboard_enabled.load(Ordering::Relaxed);
-    let next = !prev;
-    state.clipboard_enabled.store(next, Ordering::Relaxed);
-    Ok(next)
+    let on = state.watch.toggle();
+    state.show_watch_state();
+    Ok(on)
 }
 
 #[tauri::command]
 async fn get_clipboard_watch_status(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    Ok(state.clipboard_enabled.load(Ordering::Relaxed))
+    Ok(state.watch.is_on())
 }
 
 #[tauri::command]
@@ -1302,19 +1338,25 @@ fn push_report_error(report: &mut serde_json::Value, message: String) {
     }
 }
 
-fn setup_tray(
-    app: &tauri::App,
-    clipboard_enabled: Arc<AtomicBool>,
-    ocr_enabled: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+/// How long "暂停 30 分钟" in the tray menu pauses the clipboard watcher.
+const PAUSE_MINUTES: u64 = 30;
+
+fn setup_tray(app: &tauri::App, ocr_enabled: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let state = app.state::<AppState>();
     let watch_item = CheckMenuItem::with_id(
         app,
         "watch",
         "划词即查",
         true,
-        clipboard_enabled.load(Ordering::Relaxed),
+        state.watch.is_on(),
         None::<&str>,
     )?;
+    if let Ok(mut slot) = state.show_watch_mark.lock() {
+        let mark = watch_item.clone();
+        *slot = Some(Arc::new(move |on| {
+            let _ = mark.set_checked(on);
+        }));
+    }
     let pause30_item = MenuItem::with_id(app, "pause30", "暂停 30 分钟", true, None::<&str>)?;
     let lookup_item =
         MenuItem::with_id(app, "lookup_clip", "查词（读取剪贴板）", true, None::<&str>)?;
@@ -1340,46 +1382,42 @@ fn setup_tray(
     let icon_bytes = include_bytes!("../icons/icon.png");
     let icon = Image::from_bytes(icon_bytes)?;
 
-    let cb_flag = clipboard_enabled.clone();
     let _tray = TrayIconBuilder::new()
         .icon(icon)
         .menu(&menu)
         .tooltip("鸽鸽词典 — 复制英文即查词")
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "watch" => {
-                let prev = cb_flag.load(Ordering::Relaxed);
-                let next = !prev;
-                cb_flag.store(next, Ordering::Relaxed);
-                if let Some(item) = app.menu().and_then(|m| m.get("watch")) {
-                    let check = item.as_check_menuitem_unchecked();
-                    let _ = check.set_checked(next);
-                }
                 let state = app.state::<AppState>();
+                let on = state.watch.toggle();
+                // The click has flipped the check mark already; this makes it say what the
+                // switch says, which differs while a pause is running.
+                state.show_watch_state();
                 if let Ok(db) = state.db.lock() {
                     if let Ok(mut settings) = db.get_settings() {
                         if let Some(root) = settings.as_object_mut() {
-                            root.insert("clipboardWatch".into(), serde_json::Value::Bool(next));
+                            root.insert("clipboardWatch".into(), serde_json::Value::Bool(on));
                         }
                         let _ = db.save_settings(&settings);
                     }
                 };
             }
             "pause30" => {
-                cb_flag.store(false, Ordering::Relaxed);
-                if let Some(item) = app.menu().and_then(|m| m.get("watch")) {
-                    let check = item.as_check_menuitem_unchecked();
-                    let _ = check.set_checked(false);
+                let state = app.state::<AppState>();
+                // A pause is not remembered across restarts, and nothing is paused when the
+                // user has turned the watcher off.
+                if let Some(mark) = state.watch.pause() {
+                    state.show_watch_state();
+                    let app_handle = app.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(PAUSE_MINUTES * 60));
+                        let state = app_handle.state::<AppState>();
+                        // Only if the user has not touched the switch (or paused again) since.
+                        if state.watch.end_pause(mark) {
+                            state.show_watch_state();
+                        }
+                    });
                 }
-                let flag = cb_flag.clone();
-                let app_handle = app.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_secs(30 * 60));
-                    flag.store(true, Ordering::Relaxed);
-                    if let Some(item) = app_handle.menu().and_then(|m| m.get("watch")) {
-                        let check = item.as_check_menuitem_unchecked();
-                        let _ = check.set_checked(true);
-                    }
-                });
             }
             "lookup_clip" => {
                 let state = app.state::<AppState>();
@@ -1498,8 +1536,9 @@ fn resolve_startup_data_dir(
         let choice = rfd::MessageDialog::new()
             .set_title("鸽鸽词典数据目录不可用")
             .set_description(format!(
-                "已配置的数据目录不存在或无法访问：{}\n\n选择“是”重试，“否”重新定位已有 gege.db，“取消”退出或重置到默认目录。",
-                format!("{} {}", configured_dir.display(), configured_error)
+                "已配置的数据目录不存在或无法访问：{} {}\n\n选择“是”重试，“否”重新定位已有 gege.db，“取消”退出或重置到默认目录。",
+                configured_dir.display(),
+                configured_error
             ))
             .set_buttons(rfd::MessageButtons::YesNoCancel)
             .show();
@@ -1721,7 +1760,6 @@ pub fn run() {
         .ok()
         .and_then(|settings| settings.get("clipboardWatch").and_then(|v| v.as_bool()))
         .unwrap_or(true);
-    let clipboard_enabled = Arc::new(AtomicBool::new(clipboard_watch_enabled));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
@@ -1733,7 +1771,8 @@ pub fn run() {
         .manage(AppState {
             db: Mutex::new(database),
             last_capture: Mutex::new(None),
-            clipboard_enabled: clipboard_enabled.clone(),
+            watch: watch_switch::WatchSwitch::new(clipboard_watch_enabled),
+            show_watch_mark: Mutex::new(None),
             last_looked_up: Mutex::new(None),
             startup_warnings: Mutex::new(startup_warnings),
         })
@@ -1753,6 +1792,7 @@ pub fn run() {
             get_review_queue,
             submit_review,
             get_review_stats,
+            get_learning_insights,
             reset_review_state,
             add_words_to_review,
             get_reading_sessions,
@@ -1811,7 +1851,6 @@ pub fn run() {
             apply_ocr_hotkey_from_settings,
         ])
         .setup(move |app| {
-            let cb = clipboard_enabled.clone();
             let ocr_enabled = app
                 .state::<AppState>()
                 .db
@@ -1820,7 +1859,7 @@ pub fn run() {
                 .and_then(|db| db.get_settings().ok())
                 .map(|settings| ocr_settings(&settings).0)
                 .unwrap_or(true);
-            setup_tray(app, cb.clone(), ocr_enabled)?;
+            setup_tray(app, ocr_enabled)?;
             let _ = apply_ocr_hotkey(app.handle());
             let minimized = std::env::args().any(|arg| arg == "--minimized");
             if let Some(window) = app.get_webview_window("main") {
@@ -1866,7 +1905,10 @@ pub fn run() {
                     check_auto_backup(&backup_handle);
                 }
             });
-            clipboard_watcher::start(app.app_handle().clone(), cb);
+            clipboard_watcher::start(
+                app.app_handle().clone(),
+                app.state::<AppState>().watch.flag(),
+            );
             Ok(())
         })
         .on_window_event(|window, event| {

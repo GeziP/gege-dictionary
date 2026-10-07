@@ -4,6 +4,7 @@ import type {
   GlossaryImportReport,
   GlossaryPage,
   GlossaryTerm,
+  LearningInsights,
   LookupHistoryItem,
   PromptTemplate,
   ReadingSession,
@@ -110,6 +111,11 @@ export async function submitReview(wordId: string, correct: boolean): Promise<Re
 
 export async function getReviewStats(): Promise<ReviewStats> {
   return invoke<ReviewStats>('get_review_stats');
+}
+
+/** Streak, activity chart, mastery and review figures for the last `days` days (7 to 90). */
+export async function getLearningInsights(days: number): Promise<LearningInsights> {
+  return invoke<LearningInsights>('get_learning_insights', { days });
 }
 
 export async function resetReviewState(wordId: string): Promise<void> {

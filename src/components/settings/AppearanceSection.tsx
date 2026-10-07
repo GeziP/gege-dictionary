@@ -1,7 +1,9 @@
-import React from 'react';
-import { MonitorIcon, MoonIcon, SunIcon, Volume2Icon } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { MonitorIcon, MoonIcon, SquareIcon, SunIcon, Volume2Icon } from 'lucide-react';
 import { useLexNote } from '../../contexts/LexNoteContext';
 import { useSpeech } from '../../hooks/useSpeech';
+import * as bridge from '../../lib/tauri-bridge';
+import { installedVoiceFor, voiceLabel } from '../../lib/voices';
 import { Button } from '../ui/Button';
 import { Select } from '../ui/Select';
 import { SettingsSection } from './SettingsSection';
@@ -19,15 +21,54 @@ const SCALES = [
 { value: 'large' as const, label: '大字号' }];
 
 
-const VOICES = [
-'Microsoft Zira - English (United States)',
-'Microsoft David - English (United States)',
-'Microsoft Hazel - English (United Kingdom)'];
+const PREVIEW_TEXT = 'The protocol degenerates into a livelock.';
 
+/** "Choose for me": the speech engine takes an English voice, whatever language Windows speaks. */
+const AUTOMATIC_VOICE = { value: '', label: '自动（优先英语语音）' };
 
 export function AppearanceSection() {
   const { settings, updateSettings } = useLexNote();
   const { speak } = useSpeech(settings.ttsRate);
+  const [voices, setVoices] = useState<string[]>([]);
+  const [voicesError, setVoicesError] = useState<string | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+
+  // The voices that are really installed, not a list that may name voices this PC does not have.
+  useEffect(() => {
+    if (!bridge.isTauri()) return;
+    let active = true;
+    bridge
+      .listVoices()
+      .then((installed) => {
+        if (active) setVoices(installed);
+      })
+      .catch((error) => {
+        if (active) setVoicesError(String(error));
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // The preview goes through the same engine, voice and speed as the reading in the cards.
+  const preview = () => {
+    setPreviewError(null);
+    if (previewing) {
+      void bridge.stopSpeaking().catch(() => undefined);
+      return;
+    }
+    if (!bridge.isTauri()) {
+      speak(PREVIEW_TEXT, 'preview');
+      return;
+    }
+    setPreviewing(true);
+    // Settles when playback has ended, or has been stopped.
+    bridge
+      .speakText(PREVIEW_TEXT, settings.ttsVoice, settings.ttsRate)
+      .catch((error) => setPreviewError(String(error)))
+      .finally(() => setPreviewing(false));
+  };
 
   return (
     <div className="space-y-3">
@@ -92,9 +133,9 @@ export function AppearanceSection() {
           <label className="block">
             <span className="mb-1 block text-[11px] text-ink-muted">语音</span>
             <Select
-              value={settings.ttsVoice}
+              value={installedVoiceFor(settings.ttsVoice, voices)}
               onChange={(event) => updateSettings({ ttsVoice: event.target.value })}
-              options={VOICES.map((voice) => ({ value: voice, label: voice.replace('Microsoft ', '') }))} />
+              options={[AUTOMATIC_VOICE, ...voices.map((voice) => ({ value: voice, label: voiceLabel(voice) }))]} />
             
           </label>
           <label className="block">
@@ -110,14 +151,24 @@ export function AppearanceSection() {
             
           </label>
         </div>
-        <Button
-          className="mt-3"
-          size="sm"
-          icon={<Volume2Icon size={13} />}
-          onClick={() => speak('The protocol degenerates into a livelock.', 'preview')}>
-          
-          试听
-        </Button>
+        {voicesError ? (
+          <p role="alert" className="mt-2 text-[11px] text-danger">
+            无法读取已安装的语音：{voicesError}
+          </p>
+        ) : null}
+        <div className="mt-3 flex items-center gap-3">
+          <Button
+            size="sm"
+            icon={previewing ? <SquareIcon size={12} fill="currentColor" /> : <Volume2Icon size={13} />}
+            onClick={preview}>
+            {previewing ? '停止' : '试听'}
+          </Button>
+          {previewError ? (
+            <p role="alert" className="min-w-0 truncate text-[11px] text-danger" title={previewError}>
+              试听失败：{previewError}
+            </p>
+          ) : null}
+        </div>
       </SettingsSection>
     </div>);
 

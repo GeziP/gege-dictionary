@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom';
 import { BookmarkCheckIcon, SearchIcon, Trash2Icon, XIcon } from 'lucide-react';
 import { useLexNote } from '../../contexts/LexNoteContext';
+import { useRefreshWhenActive } from '../../hooks/useRefreshWhenActive';
 import * as bridge from '../../lib/tauri-bridge';
 import {
   filterHistory,
@@ -66,26 +67,8 @@ export function HistoryTab() {
 
   useEffect(() => {
     void load();
-    const onFocus = () => void load();
-    window.addEventListener('focus', onFocus);
-
-    // A lookup made in another window finishes after it was recorded, so this is the moment to read.
-    let stop: (() => void) | undefined;
-    let disposed = false;
-    bridge
-      .listenLookupDone(() => void load())
-      .then((unlisten) => {
-        if (disposed) unlisten();
-        else stop = unlisten;
-      })
-      .catch((error) => console.error('Failed to listen for finished lookups:', error));
-
-    return () => {
-      disposed = true;
-      window.removeEventListener('focus', onFocus);
-      stop?.();
-    };
   }, [load]);
+  useRefreshWhenActive(load);
 
   const savedKeys = useMemo(() => savedLookupKeys(words), [words]);
   const visible = useMemo(() => filterHistory(items ?? [], query), [items, query]);

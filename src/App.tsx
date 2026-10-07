@@ -11,6 +11,7 @@ const Settings = React.lazy(() => import('./pages/Settings').then(({ Settings: p
 const Onboarding = React.lazy(() => import('./pages/Onboarding').then(({ Onboarding: page }) => ({ default: page })));
 const Lookup = React.lazy(() => import('./pages/Lookup').then(({ Lookup: page }) => ({ default: page })));
 const Review = React.lazy(() => import('./pages/Review').then(({ Review: page }) => ({ default: page })));
+const Insights = React.lazy(() => import('./pages/Insights').then(({ Insights: page }) => ({ default: page })));
 const OcrSelect = React.lazy(() => import('./pages/OcrSelect').then(({ OcrSelect: page }) => ({ default: page })));
 
 function RouteLoading() {
@@ -85,6 +86,7 @@ function MainRouter() {
         <Route path="/library" element={<Library />} />
         <Route path="/settings" element={<Settings />} />
         <Route path="/review" element={<Review />} />
+        <Route path="/insights" element={<Insights />} />
         <Route path="/onboarding" element={<Navigate to="/library" replace />} />
         <Route path="/lookup" element={<Lookup />} />
         <Route path="*" element={<Navigate to="/library" replace />} />
@@ -100,7 +102,7 @@ function StartupWarningsBanner() {
     <div
       role="status"
       aria-live="polite"
-      className="fixed inset-x-3 top-3 z-50 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-[11px] text-ink shadow-window"
+      className="fixed inset-x-3 top-3 z-50 rounded-md border border-warn bg-surface px-3 py-2 text-[11px] text-ink shadow-window"
     >
       <p className="font-medium text-ink">启动警告</p>
       <ul className="mt-1 list-disc space-y-0.5 pl-4">

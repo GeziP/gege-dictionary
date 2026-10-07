@@ -28,6 +28,13 @@ const ENV_TEXT: &str = "GEGE_TTS_TEXT";
 const ENV_VOICE: &str = "GEGE_TTS_VOICE";
 const ENV_RATE: &str = "GEGE_TTS_RATE";
 
+/// Reads `GEGE_TTS_TEXT` aloud with the voice `GEGE_TTS_VOICE` names.
+///
+/// The voice is the first enabled one whose name contains the requested text, and when
+/// there is no such voice an English one: the system default can be a Chinese voice
+/// (the only one a Chinese Windows ships with), which cannot pronounce English words.
+/// No `#` comments in here: the script travels as one `-Command` argument, and a comment
+/// would swallow the rest of it if the line breaks were ever lost on the way.
 const SPEAK_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Speech
@@ -35,12 +42,11 @@ $s = New-Object System.Speech.Synthesis.SpeechSynthesizer
 try {
   $want = $env:GEGE_TTS_VOICE
   if ([string]::IsNullOrWhiteSpace($want)) { $want = 'Zira' }
-  foreach ($v in $s.GetInstalledVoices()) {
-    if ($v.VoiceInfo.Name.IndexOf($want, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-      $s.SelectVoice($v.VoiceInfo.Name)
-      break
-    }
-  }
+  $voices = @($s.GetInstalledVoices() | Where-Object { $_.Enabled })
+  $pick = $voices | Where-Object { $_.VoiceInfo.Name.IndexOf($want, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 } | Select-Object -First 1
+  if (-not $pick) { $pick = $voices | Where-Object { $_.VoiceInfo.Culture.Name -eq 'en-US' } | Select-Object -First 1 }
+  if (-not $pick) { $pick = $voices | Where-Object { $_.VoiceInfo.Culture.TwoLetterISOLanguageName -eq 'en' } | Select-Object -First 1 }
+  if ($pick) { $s.SelectVoice($pick.VoiceInfo.Name) }
 } catch {}
 $s.Rate = [int]$env:GEGE_TTS_RATE
 $s.Speak($env:GEGE_TTS_TEXT)
@@ -65,7 +71,7 @@ static PLAYBACK: Mutex<Option<Playback>> = Mutex::new(None);
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 static VOICES: OnceLock<Vec<String>> = OnceLock::new();
 
-fn powershell(script: &'static str) -> Command {
+fn powershell(script: &str) -> Command {
     let mut command = Command::new("powershell");
     command.args([
         "-NoProfile",
@@ -332,6 +338,67 @@ mod tests {
             assert_eq!(echoed, hex(&payload), "payload was altered: {payload}");
             assert!(!echoed.contains("INJECTED"));
         }
+    }
+
+    /// The speech script's voice choice, run against the voices really installed on this
+    /// machine (the script is cut off before it sets the rate, so nothing is spoken):
+    /// a voice that exists is used, and one that does not gives an English voice, not the
+    /// system default, which on a Chinese Windows is a Chinese voice.
+    #[cfg(windows)]
+    #[test]
+    fn voice_choice_honours_the_named_voice_and_otherwise_prefers_english() {
+        const REPORT: &str = "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; \
+            try { $s.Voice.Name + '|' + $s.Voice.Culture.TwoLetterISOLanguageName + '|' + \
+            @($s.GetInstalledVoices() | Where-Object { $_.Enabled -and $_.VoiceInfo.Culture.TwoLetterISOLanguageName -eq 'en' }).Count + '|' + \
+            (($s.GetInstalledVoices() | Where-Object { $_.Enabled } | ForEach-Object { $_.VoiceInfo.Name }) -join ';') } \
+            catch { '||0|' }";
+        let (choice, _) = SPEAK_SCRIPT
+            .split_once("$s.Rate")
+            .expect("the voice is chosen before the rate is set");
+        let probe = format!("{choice}\n{REPORT}");
+        // [voice name, its language, how many English voices there are, enabled voices]
+        let run = |voice: &str| -> Vec<String> {
+            let output = powershell(&probe)
+                .env(ENV_VOICE, voice)
+                .output()
+                .expect("powershell should start");
+            assert!(
+                output.status.success(),
+                "voice probe failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let line = String::from_utf8_lossy(&output.stdout)
+                .trim_start_matches('\u{feff}')
+                .trim()
+                .to_string();
+            let parts: Vec<String> = line.splitn(4, '|').map(str::to_string).collect();
+            assert_eq!(parts.len(), 4, "unexpected probe output: {line:?}");
+            parts
+        };
+
+        let unknown = run("no-such-voice-for-gege");
+        let enabled: Vec<&str> = unknown[3]
+            .split(';')
+            .filter(|name| !name.is_empty())
+            .collect();
+        let Some(&wanted) = enabled.last() else {
+            return; // No speech voices here: nothing to choose between.
+        };
+        let english: usize = unknown[2].parse().expect("the English voice count");
+        if english > 0 {
+            assert_eq!(
+                unknown[1], "en",
+                "an unknown voice should give an English voice, not {:?}",
+                unknown[0]
+            );
+        }
+
+        let named = run(wanted);
+        assert!(
+            named[0].contains(wanted),
+            "asked for {wanted:?}, got {:?}",
+            named[0]
+        );
     }
 
     #[test]
