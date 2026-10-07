@@ -125,6 +125,8 @@ interface LexNoteValue {
   updateSettings: (patch: SettingsPatch) => void;
   /** Saves a lookup; resolves with the word as stored (merged with an existing one). */
   saveWord: (word: SavedWord) => Promise<SavedWord>;
+  /** Puts a word back exactly as given, with nothing merged (the undo of a save). */
+  restoreWord: (word: SavedWord) => Promise<void>;
   removeWords: (ids: string[]) => void;
   updateWord: (id: string, patch: Partial<SavedWord>) => void;
   tagWords: (ids: string[], tags: string[]) => void;
@@ -340,6 +342,16 @@ export function LexNoteProvider({
       setWords((prev) => upsertSavedWord(prev, stored));
       bridge.emitWordSaved().catch(console.error);
       return stored;
+    },
+    [isTauri]
+  );
+
+  const restoreWord = useCallback(
+    async (word: SavedWord): Promise<void> => {
+      // Like saveWord, the screen only changes once the backend has agreed.
+      if (isTauri) await bridge.restoreWord(word);
+      setWords((prev) => upsertSavedWord(prev, word));
+      if (isTauri) bridge.emitWordSaved().catch(console.error);
     },
     [isTauri]
   );
@@ -616,6 +628,7 @@ export function LexNoteProvider({
     setOnboarded,
     updateSettings,
     saveWord,
+    restoreWord,
     removeWords,
     updateWord,
     tagWords,

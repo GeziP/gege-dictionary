@@ -1,24 +1,25 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
   AlignJustifyIcon,
   CheckIcon,
   ListIcon,
-  LoaderIcon,
   MinusIcon,
   PlusIcon,
-  RotateCcwIcon,
   SparklesIcon,
   Trash2Icon,
   XIcon,
 } from 'lucide-react';
 import { useLexNote } from '../../contexts/LexNoteContext';
+import { useReanalysis } from '../../hooks/useReanalysis';
 import type { Mastery, SavedWord } from '../../types/lexnote';
 import { classNames, relativeTime } from '../../utils/format';
 import { Button } from '../ui/Button';
 import { Chip } from '../ui/Chip';
 import { SpeakButton } from '../card/SpeakButton';
 import { EditableText } from './EditableText';
+import { ReanalysisBanner } from './ReanalysisBanner';
 import { RichText } from '../ui/RichText';
 import { DomainAnalysis } from '../domain/DomainAnalysis';
 import * as bridge from '../../lib/tauri-bridge';
@@ -49,9 +50,9 @@ export function WordDetail({
   fontSize?: number;
 }) {
   const { updateWord, removeWords, settings, tags } = useLexNote();
+  const navigate = useNavigate();
+  const { state: reanalysis, run: reanalyze, rollback } = useReanalysis(word);
   const [savedFlash, setSavedFlash] = useState(false);
-  const [reanalyzing, setReanalyzing] = useState(false);
-  const [snapshot, setSnapshot] = useState<SavedWord | null>(null);
   const [tagDraft, setTagDraft] = useState('');
   const [fontSize, setFontSize] = useState(initialFontSize);
   const [interleave, setInterleave] = useState(true);
@@ -59,7 +60,6 @@ export function WordDetail({
   const flashTimer = useRef<number>();
 
   useEffect(() => {
-    setSnapshot(null);
     setTagDraft('');
   }, [word?.id]);
 
@@ -74,21 +74,6 @@ export function WordDetail({
     setSavedFlash(true);
     window.clearTimeout(flashTimer.current);
     flashTimer.current = window.setTimeout(() => setSavedFlash(false), 1600);
-  };
-
-  const reanalyze = () => {
-    setSnapshot(word);
-    setReanalyzing(true);
-    window.setTimeout(() => {
-      setReanalyzing(false);
-      updateWord(word.id, { savedAt: new Date().toISOString(), lookups: word.lookups + 1 });
-    }, 1300);
-  };
-
-  const rollback = () => {
-    if (!snapshot) return;
-    updateWord(word.id, snapshot);
-    setSnapshot(null);
   };
 
   const sendToAnki = async () => {
@@ -191,17 +176,12 @@ export function WordDetail({
             </AnimatePresence>
             <Button
               size="sm"
-              icon={
-                reanalyzing ? (
-                  <LoaderIcon size={12} className="animate-spin" />
-                ) : (
-                  <SparklesIcon size={12} />
-                )
-              }
+              icon={<SparklesIcon size={12} />}
+              loading={reanalysis.status === 'running'}
               onClick={reanalyze}
-              disabled={reanalyzing}
+              title="用当前配置的模型重新解析；备注、标签与掌握度保持不变"
             >
-              重新解析
+              {reanalysis.status === 'running' ? '解析中…' : '重新解析'}
             </Button>
             <Button
               size="sm"
@@ -235,19 +215,12 @@ export function WordDetail({
         </div>
       </div>
 
-      {snapshot && !reanalyzing ? (
-        <div className="flex items-start gap-2 border-b border-line bg-accent-soft px-3 py-1.5">
-          <SparklesIcon size={13} className="mt-0.5 text-accent" />
-          <div className="min-w-0 flex-1">
-            <p className="text-[11px] font-medium text-ink">
-              已用 {settings.provider.model} 重新解析
-            </p>
-          </div>
-          <Button size="sm" icon={<RotateCcwIcon size={11} />} onClick={rollback}>
-            回滚
-          </Button>
-        </div>
-      ) : null}
+      <ReanalysisBanner
+        state={reanalysis}
+        onRollback={rollback}
+        onRetry={reanalyze}
+        onOpenSettings={() => navigate('/settings')}
+      />
 
       <div className="space-y-2 px-2 py-2" style={{ fontSize: `${fontSize}px` }}>
         {word.tags.length > 0 && (
