@@ -1,18 +1,17 @@
 import React from 'react';
 import { ArrowDownIcon, ArrowUpIcon, ArrowUpDownIcon } from 'lucide-react';
+import type { SortField, SortState } from '../../lib/library-list';
 import type { SavedWord } from '../../types/lexnote';
 import { classNames, relativeTime } from '../../utils/format';
 import { Chip } from '../ui/Chip';
 import { MasteryBadge } from '../ui/MasteryBadge';
 
-export type SortField = 'savedAt' | 'lemma' | 'mastery' | 'lookups';
-export type SortDir = 'asc' | 'desc';
-export interface SortState { field: SortField; dir: SortDir }
-
 interface WordTableProps {
   words: SavedWord[];
   density: 'table' | 'cards';
-  selectedIds: string[];
+  selectedIds: ReadonlySet<string>;
+  /** Whether every word in `words` is selected (and there is at least one). */
+  allSelected: boolean;
   activeId: string | null;
   sort?: SortState;
   onSortChange?: (sort: SortState) => void;
@@ -28,10 +27,108 @@ function SortIcon({ field, sort }: { field: SortField; sort?: SortState }) {
     : <ArrowDownIcon size={11} className="ml-0.5 inline text-accent" />;
 }
 
+interface RowProps {
+  word: SavedWord;
+  selected: boolean;
+  active: boolean;
+  onToggleSelect: (id: string) => void;
+  onActivate: (id: string) => void;
+}
+
+// Rows are memoized: selecting one word or opening another changes the props of two rows, not of
+// every row in a library of thousands, so the rest are not rendered again.
+const WordRow = React.memo(function WordRow({ word, selected, active, onToggleSelect, onActivate }: RowProps) {
+  return (
+    <tr
+      className={classNames(
+        'border-b border-line transition-colors',
+        active ? 'bg-accent-soft' : 'hover:bg-raised',
+      )}
+    >
+      <td className="px-3 py-2">
+        <input
+          type="checkbox"
+          aria-label={`选择 ${word.lemma}`}
+          checked={selected}
+          onChange={() => onToggleSelect(word.id)}
+          className="h-3.5 w-3.5 accent-[color:var(--accent)]"
+        />
+      </td>
+      <td className="py-1 pr-3">
+        <button
+          type="button"
+          onClick={() => onActivate(word.id)}
+          className="-mx-1 flex items-baseline gap-1.5 rounded-sm px-1 py-1 text-left hover:underline"
+        >
+          <span className="font-serif text-base font-bold text-ink">{word.lemma}</span>
+          <span className="text-2xs text-ink-subtle">{word.pos}</span>
+        </button>
+      </td>
+      <td className="max-w-[12rem] truncate py-2 pr-3 text-ink-muted">{word.translation}</td>
+      <td className="hidden py-2 pr-3 xl:table-cell">
+        <span className="flex flex-wrap items-center gap-1">
+          {word.tags.slice(0, 2).map((tag) => (
+            <Chip key={tag} label={tag} tone="muted" />
+          ))}
+          {word.tags.length > 2 ? (
+            <span className="text-2xs text-ink-subtle">+{word.tags.length - 2}</span>
+          ) : null}
+        </span>
+      </td>
+      <td className="hidden max-w-[9rem] truncate py-2 pr-3 text-ink-subtle lg:table-cell">
+        {word.sourceApp}
+      </td>
+      <td className="whitespace-nowrap py-2 pr-3 text-ink-subtle">{relativeTime(word.savedAt)}</td>
+      <td className="py-2 pr-3 text-right tabular-nums text-ink-subtle">{word.lookups}</td>
+      <td className="py-2 pr-3">
+        <MasteryBadge mastery={word.mastery} />
+      </td>
+    </tr>
+  );
+});
+
+const WordCard = React.memo(function WordCard({
+  word,
+  active,
+  onActivate,
+}: {
+  word: SavedWord;
+  active: boolean;
+  onActivate: (id: string) => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onActivate(word.id)}
+      className={classNames(
+        'flex flex-col rounded-lg border bg-surface p-3 text-left transition-colors',
+        active ? 'border-accent' : 'border-line hover:border-line-strong'
+      )}>
+
+      <div className="flex items-baseline gap-2">
+        <span className="font-serif text-[17px] font-bold text-ink">{word.lemma}</span>
+        <span className="font-ipa text-[11px] text-ink-subtle">{word.ipaUS}</span>
+        <span className="ml-auto shrink-0"><MasteryBadge mastery={word.mastery} compact /></span>
+      </div>
+      <p className="mt-1 text-[13px] text-ink">{word.translation}</p>
+      <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-ink-subtle">{word.contextMeaning}</p>
+      <div className="mt-2 flex flex-wrap gap-1">
+        {word.tags.map((tag) =>
+          <Chip key={tag} label={tag} tone="muted" />
+        )}
+      </div>
+      <p className="mt-2 text-[10px] text-ink-subtle">
+        {word.sourceApp} · {relativeTime(word.savedAt)}
+      </p>
+    </button>
+  );
+});
+
 export function WordTable({
   words,
   density,
   selectedIds,
+  allSelected,
   activeId,
   sort,
   onSortChange,
@@ -47,6 +144,7 @@ export function WordTable({
       onSortChange({ field, dir: sort.dir === 'asc' ? 'desc' : 'asc' });
     }
   };
+
   if (words.length === 0) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-1 p-8 text-center">
@@ -60,37 +158,11 @@ export function WordTable({
     return (
       <div className="thin-scroll grid min-h-0 flex-1 grid-cols-[repeat(auto-fill,minmax(238px,1fr))] content-start gap-2.5 overflow-y-auto p-3">
         {words.map((word) =>
-        <button
-          key={word.id}
-          type="button"
-          onClick={() => onActivate(word.id)}
-          className={classNames(
-            'flex flex-col rounded-lg border bg-surface p-3 text-left transition-colors',
-            activeId === word.id ? 'border-accent' : 'border-line hover:border-line-strong'
-          )}>
-          
-            <div className="flex items-baseline gap-2">
-              <span className="font-serif text-[17px] font-bold text-ink">{word.lemma}</span>
-              <span className="font-ipa text-[11px] text-ink-subtle">{word.ipaUS}</span>
-              <span className="ml-auto shrink-0"><MasteryBadge mastery={word.mastery} compact /></span>
-            </div>
-            <p className="mt-1 text-[13px] text-ink">{word.translation}</p>
-            <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-ink-subtle">{word.contextMeaning}</p>
-            <div className="mt-2 flex flex-wrap gap-1">
-              {word.tags.map((tag) =>
-            <Chip key={tag} label={tag} tone="muted" />
-            )}
-            </div>
-            <p className="mt-2 text-[10px] text-ink-subtle">
-              {word.sourceApp} · {relativeTime(word.savedAt)}
-            </p>
-          </button>
+          <WordCard key={word.id} word={word} active={activeId === word.id} onActivate={onActivate} />
         )}
       </div>);
 
   }
-
-  const allSelected = selectedIds.length === words.length;
 
   return (
     <div className="thin-scroll min-h-0 flex-1 overflow-auto">
@@ -134,52 +206,14 @@ export function WordTable({
         </thead>
         <tbody>
           {words.map((word) => (
-            <tr
+            <WordRow
               key={word.id}
-              className={classNames(
-                'border-b border-line transition-colors',
-                activeId === word.id ? 'bg-accent-soft' : 'hover:bg-raised',
-              )}
-            >
-              <td className="px-3 py-2">
-                <input
-                  type="checkbox"
-                  aria-label={`选择 ${word.lemma}`}
-                  checked={selectedIds.includes(word.id)}
-                  onChange={() => onToggleSelect(word.id)}
-                  className="h-3.5 w-3.5 accent-[color:var(--accent)]"
-                />
-              </td>
-              <td className="py-1 pr-3">
-                <button
-                  type="button"
-                  onClick={() => onActivate(word.id)}
-                  className="-mx-1 flex items-baseline gap-1.5 rounded-sm px-1 py-1 text-left hover:underline"
-                >
-                  <span className="font-serif text-base font-bold text-ink">{word.lemma}</span>
-                  <span className="text-2xs text-ink-subtle">{word.pos}</span>
-                </button>
-              </td>
-              <td className="max-w-[12rem] truncate py-2 pr-3 text-ink-muted">{word.translation}</td>
-              <td className="hidden py-2 pr-3 xl:table-cell">
-                <span className="flex flex-wrap items-center gap-1">
-                  {word.tags.slice(0, 2).map((tag) => (
-                    <Chip key={tag} label={tag} tone="muted" />
-                  ))}
-                  {word.tags.length > 2 ? (
-                    <span className="text-2xs text-ink-subtle">+{word.tags.length - 2}</span>
-                  ) : null}
-                </span>
-              </td>
-              <td className="hidden max-w-[9rem] truncate py-2 pr-3 text-ink-subtle lg:table-cell">
-                {word.sourceApp}
-              </td>
-              <td className="whitespace-nowrap py-2 pr-3 text-ink-subtle">{relativeTime(word.savedAt)}</td>
-              <td className="py-2 pr-3 text-right tabular-nums text-ink-subtle">{word.lookups}</td>
-              <td className="py-2 pr-3">
-                <MasteryBadge mastery={word.mastery} />
-              </td>
-            </tr>
+              word={word}
+              selected={selectedIds.has(word.id)}
+              active={activeId === word.id}
+              onToggleSelect={onToggleSelect}
+              onActivate={onActivate}
+            />
           ))}
         </tbody>
       </table>

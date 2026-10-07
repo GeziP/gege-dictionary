@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { RotateCcwIcon } from 'lucide-react';
 import type { Mastery, SavedWord } from '../../types/lexnote';
 import { classNames } from '../../utils/format';
@@ -36,12 +36,16 @@ export function FilterPanel({
   onRangeChange,
   onReset
 }: FilterPanelProps) {
-  const tagCounts = new Map<string, number>();
-  const sourceCounts = new Map<string, number>();
-  words.forEach((word) => {
-    word.tags.forEach((tag) => tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1));
-    sourceCounts.set(word.sourceApp, (sourceCounts.get(word.sourceApp) ?? 0) + 1);
-  });
+  // Counted when the words change, not on every keystroke in the search box.
+  const { tagCounts, sourceCounts } = useMemo(() => {
+    const tags = new Map<string, number>();
+    const sources = new Map<string, number>();
+    words.forEach((word) => {
+      word.tags.forEach((tag) => tags.set(tag, (tags.get(tag) ?? 0) + 1));
+      sources.set(word.sourceApp, (sources.get(word.sourceApp) ?? 0) + 1);
+    });
+    return { tagCounts: tags, sourceCounts: sources };
+  }, [words]);
 
   const hasFilters = activeTags.length + activeSources.length + activeMastery.length > 0 || range !== 'all';
 
