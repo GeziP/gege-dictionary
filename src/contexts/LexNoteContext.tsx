@@ -10,6 +10,7 @@ import type {
   SavedWord,
 } from '../types/lexnote';
 import * as bridge from '../lib/tauri-bridge';
+import { upsertSavedWord } from '../lib/words';
 
 const DEFAULT_SETTINGS: AppSettings = {
   provider: DEFAULT_PROVIDER,
@@ -122,12 +123,12 @@ interface LexNoteValue {
   setCaptureMethod: (method: CaptureMethod) => void;
   setOnboarded: (value: boolean) => void;
   updateSettings: (patch: SettingsPatch) => void;
-  saveWord: (word: SavedWord) => Promise<void>;
+  /** Saves a lookup; resolves with the word as stored (merged with an existing one). */
+  saveWord: (word: SavedWord) => Promise<SavedWord>;
   removeWords: (ids: string[]) => void;
   updateWord: (id: string, patch: Partial<SavedWord>) => void;
   tagWords: (ids: string[], tags: string[]) => void;
   batchSetMastery: (ids: string[], mastery: SavedWord['mastery']) => void;
-  findByLemma: (lemma: string) => SavedWord | undefined;
   countLookup: (tokens: number) => void;
   saveTemplate: (template: PromptTemplate) => void;
   resetTemplates: () => void;
@@ -140,7 +141,19 @@ interface LexNoteValue {
 
 const LexNoteContext = createContext<LexNoteValue | null>(null);
 
-export function LexNoteProvider({ children }: { children: React.ReactNode }) {
+/**
+ * `loadWords` is turned off for the small lookup and OCR windows. They only
+ * ever ask the backend about one word, so loading the whole library into each
+ * of them (on every cold start) was work that grows with the library for no
+ * benefit.
+ */
+export function LexNoteProvider({
+  children,
+  loadWords = true,
+}: {
+  children: React.ReactNode;
+  loadWords?: boolean;
+}) {
   const isTauri = bridge.isTauri();
 
   const [words, setWords] = useState<SavedWord[]>([]);
@@ -169,14 +182,14 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
   const [lookupListenersReady, setLookupListenersReady] = useState(false);
 
   const refreshWords = useCallback(async () => {
-    if (!isTauri) return;
+    if (!isTauri || !loadWords) return;
     try {
       const data = await bridge.getAllWords();
       setWords(data as SavedWord[]);
     } catch (e) {
       console.error('Failed to load words:', e);
     }
-  }, [isTauri]);
+  }, [isTauri, loadWords]);
 
   const refreshStartupWarnings = useCallback(async () => {
     if (!isTauri) return;
@@ -191,14 +204,14 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
   const refreshAppState = useCallback(async () => {
     if (!isTauri) return;
     const [dbWords, dbSettings, dbTemplates, dbUsage, dbWarnings] = await Promise.allSettled([
-      bridge.getAllWords(),
+      loadWords ? bridge.getAllWords() : Promise.resolve<SavedWord[] | null>(null),
       bridge.getSettings(),
       bridge.getTemplates(),
       bridge.getUsage(),
       bridge.getStartupWarnings(),
     ]);
 
-    if (dbWords.status === 'fulfilled') {
+    if (dbWords.status === 'fulfilled' && dbWords.value) {
       setWords(dbWords.value as SavedWord[]);
     }
     if (dbSettings.status === 'fulfilled') {
@@ -229,7 +242,7 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
     if (dbWarnings.status === 'fulfilled') {
       setStartupWarnings(dbWarnings.value.map((warning) => warning.message));
     }
-  }, [isTauri]);
+  }, [isTauri, loadWords]);
 
   useEffect(() => {
     if (!isTauri) return;
@@ -313,82 +326,88 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const saveWord = useCallback(
-    (word: SavedWord): Promise<void> => {
-      setWords((prev) => [word, ...prev.filter((w) => w.id !== word.id)]);
-      if (!isTauri) return Promise.resolve();
-      return bridge
-        .saveWord(word)
-        .then(() => bridge.emitWordSaved())
-        .catch((e) => {
-          console.error(e);
-          throw e;
-        });
+    async (word: SavedWord): Promise<SavedWord> => {
+      if (!isTauri) {
+        setWords((prev) => upsertSavedWord(prev, word));
+        return word;
+      }
+      // The backend merges the word with one that is already saved (mastery,
+      // note, tags and the Anki link survive), so what gets shown is the
+      // document it returns, not the one that was sent. Nothing is shown ahead
+      // of time: a save that fails must not leave a phantom word behind.
+      const stored = await bridge.saveWord(word);
+      setWords((prev) => upsertSavedWord(prev, stored));
+      bridge.emitWordSaved().catch(console.error);
+      return stored;
     },
     [isTauri]
   );
 
+  // The edits below are applied to the list at once and confirmed by the
+  // backend afterwards. If it refuses, the list is reloaded so the screen
+  // shows what is really stored instead of an edit that never happened.
+  const reloadAfterFailure = useCallback(
+    (error: unknown) => {
+      console.error(error);
+      void refreshWords();
+    },
+    [refreshWords]
+  );
+
   const removeWords = useCallback(
     (ids: string[]) => {
-      setWords((prev) => prev.filter((w) => !ids.includes(w.id)));
+      const gone = new Set(ids);
+      setWords((prev) => prev.filter((w) => !gone.has(w.id)));
       if (isTauri) {
-        bridge.deleteWords(ids)
+        bridge
+          .deleteWords(ids)
           .then(() => bridge.emitWordSaved())
-          .catch(console.error);
+          .catch(reloadAfterFailure);
       }
     },
-    [isTauri]
+    [isTauri, reloadAfterFailure]
   );
 
   const updateWord = useCallback(
     (id: string, patch: Partial<SavedWord>) => {
       setWords((prev) => prev.map((w) => (w.id === id ? { ...w, ...patch } : w)));
       if (isTauri) {
-        bridge.updateWord(id, patch)
+        bridge
+          .updateWord(id, patch)
           .then(() => bridge.emitWordSaved())
-          .catch(console.error);
+          .catch(reloadAfterFailure);
       }
     },
-    [isTauri]
+    [isTauri, reloadAfterFailure]
   );
 
   const tagWords = useCallback(
     (ids: string[], newTags: string[]) => {
+      const tags = newTags.map((tag) => tag.trim()).filter(Boolean);
+      if (ids.length === 0 || tags.length === 0) return;
+      const targets = new Set(ids);
       setWords((prev) =>
         prev.map((w) =>
-          ids.includes(w.id)
-            ? { ...w, tags: Array.from(new Set([...w.tags, ...newTags])) }
-            : w
+          targets.has(w.id) ? { ...w, tags: Array.from(new Set([...w.tags, ...tags])) } : w
         )
       );
       if (isTauri) {
-        words
-          .filter((w) => ids.includes(w.id))
-          .forEach((w) => {
-            const merged = Array.from(new Set([...w.tags, ...newTags]));
-            bridge.updateWord(w.id, { tags: merged } as Partial<SavedWord>).catch(console.error);
-          });
+        bridge.batchUpdateWords(ids, { addTags: tags }).catch(reloadAfterFailure);
       }
     },
-    [isTauri, words]
+    [isTauri, reloadAfterFailure]
   );
 
   const batchSetMastery = useCallback(
     (ids: string[], mastery: SavedWord['mastery']) => {
-      setWords((prev) =>
-        prev.map((w) => (ids.includes(w.id) ? { ...w, mastery } : w))
-      );
+      if (ids.length === 0) return;
+      const targets = new Set(ids);
+      setWords((prev) => prev.map((w) => (targets.has(w.id) ? { ...w, mastery } : w)));
       if (isTauri) {
-        ids.forEach((id) => {
-          bridge.updateWord(id, { mastery } as Partial<SavedWord>).catch(console.error);
-        });
+        bridge.batchUpdateWords(ids, { mastery }).catch(reloadAfterFailure);
       }
     },
-    [isTauri]
-  );
-
-  const findByLemma = useCallback(
-    (lemma: string) => words.find((w) => w.lemma.toLowerCase() === lemma.toLowerCase()),
-    [words]
+    [isTauri, reloadAfterFailure]
   );
 
   const countLookup = useCallback(
@@ -592,7 +611,6 @@ export function LexNoteProvider({ children }: { children: React.ReactNode }) {
     updateWord,
     tagWords,
     batchSetMastery,
-    findByLemma,
     countLookup,
     saveTemplate,
     resetTemplates,

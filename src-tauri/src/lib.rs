@@ -268,6 +268,17 @@ async fn save_word(
     db.save_lookup_result(&word)
 }
 
+/// Puts a word back exactly as given. Undo and rollback need a plain overwrite
+/// to return to the state from before a merge; `save_word` would merge again.
+#[tauri::command]
+async fn restore_word(
+    state: tauri::State<'_, AppState>,
+    word: serde_json::Value,
+) -> Result<(), String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.save_word(&word)
+}
+
 /// The saved word for a lemma (case/whitespace-insensitive), if any. Lets the
 /// lookup window ask about one word instead of loading the whole library.
 #[tauri::command]
@@ -1675,6 +1686,7 @@ pub fn run() {
             get_all_words,
             search_words,
             save_word,
+            restore_word,
             find_word_by_lemma,
             batch_update_words,
             update_word,

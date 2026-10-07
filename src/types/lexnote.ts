@@ -128,6 +128,8 @@ export interface SavedWord extends Entry {
   lookups: number;
   note: string;
   reviewState?: ReviewState;
+  /** Anki note this word was sent as; set by the backend, never by the UI. */
+  ankiNoteId?: number;
 }
 
 export interface ReviewState {

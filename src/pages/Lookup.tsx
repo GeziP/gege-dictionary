@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { motion } from 'framer-motion';
 import {
   AlignJustifyIcon,
@@ -21,6 +21,8 @@ import { classNames } from '../utils/format';
 import { RichText } from '../components/ui/RichText';
 import { DomainAnalysis } from '../components/domain/DomainAnalysis';
 import * as bridge from '../lib/tauri-bridge';
+import { resolveLookupShortcut } from '../lib/lookup-keys';
+import { MAX_TAG_CHARS, normalizeTag } from '../lib/words';
 
 type EntryMetadata = Entry & { _templateName?: string; fromCache?: boolean };
 
@@ -34,7 +36,6 @@ export function Lookup() {
     lookupSourceApp,
     lookupSourceTitle,
     settings,
-    findByLemma,
     saveWord: ctxSaveWord,
     triggerLookup,
     countLookup,
@@ -44,6 +45,17 @@ export function Lookup() {
   const [saved, setSaved] = useState(false);
   const [undoTimer, setUndoTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
   const [tagInput, setTagInput] = useState('');
+  // The saved copy of the word on screen, asked of the backend for this one
+  // word (this window never loads the whole library).
+  const [existing, setExisting] = useState<SavedWord | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  // A save in flight is also tracked synchronously: two key presses or clicks
+  // can arrive before React has re-rendered the disabled button.
+  const savingRef = useRef(false);
+  // What undo has to put back: the word as it was before the save (null when
+  // the save created it) and the document that was stored.
+  const undoRef = useRef<{ before: SavedWord | null; stored: SavedWord } | null>(null);
   const [pinned, setPinned] = useState(false);
   const [initDone, setInitDone] = useState(false);
 
@@ -102,7 +114,34 @@ export function Lookup() {
   }, [initDone, triggerLookup]);
 
   const entry = lookupResult;
-  const existing = entry ? findByLemma(entry.lemma) : undefined;
+  const entryLemma = entry?.lemma;
+  const entryKind = entry?.kind;
+
+  useEffect(() => {
+    if (!entryLemma || lookupStatus !== 'done') {
+      setExisting(null);
+      return;
+    }
+    let cancelled = false;
+    bridge
+      .findWordByLemma(entryLemma, entryKind)
+      .then((found) => {
+        if (!cancelled) setExisting(found);
+      })
+      .catch(() => {
+        if (!cancelled) setExisting(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [entryLemma, entryKind, lookupStatus]);
+
+  useEffect(
+    () => () => {
+      if (undoTimer) clearTimeout(undoTimer);
+    },
+    [undoTimer],
+  );
 
   useEffect(() => {
     if (pinned) return;
@@ -119,64 +158,102 @@ export function Lookup() {
     return () => window.removeEventListener('blur', handler);
   }, [pinned, lookupStatus]);
 
-  const handleSave = useCallback(() => {
-    if (!entry || lookupStatus !== 'done') return;
-    const word: SavedWord = {
-      ...entry,
-      id: existing?.id || `w-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      savedAt: new Date().toISOString(),
-      context: lookupContext,
-      sourceApp: lookupSourceApp,
-      sourceTitle: lookupSourceTitle,
-      tags: tagInput.trim() ? [tagInput.trim().toLowerCase()] : [],
-      mastery: 'new',
-      lookups: (existing?.lookups || 0) + 1,
-      note: existing?.note || '',
-    };
-    ctxSaveWord(word)
-      .then(() => {
-        setSaved(true);
-        countLookup(0);
-        const timer = setTimeout(() => setUndoTimer(null), 5000);
-        setUndoTimer(timer);
-        if (settings.anki?.enabled && settings.anki.autoSend) {
-          return bridge
-            .sendWordsToAnki([word.id])
-            .then((report) => {
-              if (report.added > 0) {
-                setAnkiFlash(`已同步 Anki（${report.added}）`);
-              } else if (report.skipped > 0) {
-                setAnkiFlash('Anki 已有此词');
-              }
-            })
-            .catch(() => {
-              /* Anki optional */
-            });
-        }
-        return undefined;
-      })
-      .catch((e) => {
-        console.error('saveWord failed', e);
-        setSaved(false);
+  const handleSave = useCallback(async () => {
+    if (!entry || lookupStatus !== 'done' || saved || savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    setSaveError(null);
+    const before = existing;
+    try {
+      const tag = normalizeTag(tagInput);
+      // Only the content, the context and the tag matter here. When the word is
+      // already saved the backend keeps its mastery, note, earlier tags and Anki
+      // link, so the placeholders below are used for a brand new word only.
+      const stored = await ctxSaveWord({
+        ...entry,
+        id: before?.id ?? `w-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        savedAt: new Date().toISOString(),
+        context: lookupContext,
+        sourceApp: lookupSourceApp,
+        sourceTitle: lookupSourceTitle,
+        tags: tag ? [tag] : [],
+        mastery: 'new',
+        lookups: 1,
+        note: '',
       });
-  }, [entry, existing, lookupContext, lookupSourceApp, lookupSourceTitle, tagInput, ctxSaveWord, countLookup, lookupStatus, settings.anki]);
+      undoRef.current = { before, stored };
+      setExisting(stored);
+      setSaved(true);
+      countLookup(0);
+      if (undoTimer) clearTimeout(undoTimer);
+      setUndoTimer(setTimeout(() => setUndoTimer(null), 5000));
+      if (settings.anki?.enabled && settings.anki.autoSend) {
+        try {
+          const report = await bridge.sendWordsToAnki([stored.id]);
+          if (report.added > 0) setAnkiFlash(`已同步 Anki（${report.added}）`);
+          else if (report.skipped > 0) setAnkiFlash('Anki 已有此词');
+          else if (report.errors[0]) setAnkiFlash(`Anki 同步失败：${report.errors[0]}`);
+        } catch (error) {
+          setAnkiFlash(`Anki 同步失败：${String(error)}`);
+        }
+      }
+    } catch (error) {
+      console.error('saveWord failed', error);
+      setSaveError(`保存失败：${String(error)}`);
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  }, [entry, existing, lookupContext, lookupSourceApp, lookupSourceTitle, tagInput, ctxSaveWord, countLookup, lookupStatus, saved, settings.anki, undoTimer]);
+
+  // Undo really undoes the save: a word this save created is deleted, and a
+  // word that already existed goes back to exactly how it was. (It used to
+  // only flip the button back while the word stayed in the library.)
+  const handleUndo = useCallback(async () => {
+    const undo = undoRef.current;
+    if (!undo || savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      if (undo.before) await bridge.restoreWord(undo.before);
+      else await bridge.deleteWords([undo.stored.id]);
+      bridge.emitWordSaved().catch(console.error);
+      undoRef.current = null;
+      if (undoTimer) clearTimeout(undoTimer);
+      setUndoTimer(null);
+      setExisting(undo.before);
+      setSaved(false);
+      setAnkiFlash((flash) => (flash?.startsWith('已同步') ? 'Anki 中已发送的卡片不会被删除' : null));
+    } catch (error) {
+      console.error('undo failed', error);
+      setSaveError(`撤销失败：${String(error)}`);
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  }, [undoTimer]);
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !pinned) {
+      const action = resolveLookupShortcut(event, {
+        pinned,
+        hasEntry: Boolean(entry),
+        canSave: Boolean(entry) && lookupStatus === 'done' && !saved && !saving,
+      });
+      if (action === 'close') {
         bridge.closeLookupWindow();
-      }
-      if (event.key === 'Enter' && entry && !saved) {
-        handleSave();
-      }
-      if (event.key === ' ' && entry) {
+      } else if (action === 'save') {
         event.preventDefault();
-        bridge.speakText(entry.lemma, settings.ttsVoice, settings.ttsRate);
+        void handleSave();
+      } else if (action === 'speak' && entry) {
+        event.preventDefault();
+        bridge.speakText(entry.lemma, settings.ttsVoice, settings.ttsRate).catch(console.warn);
       }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [entry, handleSave, pinned, saved, settings.ttsRate, settings.ttsVoice]);
+  }, [entry, handleSave, lookupStatus, pinned, saved, saving, settings.ttsRate, settings.ttsVoice]);
 
   const handleRetry = () => {
     if (lookupSelection) {
@@ -205,6 +282,10 @@ export function Lookup() {
       setInitDone(false);
       setEmptyHint(false);
       setAnkiFlash(null);
+      setExisting(null);
+      setSaveError(null);
+      setUndoTimer(null);
+      undoRef.current = null;
       // Clear previous result immediately so the next capture cannot flash stale content.
       clearLookup();
     };
@@ -538,7 +619,7 @@ export function Lookup() {
                           <HighlightWord text={ex.en} word={entry.lemma} />
                           <button
                             type="button"
-                            onClick={() => bridge.speakText(ex.en, settings.ttsVoice, settings.ttsRate)}
+                            onClick={() => bridge.speakText(ex.en, settings.ttsVoice, settings.ttsRate).catch(console.warn)}
                             className="ml-1 inline opacity-0 transition-opacity group-hover:opacity-100"
                             title="朗读例句"
                           >
@@ -632,24 +713,33 @@ export function Lookup() {
         {/* Save Bar */}
         {entry && lookupStatus === 'done' && (
           <div className="border-t border-line bg-raised px-3 py-2">
+            {saveError && (
+              <p role="alert" className="mb-1.5 text-[11px] text-danger">{saveError}</p>
+            )}
             {!saved ? (
               <div className="flex items-center gap-2">
                 <input
                   value={tagInput}
                   onChange={(e) => setTagInput(e.target.value)}
                   placeholder="标签（可选，回车保存）"
+                  maxLength={MAX_TAG_CHARS}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter') handleSave();
+                    // Enter that confirms an IME candidate is not a save.
+                    if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                      e.preventDefault();
+                      void handleSave();
+                    }
                   }}
                   className="h-7 flex-1 rounded border border-line bg-surface px-2 text-[11px] text-ink placeholder:text-ink-subtle outline-none focus:border-accent"
                 />
                 <button
                   type="button"
-                  onClick={handleSave}
-                  className="inline-flex h-7 items-center gap-1.5 rounded-md bg-accent px-3 text-[11px] font-medium text-accent-ink hover:bg-accent-hover"
+                  onClick={() => void handleSave()}
+                  disabled={saving}
+                  className="inline-flex h-7 items-center gap-1.5 rounded-md bg-accent px-3 text-[11px] font-medium text-accent-ink hover:bg-accent-hover disabled:cursor-wait disabled:opacity-60"
                 >
                   <BookmarkPlusIcon size={12} />
-                  {existing ? '更新解析' : '加入生词库'}
+                  {saving ? '保存中…' : existing ? '更新解析' : '加入生词库'}
                 </button>
               </div>
             ) : (
@@ -663,12 +753,9 @@ export function Lookup() {
                 {undoTimer && (
                   <button
                     type="button"
-                    onClick={() => {
-                      setSaved(false);
-                      if (undoTimer) clearTimeout(undoTimer);
-                      setUndoTimer(null);
-                    }}
-                    className="inline-flex items-center gap-1 text-[11px] text-ink-subtle hover:text-ink"
+                    onClick={() => void handleUndo()}
+                    disabled={saving}
+                    className="inline-flex items-center gap-1 text-[11px] text-ink-subtle hover:text-ink disabled:cursor-wait disabled:opacity-60"
                   >
                     <Undo2Icon size={11} /> 撤销
                   </button>

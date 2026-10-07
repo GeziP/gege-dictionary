@@ -111,8 +111,11 @@ function StartupWarningsBanner() {
 }
 
 export function App() {
+  // The lookup and OCR windows are small separate webviews that never show the
+  // library, so they must not pay for loading all of it on every cold start.
+  const lightweightWindow = ['/lookup', '/ocr-select'].includes(window.location.pathname);
   return (
-    <LexNoteProvider>
+    <LexNoteProvider loadWords={!lightweightWindow}>
       <BrowserRouter>
         <div className="h-full w-full bg-canvas text-ink">
           <UpdateBanner />

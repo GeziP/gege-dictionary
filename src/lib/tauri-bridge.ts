@@ -49,8 +49,46 @@ export async function searchWords(
   return invoke<SavedWord[]>('search_words', { query, tag, source, mastery });
 }
 
-export async function saveWord(word: SavedWord): Promise<void> {
-  return invoke('save_word', { word });
+/**
+ * Saves the outcome of a lookup. A word that is already in the library is
+ * merged with it by the backend (mastery, note, tags and the Anki link are
+ * kept), so the document that was stored comes back and must be used instead
+ * of the one that was sent.
+ */
+export async function saveWord(word: SavedWord): Promise<SavedWord> {
+  return invoke<SavedWord>('save_word', { word });
+}
+
+/** The saved word for a lemma (case and whitespace insensitive), or null. */
+export async function findWordByLemma(lemma: string, kind?: string): Promise<SavedWord | null> {
+  return invoke<SavedWord | null>('find_word_by_lemma', { lemma, kind });
+}
+
+export interface BatchWordPatch {
+  mastery?: SavedWord['mastery'];
+  addTags?: string[];
+  removeTags?: string[];
+}
+
+export interface BatchUpdateReport {
+  updated: number;
+  missing: number;
+}
+
+/** One transactional change (mastery and/or tags to add or remove) for many words. */
+export async function batchUpdateWords(
+  ids: string[],
+  patch: BatchWordPatch,
+): Promise<BatchUpdateReport> {
+  return invoke<BatchUpdateReport>('batch_update_words', { ids, patch });
+}
+
+/**
+ * Puts a word back exactly as given (undo / rollback). Unlike `saveWord` this
+ * is a plain overwrite, so it can restore the state from before a merge.
+ */
+export async function restoreWord(word: SavedWord): Promise<void> {
+  return invoke('restore_word', { word });
 }
 
 export async function updateWord(id: string, patch: Partial<SavedWord>): Promise<void> {
