@@ -415,8 +415,10 @@ mod tests {
 
     #[test]
     fn non_loopback_host_is_forced_to_loopback() {
-        let mut c = AnkiConfig::default();
-        c.host = "evil.example.com".into();
+        let c = AnkiConfig {
+            host: "evil.example.com".into(),
+            ..AnkiConfig::default()
+        };
         assert!(c.endpoint().starts_with("http://127.0.0.1:"));
     }
 

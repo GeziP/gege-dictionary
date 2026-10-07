@@ -66,6 +66,21 @@ struct PreparedLookup {
     record_history: bool,
 }
 
+impl PreparedLookup {
+    /// The call to the model that this lookup makes; the prompt is built from the selection.
+    fn model_call(&self) -> llm::ModelCall<'_> {
+        llm::ModelCall {
+            base_url: &self.base_url,
+            api_key: &self.api_key,
+            model: &self.model,
+            protocol: &self.protocol,
+            temperature: self.temperature,
+            max_tokens: self.max_tokens,
+            timeout_secs: self.timeout_secs,
+        }
+    }
+}
+
 /// The question a lookup answers: what was selected, around what, and as which kind.
 #[derive(Clone, Copy)]
 struct LookupRequest<'a> {
@@ -223,6 +238,20 @@ pub(crate) fn selection_meta(selection: &str, kind: &str) -> String {
     format!("len={} kind={kind} head_hash={head:08x}", selection.len())
 }
 
+/// What the settings and the templates say about answering one lookup, read under one lock.
+struct LookupPlan {
+    base_url: String,
+    api_key: String,
+    model: String,
+    protocol: String,
+    temperature: f64,
+    max_tokens: u32,
+    timeout_secs: u64,
+    template_body: String,
+    template_name: String,
+    cache_ttl: i64,
+}
+
 /// Shared preflight for non-streaming and streaming lookup commands.
 /// Resolves provider/template/glossary, DPAPI key, cache key, and optional cache hit.
 fn prepare_lookup(
@@ -234,7 +263,7 @@ fn prepare_lookup(
     log_prefix: &str,
 ) -> Result<PreparedLookup, String> {
     let record_history;
-    let (
+    let LookupPlan {
         base_url,
         api_key,
         model,
@@ -245,7 +274,7 @@ fn prepare_lookup(
         template_body,
         template_name,
         cache_ttl,
-    ) = {
+    } = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let settings = db.get_settings()?;
         record_history = crate::history_enabled(&settings);
@@ -343,29 +372,29 @@ fn prepare_lookup(
             .to_string();
         let api_key_decrypted = decrypt_provider_api_key(&raw_key, log_prefix);
 
-        (
-            base_url_value,
-            api_key_decrypted,
-            provider
+        LookupPlan {
+            base_url: base_url_value,
+            api_key: api_key_decrypted,
+            model: provider
                 .get("model")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
-            provider
+            protocol: provider
                 .get("protocol")
                 .and_then(|v| v.as_str())
                 .unwrap_or("openai")
                 .to_string(),
-            provider
+            temperature: provider
                 .get("temperature")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.3),
-            mt,
-            ts,
-            tpl_body,
-            format!("{} [{}]", tpl_name, tpl_scope),
-            crate::cache_ttl_days(&settings),
-        )
+            max_tokens: mt,
+            timeout_secs: ts,
+            template_body: tpl_body,
+            template_name: format!("{} [{}]", tpl_name, tpl_scope),
+            cache_ttl: crate::cache_ttl_days(&settings),
+        }
     };
 
     if api_key.trim().is_empty() {
@@ -439,7 +468,7 @@ pub(crate) fn resolve_api_key_for_request(
             return dpapi::decrypt(&stored)
                 .map_err(|e| llm::coded("no_key", format!("API Key 解密失败，请重新输入（{e}）")));
         }
-        return Ok(stored);
+        Ok(stored)
     }
     #[cfg(not(windows))]
     {
@@ -498,16 +527,9 @@ pub async fn lookup_word(
     );
 
     let full_text = llm::stream_lookup(
-        &prepared.base_url,
-        &prepared.api_key,
-        &prepared.model,
-        &prepared.protocol,
-        prepared.temperature,
-        prepared.max_tokens,
-        prepared.timeout_secs,
+        prepared.model_call(),
         &selection,
         &context,
-        &kind,
         &prepared.template_body,
     )
     .await
@@ -584,16 +606,9 @@ pub async fn lookup_word_stream(
     let prompt = llm::build_prompt(&prepared.template_body, &selection, &context);
 
     let result = llm::stream_lookup_sse(
-        &prepared.base_url,
-        &prepared.api_key,
-        &prepared.model,
-        &prepared.protocol,
-        prepared.temperature,
-        prepared.max_tokens,
-        prepared.timeout_secs,
+        prepared.model_call(),
         &selection,
         &context,
-        &kind,
         &prepared.template_body,
         |delta| {
             if !delta.is_empty() {
@@ -672,16 +687,9 @@ pub async fn lookup_word_stream(
                 eprintln!("[lookup_stream] falling back to one non-streaming request");
                 crate::record_event_handle(&app, "lookup_stream_fallback", serde_json::json!({}));
                 match llm::stream_lookup(
-                    &prepared.base_url,
-                    &prepared.api_key,
-                    &prepared.model,
-                    &prepared.protocol,
-                    prepared.temperature,
-                    prepared.max_tokens,
-                    prepared.timeout_secs,
+                    prepared.model_call(),
                     &selection,
                     &context,
-                    &kind,
                     &prepared.template_body,
                 )
                 .await
@@ -838,7 +846,8 @@ mod tests {
         AppState {
             db: std::sync::Mutex::new(db::Database::open_memory().unwrap()),
             last_capture: std::sync::Mutex::new(capture),
-            clipboard_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            watch: crate::watch_switch::WatchSwitch::new(true),
+            show_watch_mark: std::sync::Mutex::new(None),
             last_looked_up: std::sync::Mutex::new(None),
             startup_warnings: std::sync::Mutex::new(Vec::new()),
         }

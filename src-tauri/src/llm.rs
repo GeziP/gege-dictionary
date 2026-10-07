@@ -257,64 +257,44 @@ pub(crate) fn estimate_lookup_tokens(prompt: &str, answer: &str) -> u32 {
     estimate_tokens(SYSTEM_PROMPT) + estimate_tokens(prompt) + estimate_tokens(answer)
 }
 
+/// Where a model call goes and how it is made: everything about it except the prompt.
+#[derive(Clone, Copy)]
+pub struct ModelCall<'a> {
+    pub base_url: &'a str,
+    pub api_key: &'a str,
+    pub model: &'a str,
+    /// The protocol the user chose; the URL can overrule it (see `effective_protocol`).
+    pub protocol: &'a str,
+    pub temperature: f64,
+    pub max_tokens: u32,
+    pub timeout_secs: u64,
+}
+
 /// Blocking (non-streaming) lookup — used as fallback or when streaming is disabled.
 pub async fn stream_lookup(
-    base_url: &str,
-    api_key: &str,
-    model: &str,
-    protocol: &str,
-    temperature: f64,
-    max_tokens: u32,
-    timeout_secs: u64,
+    call: ModelCall<'_>,
     selection: &str,
     context: &str,
-    _kind: &str,
     template_body: &str,
 ) -> Result<String, String> {
     let prompt = build_prompt(template_body, selection, context);
 
-    let proto = effective_protocol(protocol, base_url);
-    eprintln!("[stream_lookup] protocol={protocol}, effective={proto}, url={base_url}");
+    let proto = effective_protocol(call.protocol, call.base_url);
+    eprintln!(
+        "[stream_lookup] protocol={}, effective={proto}, url={}",
+        call.protocol, call.base_url
+    );
     match proto {
-        "anthropic" => {
-            call_anthropic_blocking(
-                base_url,
-                api_key,
-                model,
-                temperature,
-                max_tokens,
-                timeout_secs,
-                &prompt,
-            )
-            .await
-        }
-        _ => {
-            call_openai_blocking(
-                base_url,
-                api_key,
-                model,
-                temperature,
-                max_tokens,
-                timeout_secs,
-                &prompt,
-            )
-            .await
-        }
+        "anthropic" => call_anthropic_blocking(call, &prompt).await,
+        _ => call_openai_blocking(call, &prompt).await,
     }
 }
 
 /// Streaming lookup — emits deltas through a callback, returns full text at the end.
 pub async fn stream_lookup_sse<F>(
-    base_url: &str,
-    api_key: &str,
-    model: &str,
-    protocol: &str,
-    temperature: f64,
-    max_tokens: u32,
-    timeout_secs: u64,
+    call: ModelCall<'_>,
     selection: &str,
     context: &str,
-    _kind: &str,
     template_body: &str,
     mut on_delta: F,
 ) -> Result<String, String>
@@ -323,46 +303,22 @@ where
 {
     let prompt = build_prompt(template_body, selection, context);
 
-    let proto = effective_protocol(protocol, base_url);
-    match proto {
-        "anthropic" => {
-            call_anthropic_streaming(
-                base_url,
-                api_key,
-                model,
-                temperature,
-                max_tokens,
-                timeout_secs,
-                &prompt,
-                &mut on_delta,
-            )
-            .await
-        }
-        _ => {
-            call_openai_streaming(
-                base_url,
-                api_key,
-                model,
-                temperature,
-                max_tokens,
-                timeout_secs,
-                &prompt,
-                &mut on_delta,
-            )
-            .await
-        }
+    match effective_protocol(call.protocol, call.base_url) {
+        "anthropic" => call_anthropic_streaming(call, &prompt, &mut on_delta).await,
+        _ => call_openai_streaming(call, &prompt, &mut on_delta).await,
     }
 }
 
-async fn call_openai_blocking(
-    base_url: &str,
-    api_key: &str,
-    model: &str,
-    temperature: f64,
-    max_tokens: u32,
-    timeout_secs: u64,
-    prompt: &str,
-) -> Result<String, String> {
+async fn call_openai_blocking(call: ModelCall<'_>, prompt: &str) -> Result<String, String> {
+    let ModelCall {
+        base_url,
+        api_key,
+        model,
+        temperature,
+        max_tokens,
+        timeout_secs,
+        ..
+    } = call;
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     eprintln!(
         "[call_openai_blocking] POST {url}, model={model}, key_len={}, prompt_len={}",
@@ -500,15 +456,19 @@ async fn call_openai_blocking(
 }
 
 async fn call_openai_streaming<F: FnMut(&str)>(
-    base_url: &str,
-    api_key: &str,
-    model: &str,
-    temperature: f64,
-    max_tokens: u32,
-    timeout_secs: u64,
+    call: ModelCall<'_>,
     prompt: &str,
     on_delta: &mut F,
 ) -> Result<String, String> {
+    let ModelCall {
+        base_url,
+        api_key,
+        model,
+        temperature,
+        max_tokens,
+        timeout_secs,
+        ..
+    } = call;
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
     let mut body = serde_json::json!({
@@ -623,15 +583,16 @@ fn parse_openai_sse_event(line: &str) -> (Option<String>, Option<String>) {
     (delta, finish)
 }
 
-async fn call_anthropic_blocking(
-    base_url: &str,
-    api_key: &str,
-    model: &str,
-    temperature: f64,
-    max_tokens: u32,
-    timeout_secs: u64,
-    prompt: &str,
-) -> Result<String, String> {
+async fn call_anthropic_blocking(call: ModelCall<'_>, prompt: &str) -> Result<String, String> {
+    let ModelCall {
+        base_url,
+        api_key,
+        model,
+        temperature,
+        max_tokens,
+        timeout_secs,
+        ..
+    } = call;
     let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
 
     let body = serde_json::json!({
@@ -661,6 +622,13 @@ async fn call_anthropic_blocking(
         .await
         .map_err(|e| coded("parse", format!("响应解析失败: {e}")))?;
 
+    if resp_json.get("stop_reason").and_then(|r| r.as_str()) == Some(ANTHROPIC_CUT_OFF) {
+        return Err(coded(
+            "truncated",
+            format!("模型输出被截断（max_tokens={max_tokens}），请提高最大 tokens 后重试"),
+        ));
+    }
+
     let content = resp_json
         .get("content")
         .and_then(|c| c.as_array())
@@ -687,15 +655,19 @@ async fn call_anthropic_blocking(
 }
 
 async fn call_anthropic_streaming<F: FnMut(&str)>(
-    base_url: &str,
-    api_key: &str,
-    model: &str,
-    temperature: f64,
-    max_tokens: u32,
-    timeout_secs: u64,
+    call: ModelCall<'_>,
     prompt: &str,
     on_delta: &mut F,
 ) -> Result<String, String> {
+    let ModelCall {
+        base_url,
+        api_key,
+        model,
+        temperature,
+        max_tokens,
+        timeout_secs,
+        ..
+    } = call;
     let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
 
     let body = serde_json::json!({
@@ -724,6 +696,7 @@ async fn call_anthropic_streaming<F: FnMut(&str)>(
     let mut full_text = String::new();
     let mut stream = response.bytes_stream();
     let mut line_buf = String::new();
+    let mut stop_reason: Option<String> = None;
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| coded("network", format!("流式读取中断: {e}")))?;
@@ -731,7 +704,11 @@ async fn call_anthropic_streaming<F: FnMut(&str)>(
 
         for ch in text.chars() {
             if ch == '\n' {
-                if let Some(delta) = parse_anthropic_sse_line(&line_buf) {
+                let (delta, stop) = parse_anthropic_sse_event(&line_buf);
+                if stop.is_some() {
+                    stop_reason = stop;
+                }
+                if let Some(delta) = delta {
                     full_text.push_str(&delta);
                     on_delta(&delta);
                 }
@@ -742,7 +719,11 @@ async fn call_anthropic_streaming<F: FnMut(&str)>(
         }
     }
     if !line_buf.is_empty() {
-        if let Some(delta) = parse_anthropic_sse_line(&line_buf) {
+        let (delta, stop) = parse_anthropic_sse_event(&line_buf);
+        if stop.is_some() {
+            stop_reason = stop;
+        }
+        if let Some(delta) = delta {
             full_text.push_str(&delta);
             on_delta(&delta);
         }
@@ -751,24 +732,41 @@ async fn call_anthropic_streaming<F: FnMut(&str)>(
     if full_text.is_empty() {
         return Err(coded("empty", "流式响应为空"));
     }
+    if stop_reason.as_deref() == Some(ANTHROPIC_CUT_OFF) {
+        return Err(coded(
+            "truncated",
+            format!("模型流式输出被截断（max_tokens={max_tokens}），请提高最大 tokens 后重试"),
+        ));
+    }
     Ok(full_text)
 }
 
+/// The `stop_reason` of an Anthropic reply that ran into `max_tokens` before it was done.
+const ANTHROPIC_CUT_OFF: &str = "max_tokens";
+
+#[cfg(test)]
 fn parse_anthropic_sse_line(line: &str) -> Option<String> {
+    parse_anthropic_sse_event(line).0
+}
+
+/// What one line of an Anthropic event stream says: some new text, and/or why the model has
+/// stopped (the `message_delta` event near the end of a reply carries the `stop_reason`).
+fn parse_anthropic_sse_event(line: &str) -> (Option<String>, Option<String>) {
     let line = line.trim_end_matches('\r');
-    let data = line.strip_prefix("data: ")?;
-    if data.is_empty() {
-        return None;
-    }
-    let json: Value = serde_json::from_str(data).ok()?;
-    let event_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    match event_type {
-        "content_block_delta" => json
-            .get("delta")
-            .and_then(|d| d.get("text"))
-            .and_then(|t| t.as_str())
-            .map(|s| s.to_string()),
-        _ => None,
+    let Some(data) = line.strip_prefix("data: ") else {
+        return (None, None);
+    };
+    let Ok(json) = serde_json::from_str::<Value>(data) else {
+        return (None, None);
+    };
+    let text = |value: Option<&Value>| value.and_then(|v| v.as_str()).map(str::to_string);
+    match json.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+        "content_block_delta" => (text(json.get("delta").and_then(|d| d.get("text"))), None),
+        "message_delta" => (
+            None,
+            text(json.get("delta").and_then(|d| d.get("stop_reason"))),
+        ),
+        _ => (None, None),
     }
 }
 
@@ -868,6 +866,18 @@ async fn test_anthropic(
     }))
 }
 
+/// What the log may say about a model answer that could not be read: how long it was and where
+/// the parser gave up. Never any of its text, which is the translation of what the user selected
+/// (the logs promise not to print that).
+fn parse_failure_note(answer: &str, error: &serde_json::Error) -> String {
+    format!(
+        "len={} line={} column={}",
+        answer.len(),
+        error.line(),
+        error.column()
+    )
+}
+
 pub fn parse_entry(raw: &str, selection: &str, kind: &str) -> Result<Value, String> {
     let trimmed = raw.trim();
     let json_str = extract_json_block(trimmed)?;
@@ -883,8 +893,8 @@ pub fn parse_entry(raw: &str, selection: &str, kind: &str) -> Result<Value, Stri
         })
         .map_err(|e| {
             eprintln!(
-                "[parse_entry] all repair attempts failed. raw_head={}",
-                truncate_for_log(&json_str, 500)
+                "[parse_entry] all repair attempts failed. {}",
+                parse_failure_note(&json_str, &e)
             );
             coded("parse", format!("JSON 解析失败: {e}"))
         })?;
@@ -1093,7 +1103,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
     use std::thread;
     use std::time::Duration;
 
@@ -1113,12 +1123,14 @@ mod tests {
         }
     }
 
-    fn loopback_proxy_guard() -> (std::sync::MutexGuard<'static, ()>, EnvironmentGuard) {
-        static PROXY_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    /// Keeps the other tests away from the process environment while one of them changes it.
+    /// The tests that use it wait on the network with the guard held, so it is an async lock.
+    async fn loopback_proxy_guard() -> (tokio::sync::MutexGuard<'static, ()>, EnvironmentGuard) {
+        static PROXY_ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
         let lock = PROXY_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
+            .get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
-            .unwrap();
+            .await;
         let names = ["NO_PROXY", "no_proxy"];
         let previous = names
             .iter()
@@ -1128,6 +1140,19 @@ mod tests {
             std::env::set_var(name, "127.0.0.1,localhost");
         }
         (lock, EnvironmentGuard { values: previous })
+    }
+
+    /// A call to the server at `base_url`, as a lookup would make it.
+    fn model_call<'a>(base_url: &'a str, protocol: &'a str) -> ModelCall<'a> {
+        ModelCall {
+            base_url,
+            api_key: "test-key",
+            model: "test-model",
+            protocol,
+            temperature: 0.3,
+            max_tokens: 1200,
+            timeout_secs: 30,
+        }
     }
 
     #[test]
@@ -1206,7 +1231,7 @@ mod tests {
 
     #[tokio::test]
     async fn openai_streaming_round_trips_sse_and_emits_deltas() {
-        let (_proxy_lock, _proxy_guard) = loopback_proxy_guard();
+        let (_proxy_lock, _proxy_guard) = loopback_proxy_guard().await;
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -1251,17 +1276,11 @@ mod tests {
         });
 
         let mut deltas = Vec::new();
+        let base_url = format!("http://{address}");
         let result = stream_lookup_sse(
-            &format!("http://{address}"),
-            "test-key",
-            "test-model",
-            "openai",
-            0.3,
-            1200,
-            30,
+            model_call(&base_url, "openai"),
             "hello",
             "context",
-            "word",
             "Translate {{selection}} in {{context}}",
             |delta| deltas.push(delta.to_string()),
         )
@@ -1327,6 +1346,94 @@ mod tests {
     fn test_parse_anthropic_sse_other_events() {
         let line = r#"data: {"type":"message_start","message":{}}"#;
         assert_eq!(parse_anthropic_sse_line(line), None);
+    }
+
+    #[test]
+    fn test_parse_anthropic_sse_stop_reason() {
+        let cut = r#"data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":12}}"#;
+        assert_eq!(
+            parse_anthropic_sse_event(cut),
+            (None, Some("max_tokens".to_string()))
+        );
+        let done = r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#;
+        assert_eq!(
+            parse_anthropic_sse_event(done),
+            (None, Some("end_turn".to_string()))
+        );
+        // A text event has no stop reason, and the other lines of a stream have neither.
+        let text = "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\r";
+        assert_eq!(
+            parse_anthropic_sse_event(text),
+            (Some("hi".to_string()), None)
+        );
+        assert_eq!(
+            parse_anthropic_sse_event("event: message_delta"),
+            (None, None)
+        );
+        assert_eq!(parse_anthropic_sse_event("data: "), (None, None));
+    }
+
+    #[tokio::test]
+    async fn an_anthropic_answer_cut_off_by_max_tokens_is_reported_as_truncated() {
+        let (_proxy_lock, _proxy_guard) = loopback_proxy_guard().await;
+
+        let (base_url, server) = serve_once(
+            "200 OK",
+            r#"{"content":[{"type":"text","text":"{\"lemma\":\"cut"}],"stop_reason":"max_tokens"}"#,
+        );
+        let err = stream_lookup(model_call(&base_url, "anthropic"), "w", "c", "t")
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error_code(&err), Some("truncated"), "{err}");
+
+        let (base_url, server) = serve_once(
+            "200 OK",
+            concat!(
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"{\\\"lemma\\\":\"}}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n"
+            ),
+        );
+        let mut seen = String::new();
+        let err = stream_lookup_sse(model_call(&base_url, "anthropic"), "w", "c", "t", |delta| {
+            seen.push_str(delta)
+        })
+        .await
+        .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error_code(&err), Some("truncated"), "{err}");
+        assert_eq!(seen, "{\"lemma\":", "what arrived was still shown");
+    }
+
+    #[tokio::test]
+    async fn an_anthropic_answer_that_ended_by_itself_is_returned_whole() {
+        let (_proxy_lock, _proxy_guard) = loopback_proxy_guard().await;
+
+        let (base_url, server) = serve_once(
+            "200 OK",
+            r#"{"content":[{"type":"text","text":"all of it"}],"stop_reason":"end_turn"}"#,
+        );
+        let full = stream_lookup(model_call(&base_url, "anthropic"), "w", "c", "t")
+            .await
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(full, "all of it");
+
+        let (base_url, server) = serve_once(
+            "200 OK",
+            concat!(
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello \"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"world\"}}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n"
+            ),
+        );
+        let full = stream_lookup_sse(model_call(&base_url, "anthropic"), "w", "c", "t", |_| {})
+            .await
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(full, "Hello world");
     }
 
     #[test]
@@ -1556,6 +1663,22 @@ mod tests {
     }
 
     #[test]
+    fn a_parse_failure_is_logged_without_any_text_of_the_answer() {
+        let answer = r#"{"translation": "绝密的释义", "lemma": "secret", "pos": }"#;
+        let error = serde_json::from_str::<Value>(answer).unwrap_err();
+
+        let note = parse_failure_note(answer, &error);
+
+        assert!(
+            note.starts_with(&format!("len={} line=1 column=", answer.len())),
+            "{note}"
+        );
+        for text in ["绝密", "释义", "secret", "translation"] {
+            assert!(!note.contains(text), "the note quotes {text:?}: {note}");
+        }
+    }
+
+    #[test]
     fn build_prompt_fills_every_placeholder() {
         let prompt = build_prompt(
             "{{selection}} | {{context}} | {{native_lang}} | {{selection}}",
@@ -1618,7 +1741,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejected_connection_test_reports_the_status_as_a_code() {
-        let (_proxy_lock, _proxy_guard) = loopback_proxy_guard();
+        let (_proxy_lock, _proxy_guard) = loopback_proxy_guard().await;
         for (status_line, code) in [
             ("401 Unauthorized", "auth"),
             ("404 Not Found", "model"),
@@ -1643,7 +1766,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_success_with_an_unreadable_body_is_a_parse_error() {
-        let (_proxy_lock, _proxy_guard) = loopback_proxy_guard();
+        let (_proxy_lock, _proxy_guard) = loopback_proxy_guard().await;
         let (base_url, server) = serve_once("200 OK", "this is not json");
         let err = test_connection(&base_url, "key", "model", "openai")
             .await
@@ -1654,7 +1777,7 @@ mod tests {
 
     #[tokio::test]
     async fn transport_failures_are_classified_by_kind_not_by_message() {
-        let (_proxy_lock, _proxy_guard) = loopback_proxy_guard();
+        let (_proxy_lock, _proxy_guard) = loopback_proxy_guard().await;
 
         // The kernel accepts the connection, but nobody ever answers.
         let silent = TcpListener::bind(("127.0.0.1", 0)).unwrap();

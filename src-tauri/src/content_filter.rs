@@ -358,16 +358,17 @@ fn is_code_snippet(text: &str) -> bool {
 
     // Symbol-only strong operators anywhere on first line of short copy
     let first_trim = first_line.trim();
-    if first_trim.contains("};") || first_trim.contains("});") || first_trim.contains(");") {
-        if first_trim
+    let ends_a_statement =
+        first_trim.contains("};") || first_trim.contains("});") || first_trim.contains(");");
+    if ends_a_statement
+        && (first_trim
             .chars()
             .filter(|c| !c.is_whitespace())
             .all(|c| !c.is_ascii_alphabetic())
             || first_trim.contains("function")
-            || first_trim.contains("const ")
-        {
-            return true;
-        }
+            || first_trim.contains("const "))
+    {
+        return true;
     }
 
     for ind in WEAK_PREFIXES {
@@ -407,7 +408,7 @@ fn is_base64_blob(text: &str) -> bool {
         return false;
     }
     let clean: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    clean.len() >= 40 && (clean.ends_with('=') || clean.len() % 4 == 0)
+    clean.len() >= 40 && (clean.ends_with('=') || clean.len().is_multiple_of(4))
 }
 
 fn is_email(text: &str) -> bool {
