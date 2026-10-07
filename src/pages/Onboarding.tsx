@@ -16,6 +16,7 @@ import { Button } from '../components/ui/Button';
 import { TextInput } from '../components/ui/TextInput';
 import { Toggle } from '../components/ui/Toggle';
 import { classNames } from '../utils/format';
+import { connectionOkText, useConnectionTest } from '../hooks/useConnectionTest';
 import * as bridge from '../lib/tauri-bridge';
 
 const WALLPAPER_LIGHT = '/2c289357-34ac-4f7f-a87b-992be2963c85.jpg';
@@ -26,10 +27,10 @@ export function Onboarding() {
   const navigate = useNavigate();
   const { settings, updateSettings, setOnboarded } = useLexNote();
   const [step, setStep] = useState(0);
-  const [test, setTest] = useState<'idle' | 'testing' | 'ok' | 'error'>('idle');
   const [autostartError, setAutostartError] = useState<string | null>(null);
   const [autostartEnabled, setAutostartEnabled] = useState(settings.launchAtLogin);
   const provider = settings.provider;
+  const { state: connection, test: runConnectionTest } = useConnectionTest(provider);
   const patch = (changes: Partial<typeof provider>) =>
   updateSettings({ provider: changes });
 
@@ -95,7 +96,6 @@ export function Onboarding() {
                 type="button"
                 onClick={() => {
                   patch({ name: preset.name, protocol: preset.protocol, baseUrl: preset.baseUrl, model: preset.model });
-                  setTest('idle');
                 }}
                 className={classNames(
                   'rounded-full border px-2.5 py-1 text-[11px] transition-colors',
@@ -128,10 +128,7 @@ export function Onboarding() {
                   <TextInput
                   type="password"
                   value={provider.apiKey}
-                  onChange={(event) => {
-                    patch({ apiKey: event.target.value });
-                    setTest('idle');
-                  }}
+                  onChange={(event) => patch({ apiKey: event.target.value })}
                   placeholder="sk-…" />
                 
                 </label>
@@ -143,28 +140,19 @@ export function Onboarding() {
               <div className="mt-3 flex items-center gap-2">
                 <Button
                 variant="primary"
-                icon={test === 'testing' ? <LoaderIcon size={13} className="animate-spin" /> : <ZapIcon size={13} />}
-                disabled={test === 'testing'}
-                onClick={async () => {
-                  setTest('testing');
-                  try {
-                    const { testConnection } = await import('../lib/tauri-bridge');
-                    await testConnection(provider.baseUrl, provider.apiKey, provider.model, provider.protocol);
-                    setTest('ok');
-                  } catch {
-                    setTest('error');
-                  }
-                }}>
+                icon={connection.status === 'testing' ? <LoaderIcon size={13} className="animate-spin" /> : <ZapIcon size={13} />}
+                disabled={connection.status === 'testing'}
+                onClick={runConnectionTest}>
                 
                   测试连接
                 </Button>
-                {test === 'ok' ?
+                {connection.status === 'ok' ?
               <span className="inline-flex items-center gap-1.5 text-[11px] text-positive">
-                    <CheckCircle2Icon size={13} /> 连接正常 · 412ms · 模型回显 {provider.model}
+                    <CheckCircle2Icon size={13} /> {connectionOkText(connection)}
                   </span> :
               null}
-                {test === 'error' ?
-              <span className="text-[11px] text-danger">鉴权失败（401）：请检查 API Key 是否填写正确</span> :
+                {connection.status === 'error' ?
+              <span role="alert" className="text-[11px] text-danger">{connection.message}</span> :
               null}
               </div>
             </div> :
@@ -241,10 +229,10 @@ export function Onboarding() {
           <Button
             variant="primary"
             icon={<ArrowRightIcon size={13} />}
-            disabled={step === 0 && test !== 'ok'}
+            disabled={step === 0 && connection.status !== 'ok'}
             onClick={() => setStep((value) => value + 1)}>
             
-              {step === 0 && test !== 'ok' ? '请先测试连接' : '下一步'}
+              {step === 0 && connection.status !== 'ok' ? '请先测试连接' : '下一步'}
             </Button> :
 
           <Button

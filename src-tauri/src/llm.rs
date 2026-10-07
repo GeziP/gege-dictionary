@@ -16,6 +16,42 @@ pub(crate) fn truncate_for_log(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// Every machine-readable kind an LLM call can fail with. The code travels as a
+/// `[code] ` prefix on the error string, so the UI picks its advice from the code
+/// instead of guessing from wording. `src/lib/lookup-errors.ts` mirrors this list and
+/// `error_codes_match_the_frontend_contract` fails if the two differ.
+pub(crate) const ERROR_CODES: &[&str] = &[
+    "no_key",
+    "auth",
+    "model",
+    "rate_limit",
+    "server",
+    "http",
+    "timeout",
+    "network",
+    "parse",
+    "empty",
+    "truncated",
+    "api",
+    "internal",
+    "unknown",
+];
+
+/// Tag `message` with its error `code`: the one shape every LLM-facing error leaves this module in.
+pub(crate) fn coded(code: &str, message: impl std::fmt::Display) -> String {
+    debug_assert!(
+        ERROR_CODES.contains(&code),
+        "unregistered error code: {code}"
+    );
+    format!("[{code}] {message}")
+}
+
+/// The registered code carried by `err`, if it has one.
+pub(crate) fn error_code(err: &str) -> Option<&str> {
+    let (code, _) = err.trim_start().strip_prefix('[')?.split_once(']')?;
+    ERROR_CODES.contains(&code).then_some(code)
+}
+
 pub struct IncrementalJsonExtractor {
     buffer: String,
     emitted: HashSet<String>,
@@ -317,13 +353,16 @@ async fn call_openai_blocking(
     let resp_text = response
         .text()
         .await
-        .map_err(|e| format!("响应读取失败: {e}"))?;
+        .map_err(|e| coded("network", format!("响应读取失败: {e}")))?;
     eprintln!("[call_openai_blocking] response_len={}", resp_text.len());
 
     let resp_json: Value = serde_json::from_str(&resp_text).map_err(|e| {
-        format!(
-            "响应JSON解析失败: {e}. 原始响应: {}",
-            truncate_for_log(&resp_text, 200)
+        coded(
+            "parse",
+            format!(
+                "响应JSON解析失败: {e}. 原始响应: {}",
+                truncate_for_log(&resp_text, 200)
+            ),
         )
     })?;
 
@@ -333,7 +372,7 @@ async fn call_openai_blocking(
             .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or_else(|| err_obj.as_str().unwrap_or("unknown error"));
-        return Err(format!("API 错误: {err_msg} (url={url})"));
+        return Err(coded("api", format!("API 错误: {err_msg} (url={url})")));
     }
     if resp_json.get("success") == Some(&Value::Bool(false)) {
         let msg = resp_json
@@ -341,7 +380,10 @@ async fn call_openai_blocking(
             .and_then(|m| m.as_str())
             .unwrap_or("unknown");
         let code = resp_json.get("code").and_then(|c| c.as_u64()).unwrap_or(0);
-        return Err(format!("API 网关错误: {msg} (code={code}, url={url})"));
+        return Err(coded(
+            "api",
+            format!("API 网关错误: {msg} (code={code}, url={url})"),
+        ));
     }
 
     let finish_reason = resp_json
@@ -351,8 +393,9 @@ async fn call_openai_blocking(
         .and_then(|f| f.as_str())
         .unwrap_or("unknown");
     if finish_reason == "length" {
-        return Err(format!(
-            "模型输出被截断（max_tokens={max_tokens}），请提高最大 tokens 后重试"
+        return Err(coded(
+            "truncated",
+            format!("模型输出被截断（max_tokens={max_tokens}），请提高最大 tokens 后重试"),
         ));
     }
 
@@ -402,9 +445,12 @@ async fn call_openai_blocking(
             "[call_openai_blocking] empty content! resp_len={} snippet_len={resp_snippet_len}",
             resp_text.len()
         );
-        return Err(format!(
-            "模型返回空内容 (finish_reason={finish_reason}). 原始响应长度: {}",
-            resp_text.len()
+        return Err(coded(
+            "empty",
+            format!(
+                "模型返回空内容 (finish_reason={finish_reason}). 原始响应长度: {}",
+                resp_text.len()
+            ),
         ));
     }
     Ok(content)
@@ -451,7 +497,7 @@ async fn call_openai_streaming<F: FnMut(&str)>(
     let mut finish_reason: Option<String> = None;
 
     'stream: while let Some(chunk) = stream.next().await {
-        let bytes = chunk.map_err(|e| format!("Stream read error: {e}"))?;
+        let bytes = chunk.map_err(|e| coded("network", format!("流式读取中断: {e}")))?;
         let text = String::from_utf8_lossy(&bytes);
 
         for ch in text.chars() {
@@ -490,11 +536,12 @@ async fn call_openai_streaming<F: FnMut(&str)>(
     }
 
     if full_text.is_empty() {
-        return Err("流式响应为空".to_string());
+        return Err(coded("empty", "流式响应为空"));
     }
     if finish_reason.as_deref() == Some("length") {
-        return Err(format!(
-            "模型流式输出被截断（max_tokens={max_tokens}），请提高最大 tokens 后重试"
+        return Err(coded(
+            "truncated",
+            format!("模型流式输出被截断（max_tokens={max_tokens}），请提高最大 tokens 后重试"),
         ));
     }
     Ok(full_text)
@@ -569,7 +616,7 @@ async fn call_anthropic_blocking(
     let resp_json: Value = response
         .json()
         .await
-        .map_err(|e| format!("响应解析失败: {e}"))?;
+        .map_err(|e| coded("parse", format!("响应解析失败: {e}")))?;
 
     let content = resp_json
         .get("content")
@@ -584,12 +631,14 @@ async fn call_anthropic_blocking(
         .to_string();
 
     if content.is_empty() {
-        let err_msg = resp_json
+        let api_error = resp_json
             .get("error")
             .and_then(|e| e.get("message"))
-            .and_then(|m| m.as_str())
-            .unwrap_or("模型返回了空内容");
-        return Err(err_msg.to_string());
+            .and_then(|m| m.as_str());
+        return Err(match api_error {
+            Some(message) => coded("api", message),
+            None => coded("empty", "模型返回了空内容"),
+        });
     }
     Ok(content)
 }
@@ -634,7 +683,7 @@ async fn call_anthropic_streaming<F: FnMut(&str)>(
     let mut line_buf = String::new();
 
     while let Some(chunk) = stream.next().await {
-        let bytes = chunk.map_err(|e| format!("Stream read error: {e}"))?;
+        let bytes = chunk.map_err(|e| coded("network", format!("流式读取中断: {e}")))?;
         let text = String::from_utf8_lossy(&bytes);
 
         for ch in text.chars() {
@@ -657,7 +706,7 @@ async fn call_anthropic_streaming<F: FnMut(&str)>(
     }
 
     if full_text.is_empty() {
-        return Err("流式响应为空".to_string());
+        return Err(coded("empty", "流式响应为空"));
     }
     Ok(full_text)
 }
@@ -722,7 +771,10 @@ async fn test_openai(
     let latency = start.elapsed().as_millis();
     let response = check_response(response).await?;
 
-    let resp: Value = response.json().await.map_err(|e| e.to_string())?;
+    let resp: Value = response
+        .json()
+        .await
+        .map_err(|e| coded("parse", format!("响应解析失败: {e}")))?;
     let resp_model = resp.get("model").and_then(|v| v.as_str()).unwrap_or(model);
 
     Ok(serde_json::json!({
@@ -760,7 +812,10 @@ async fn test_anthropic(
     let latency = start.elapsed().as_millis();
     let response = check_response(response).await?;
 
-    let resp: Value = response.json().await.map_err(|e| e.to_string())?;
+    let resp: Value = response
+        .json()
+        .await
+        .map_err(|e| coded("parse", format!("响应解析失败: {e}")))?;
     let resp_model = resp.get("model").and_then(|v| v.as_str()).unwrap_or(model);
 
     Ok(serde_json::json!({
@@ -788,7 +843,7 @@ pub fn parse_entry(raw: &str, selection: &str, kind: &str) -> Result<Value, Stri
                 "[parse_entry] all repair attempts failed. raw_head={}",
                 truncate_for_log(&json_str, 500)
             );
-            format!("JSON 解析失败: {e}")
+            coded("parse", format!("JSON 解析失败: {e}"))
         })?;
 
     if let Some(obj) = entry.as_object_mut() {
@@ -863,7 +918,9 @@ pub fn parse_entry(raw: &str, selection: &str, kind: &str) -> Result<Value, Stri
 }
 
 fn extract_json_block(text: &str) -> Result<String, String> {
-    let start = text.find('{').ok_or("No JSON object found in response")?;
+    let start = text
+        .find('{')
+        .ok_or_else(|| coded("parse", "模型返回的内容里没有 JSON 对象"))?;
     let end = text.rfind('}').map(|i| i + 1).unwrap_or(text.len());
     Ok(text[start..end].to_string())
 }
@@ -946,16 +1003,36 @@ fn build_client(timeout_secs: u64) -> Result<Client, String> {
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(timeout_secs.max(30)))
         .build()
-        .map_err(|e| format!("HTTP client error: {e}"))
+        .map_err(|e| coded("internal", format!("HTTP client error: {e}")))
 }
 
+/// Classify a failed send by what reqwest says went wrong, never by the wording of its message.
 fn format_request_error(e: &reqwest::Error) -> String {
     if e.is_timeout() {
-        "请求超时，请检查网络连接或增加超时时间".to_string()
+        coded("timeout", "请求超时，请检查网络连接或增加超时时间")
     } else if e.is_connect() {
-        "无法连接到模型服务，请检查 Base URL 是否正确".to_string()
+        coded("network", "无法连接到模型服务，请检查 Base URL 是否正确")
     } else {
-        format!("网络请求失败: {e}")
+        coded("network", format!("网络请求失败: {e}"))
+    }
+}
+
+/// The coded error for a non-success HTTP status. `body` is only quoted, and bounded, for
+/// statuses nothing more specific is known about.
+fn status_error(status: u16, body: &str) -> String {
+    match status {
+        401 => coded("auth", "鉴权失败（401）：请检查 API Key 是否正确"),
+        403 => coded("auth", "访问被拒绝（403）：API Key 权限不足"),
+        404 => coded(
+            "model",
+            "模型不存在（404）：请检查模型名称与 Base URL 是否正确",
+        ),
+        429 => coded("rate_limit", "请求过于频繁（429）：请稍后重试"),
+        500..=599 => coded("server", format!("服务端错误（{status}）：请稍后重试")),
+        _ => coded(
+            "http",
+            format!("HTTP {status}: {}", truncate_for_log(body, 300)),
+        ),
     }
 }
 
@@ -963,16 +1040,9 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
     if response.status().is_success() {
         return Ok(response);
     }
-    let status_code = response.status().as_u16();
-    let body_text = response.text().await.unwrap_or_default();
-    Err(match status_code {
-        401 => "鉴权失败（401）：请检查 API Key 是否正确".to_string(),
-        403 => "访问被拒绝（403）：API Key 权限不足".to_string(),
-        404 => "模型不存在（404）：请检查模型名称".to_string(),
-        429 => "请求过于频繁（429）：请稍后重试".to_string(),
-        500..=599 => format!("服务端错误（{}）：请稍后重试", status_code),
-        _ => format!("HTTP {}: {}", status_code, body_text),
-    })
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+    Err(status_error(status, &body))
 }
 
 #[cfg(test)]
@@ -1317,5 +1387,201 @@ mod tests {
         let mut extractor = IncrementalJsonExtractor::new();
         let fields = extractor.push(r#"```json {"ipaUS":null,"examples":[{"en":"unfinished"#);
         assert_eq!(fields, vec![("ipaUS".into(), Value::Null)]);
+    }
+
+    /// Serve one canned HTTP response on a loopback port; returns the base URL to call it at.
+    /// The request is read in full first, so closing the socket cannot reset a half-sent upload.
+    fn serve_once(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            let header_end = loop {
+                let count = stream.read(&mut chunk).unwrap();
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(at) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break at + 4;
+                }
+                assert!(count > 0, "client closed before finishing its headers");
+            };
+            let head = String::from_utf8_lossy(&request[..header_end]).to_lowercase();
+            let body_len: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            while request.len() < header_end + body_len {
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0, "client closed in the middle of its body");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+        (base_url, server)
+    }
+
+    #[test]
+    fn every_failure_status_maps_to_one_stable_code() {
+        for (status, code) in [
+            (401, "auth"),
+            (403, "auth"),
+            (404, "model"),
+            (429, "rate_limit"),
+            (500, "server"),
+            (502, "server"),
+            (503, "server"),
+            (529, "server"),
+            (400, "http"),
+            (402, "http"),
+            (413, "http"),
+            (422, "http"),
+            (451, "http"),
+        ] {
+            let err = status_error(status, "");
+            assert_eq!(error_code(&err), Some(code), "status {status}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_unexpected_status_quotes_only_a_bounded_slice_of_the_body() {
+        let err = status_error(400, &"x".repeat(5000));
+        assert!(err.starts_with("[http] HTTP 400: "));
+        assert!(err.chars().count() < 400, "{} chars", err.chars().count());
+        // Multi-byte bodies are cut on a character boundary rather than panicking.
+        assert!(status_error(400, &"错".repeat(5000)).contains('…'));
+    }
+
+    #[test]
+    fn coded_errors_carry_exactly_their_code() {
+        for code in ERROR_CODES {
+            let err = coded(code, "boom");
+            assert_eq!(err, format!("[{code}] boom"));
+            assert_eq!(error_code(&err), Some(*code));
+        }
+    }
+
+    #[test]
+    fn error_code_ignores_anything_unregistered() {
+        assert_eq!(error_code("  [timeout] slow"), Some("timeout"));
+        for text in [
+            "[bogus] x",
+            "auth] x",
+            "[auth x",
+            "[] x",
+            "plain",
+            "",
+            "[Auth] x",
+        ] {
+            assert_eq!(error_code(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn error_codes_match_the_frontend_contract() {
+        let source = include_str!("../../src/lib/lookup-errors.ts");
+        let list = source
+            .split("LOOKUP_ERROR_CODES = [")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .expect("src/lib/lookup-errors.ts must declare LOOKUP_ERROR_CODES");
+        let mut frontend: Vec<&str> = list.split('\'').skip(1).step_by(2).collect();
+        let mut backend = ERROR_CODES.to_vec();
+        frontend.sort_unstable();
+        backend.sort_unstable();
+        assert_eq!(
+            frontend, backend,
+            "ERROR_CODES (llm.rs) and LOOKUP_ERROR_CODES (lookup-errors.ts) must list the same codes"
+        );
+    }
+
+    #[test]
+    fn model_output_that_is_not_json_is_a_parse_error() {
+        for raw in ["no braces here", "{ not json at all"] {
+            let err = parse_entry(raw, "x", "word").unwrap_err();
+            assert_eq!(error_code(&err), Some("parse"), "{raw}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_connection_test_reports_the_status_as_a_code() {
+        let (_proxy_lock, _proxy_guard) = loopback_proxy_guard();
+        for (status_line, code) in [
+            ("401 Unauthorized", "auth"),
+            ("404 Not Found", "model"),
+            ("429 Too Many Requests", "rate_limit"),
+            ("503 Service Unavailable", "server"),
+            ("400 Bad Request", "http"),
+        ] {
+            for protocol in ["openai", "anthropic"] {
+                let (base_url, server) = serve_once(status_line, r#"{"error":"nope"}"#);
+                let err = test_connection(&base_url, "key", "model", protocol)
+                    .await
+                    .unwrap_err();
+                server.join().unwrap();
+                assert_eq!(
+                    error_code(&err),
+                    Some(code),
+                    "{status_line} via {protocol}: {err}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_success_with_an_unreadable_body_is_a_parse_error() {
+        let (_proxy_lock, _proxy_guard) = loopback_proxy_guard();
+        let (base_url, server) = serve_once("200 OK", "this is not json");
+        let err = test_connection(&base_url, "key", "model", "openai")
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error_code(&err), Some("parse"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn transport_failures_are_classified_by_kind_not_by_message() {
+        let (_proxy_lock, _proxy_guard) = loopback_proxy_guard();
+
+        // The kernel accepts the connection, but nobody ever answers.
+        let silent = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let client = Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let err = client
+            .get(format!("http://{}", silent.local_addr().unwrap()))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error_code(&format_request_error(&err)),
+            Some("timeout"),
+            "{err}"
+        );
+
+        // Nothing is listening on this port any more.
+        let closed = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = closed.local_addr().unwrap();
+        drop(closed);
+        let err = Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error_code(&format_request_error(&err)),
+            Some("network"),
+            "{err}"
+        );
     }
 }

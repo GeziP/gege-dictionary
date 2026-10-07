@@ -133,6 +133,8 @@ interface LexNoteValue {
   saveTemplate: (template: PromptTemplate) => void;
   resetTemplates: () => void;
   triggerLookup: (selection: string, context: string, kind: string, sourceApp?: string, sourceTitle?: string, forceRefresh?: boolean) => void;
+  /** Looks the same text up again, as the same kind it was first looked up as. */
+  retryLookup: (context?: string) => void;
   clearLookup: () => void;
   refreshWords: () => void;
   refreshAppState: () => Promise<void>;
@@ -568,6 +570,17 @@ export function LexNoteProvider({
     [isTauri, lookupListenersReady, settings.streamingEnabled]
   );
 
+  // The kind comes from the first lookup (the backend detected it), not from re-counting words
+  // here: the two counts disagree on text with leading or trailing whitespace.
+  const retryLookup = useCallback(
+    (context?: string) => {
+      const { selection, kind } = activeLookupRef.current;
+      if (!selection) return;
+      void triggerLookup(selection, context ?? lookupContext, kind);
+    },
+    [triggerLookup, lookupContext]
+  );
+
   const clearLookup = useCallback(() => {
     setLookupStatus('idle');
     setLookupResult(null);
@@ -615,6 +628,7 @@ export function LexNoteProvider({
     saveTemplate,
     resetTemplates,
     triggerLookup,
+    retryLookup,
     clearLookup,
     refreshWords,
     refreshAppState,

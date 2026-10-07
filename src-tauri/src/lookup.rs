@@ -39,26 +39,14 @@ pub(crate) fn should_fallback_stream(saw_content: bool) -> bool {
     !saw_content
 }
 
-/// Prefix LLM errors with a stable machine-readable code for empty-state UI.
+/// Make sure a lookup error reaches the UI carrying a code. Errors from `llm.rs` already
+/// have the one chosen from the real cause (HTTP status, kind of transport error, ...);
+/// anything else is `unknown` - the wording of a message is never enough to invent a code.
 pub(crate) fn classify_lookup_error(err: &str) -> String {
-    let lower = err.to_lowercase();
-    if lower.contains("401")
-        || lower.contains("unauthorized")
-        || lower.contains("invalid api key")
-        || lower.contains("authentication")
-    {
-        format!("[auth] {err}")
-    } else if lower.contains("timed out") || lower.contains("timeout") {
-        format!("[timeout] {err}")
-    } else if lower.contains("connection")
-        || lower.contains("dns")
-        || lower.contains("connect")
-        || lower.contains("network")
-        || lower.contains("socket")
-    {
-        format!("[network] {err}")
+    if llm::error_code(err).is_some() {
+        err.trim_start().to_string()
     } else {
-        format!("[network] {err}")
+        llm::coded("unknown", err)
     }
 }
 
@@ -78,9 +66,8 @@ struct PreparedLookup {
 
 fn decrypt_provider_api_key(raw_key: &str, log_prefix: &str) -> String {
     eprintln!(
-        "[{log_prefix}] raw_key starts_with dpapi={}, len={}",
-        raw_key.starts_with("dpapi:"),
-        raw_key.len()
+        "[{log_prefix}] stored key is DPAPI-encrypted={}",
+        raw_key.starts_with("dpapi:")
     );
     #[cfg(windows)]
     {
@@ -157,7 +144,7 @@ fn prepare_lookup(
         let settings = db.get_settings()?;
         let provider = settings
             .get("provider")
-            .ok_or("No provider configured")?
+            .ok_or_else(|| llm::coded("no_key", "尚未配置模型服务，请到设置页填写"))?
             .clone();
         let templates = db.get_templates()?;
         let scope = match kind {
@@ -275,10 +262,10 @@ fn prepare_lookup(
     };
 
     if api_key.trim().is_empty() {
-        return Err("[no_key] 尚未配置 API Key，请到设置页填写".to_string());
+        return Err(llm::coded("no_key", "尚未配置 API Key，请到设置页填写"));
     }
     if api_key.starts_with("dpapi:") {
-        return Err("[no_key] API Key 解密失败，请到设置页重新输入".to_string());
+        return Err(llm::coded("no_key", "API Key 解密失败，请到设置页重新输入"));
     }
 
     let cache_key = lookup_cache_key(selection, context, kind, &model, &template_body);
@@ -338,10 +325,11 @@ pub(crate) fn resolve_api_key_for_request(
             .unwrap_or("")
             .to_string();
         if stored.is_empty() {
-            return Err("尚未配置 API Key".into());
+            return Err(llm::coded("no_key", "尚未配置 API Key"));
         }
         if dpapi::is_encrypted(&stored) {
-            return dpapi::decrypt(&stored);
+            return dpapi::decrypt(&stored)
+                .map_err(|e| llm::coded("no_key", format!("API Key 解密失败，请重新输入（{e}）")));
         }
         return Ok(stored);
     }
@@ -349,7 +337,7 @@ pub(crate) fn resolve_api_key_for_request(
     {
         let _ = state;
         if api_key.is_empty() || is_placeholder_api_key(api_key) {
-            return Err("尚未配置 API Key".into());
+            return Err(llm::coded("no_key", "尚未配置 API Key"));
         }
         Ok(api_key.to_string())
     }
@@ -414,7 +402,7 @@ pub async fn lookup_word(
 
     let mut entry = llm::parse_entry(&full_text, &selection, &kind).map_err(|e| {
         eprintln!("[lookup_word] parse FAIL: {e}");
-        format!("JSON 解析失败: {e}")
+        classify_lookup_error(&e)
     })?;
     annotate_lookup_entry(&mut entry, &prepared.template_name);
     store_lookup_cache(&state, &prepared.cache_key, &prepared.model, &entry);
@@ -455,11 +443,7 @@ pub async fn lookup_word_stream(
         return Ok(());
     }
 
-    eprintln!(
-        "[lookup_stream] starting SSE, key_len={}, url={}",
-        prepared.api_key.len(),
-        prepared.base_url
-    );
+    eprintln!("[lookup_stream] starting SSE, url={}", prepared.base_url);
 
     let rid = request_id.clone();
     let app_clone = app.clone();
@@ -538,7 +522,7 @@ pub async fn lookup_word_stream(
                 Ok(())
             }
             Err(e) => {
-                let err_msg = format!("JSON 解析失败: {e}");
+                let err_msg = classify_lookup_error(&e);
                 let _ = app.emit(
                     "lookup://error",
                     serde_json::json!({
@@ -645,11 +629,22 @@ mod tests {
     }
 
     #[test]
-    fn classify_lookup_error_prefixes_stable_codes() {
-        assert!(classify_lookup_error("401 Unauthorized").starts_with("[auth]"));
-        assert!(classify_lookup_error("request timed out").starts_with("[timeout]"));
-        assert!(classify_lookup_error("connection refused").starts_with("[network]"));
-        assert!(classify_lookup_error("something else").starts_with("[network]"));
+    fn classify_lookup_error_keeps_a_real_code_and_never_guesses_one() {
+        // A code chosen at the source passes through untouched...
+        for code in llm::ERROR_CODES {
+            let err = llm::coded(code, "x");
+            assert_eq!(classify_lookup_error(&err), err);
+        }
+        // ...and the wording of a message is never enough to invent one.
+        for text in [
+            "401 Unauthorized",
+            "request timed out",
+            "connection refused",
+            "请求超时",
+            "something else",
+        ] {
+            assert_eq!(classify_lookup_error(text), format!("[unknown] {text}"));
+        }
     }
 
     #[test]

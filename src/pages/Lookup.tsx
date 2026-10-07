@@ -16,6 +16,7 @@ import {
 import { useLexNote } from '../contexts/LexNoteContext';
 import { Skeleton } from '../components/ui/Skeleton';
 import { SpeakButton } from '../components/card/SpeakButton';
+import { LookupErrorState } from '../components/card/LookupErrorState';
 import type { Entry, SavedWord } from '../types/lexnote';
 import { classNames } from '../utils/format';
 import { RichText } from '../components/ui/RichText';
@@ -38,6 +39,7 @@ export function Lookup() {
     settings,
     saveWord: ctxSaveWord,
     triggerLookup,
+    retryLookup,
     countLookup,
     clearLookup,
   } = useLexNote();
@@ -255,11 +257,17 @@ export function Lookup() {
     return () => window.removeEventListener('keydown', handler);
   }, [entry, handleSave, lookupStatus, pinned, saved, saving, settings.ttsRate, settings.ttsVoice]);
 
-  const handleRetry = () => {
-    if (lookupSelection) {
-      const wc = lookupSelection.split(/\s+/).length;
-      const kind = wc >= 30 ? 'paragraph' : wc >= 6 ? 'sentence' : lookupSelection.includes(' ') ? 'phrase' : 'word';
-      triggerLookup(lookupSelection, contextDraft || lookupContext, kind);
+  const handleRetry = () => retryLookup(contextDraft || lookupContext);
+
+  const handleOpenSettings = async () => {
+    await bridge.closeLookupWindow();
+    await bridge.showMainWindow().catch(() => undefined);
+    try {
+      const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+      const main = await WebviewWindow.getByLabel('main');
+      await main?.emit('gege://navigate', { path: '/settings' });
+    } catch (error) {
+      console.warn('Could not ask the main window to open Settings:', error);
     }
   };
 
@@ -431,86 +439,7 @@ export function Lookup() {
           )}
 
           {lookupStatus === 'error' && (
-            <div className="flex flex-col items-center gap-3 py-8 text-center">
-              <p className="text-[12px] text-danger">{lookupError}</p>
-              {(() => {
-                const raw = lookupError || '';
-                const codeMatch = raw.match(/^\[([a-z_]+)\]\s*/i);
-                const code = codeMatch?.[1]?.toLowerCase() || '';
-                const msg = raw.toLowerCase();
-                const noKey =
-                  code === 'no_key' ||
-                  msg.includes('api key') ||
-                  msg.includes('apikey') ||
-                  msg.includes('未配置') ||
-                  msg.includes('unauthorized') ||
-                  msg.includes('401');
-                const auth = code === 'auth' || msg.includes('401') || msg.includes('unauthorized');
-                const timeout = code === 'timeout' || msg.includes('timed out') || msg.includes('超时');
-                const network =
-                  code === 'network' ||
-                  msg.includes('connection') ||
-                  msg.includes('network') ||
-                  msg.includes('连接失败');
-                const filtered =
-                  code === 'filtered' || msg.includes('被过滤') || msg.includes('filtered');
-                if (noKey || auth) {
-                  return (
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        await bridge.closeLookupWindow();
-                        await bridge.showMainWindow().catch(() => undefined);
-                        try {
-                          const mod = await import('@tauri-apps/api/webviewWindow');
-                          const main = await mod.WebviewWindow.getByLabel('main');
-                          if (main) {
-                            await main.emit('gege://navigate', { path: '/settings' });
-                          }
-                        } catch {
-                          /* ignore */
-                        }
-                      }}
-                      className="rounded-md border border-line bg-raised px-3 py-1.5 text-[11px] text-ink hover:bg-sunken"
-                    >
-                      {auth ? '检查 API Key 与额度' : '去设置配置 API Key'}
-                    </button>
-                  );
-                }
-                if (filtered) {
-                  return (
-                    <p className="text-[11px] text-ink-subtle">
-                      该内容不会发送给模型。可关闭智能过滤或改用双击 Ctrl+C 强制查词。
-                    </p>
-                  );
-                }
-                if (timeout || network) {
-                  return (
-                    <div className="flex flex-col items-center gap-2">
-                      <p className="text-[11px] text-ink-subtle">
-                        {timeout ? '请求超时，可增大设置中的超时秒数后重试。' : '网络连接失败，请检查网络或模型服务地址。'}
-                      </p>
-                      <button
-                        type="button"
-                        onClick={handleRetry}
-                        className="inline-flex items-center gap-1.5 rounded-md border border-line bg-raised px-3 py-1.5 text-[11px] text-ink hover:bg-sunken"
-                      >
-                        <RefreshCwIcon size={12} /> 重试
-                      </button>
-                    </div>
-                  );
-                }
-                return (
-                  <button
-                    type="button"
-                    onClick={handleRetry}
-                    className="inline-flex items-center gap-1.5 rounded-md border border-line bg-raised px-3 py-1.5 text-[11px] text-ink hover:bg-sunken"
-                  >
-                    <RefreshCwIcon size={12} /> 重试
-                  </button>
-                );
-              })()}
-            </div>
+            <LookupErrorState error={lookupError} onRetry={handleRetry} onOpenSettings={handleOpenSettings} />
           )}
 
           {entry && (lookupStatus === 'streaming' || lookupStatus === 'done') && (

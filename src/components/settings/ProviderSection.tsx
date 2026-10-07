@@ -6,38 +6,22 @@ import { Button } from '../ui/Button';
 import { TextInput } from '../ui/TextInput';
 import { SettingsSection } from './SettingsSection';
 import { classNames } from '../../utils/format';
+import { connectionOkText, useConnectionTest } from '../../hooks/useConnectionTest';
 
 function maskApiKey(key: string): string {
   if (!key || key.length <= 8) return key ? '••••••••' : '';
   return `${key.slice(0, 4)}••••${key.slice(-4)}`;
 }
 
-type TestState =
-  | {status: 'idle';}
-  | {status: 'testing';}
-  | {status: 'ok';latency: number;}
-  | {status: 'error';message: string;};
-
 export function ProviderSection() {
   const { settings, updateSettings } = useLexNote();
   const { provider } = settings;
   const [showKey, setShowKey] = useState(false);
   const [editingKey, setEditingKey] = useState(false);
-  const [test, setTest] = useState<TestState>({ status: 'idle' });
+  const { state: test, test: runTest } = useConnectionTest(provider);
 
   const patch = (changes: Partial<typeof provider>) =>
   updateSettings({ provider: changes });
-
-  const runTest = async () => {
-    setTest({ status: 'testing' });
-    try {
-      const { testConnection } = await import('../../lib/tauri-bridge');
-      const result = await testConnection(provider.baseUrl, provider.apiKey, provider.model, provider.protocol);
-      setTest({ status: 'ok', latency: result.latency });
-    } catch (e) {
-      setTest({ status: 'error', message: String(e) });
-    }
-  };
 
   return (
     <div className="space-y-3">
@@ -160,11 +144,11 @@ export function ProviderSection() {
           {test.status === 'ok' ?
           <span className="inline-flex items-center gap-1.5 text-[11px] text-positive">
               <CheckCircle2Icon size={13} />
-              连接正常 · {test.latency}ms · 模型回显 {provider.model}
+              {connectionOkText(test)}
             </span> :
           null}
           {test.status === 'error' ?
-          <span className="text-[11px] text-danger">{test.message}</span> :
+          <span role="alert" className="text-[11px] text-danger">{test.message}</span> :
           null}
         </div>
         <p className="mt-1 text-[10px] text-ink-subtle">
