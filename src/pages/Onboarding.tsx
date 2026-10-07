@@ -15,9 +15,10 @@ import { PROVIDER_PRESETS } from '../data/providers';
 import { Button } from '../components/ui/Button';
 import { TextInput } from '../components/ui/TextInput';
 import { Toggle } from '../components/ui/Toggle';
-import { WALLPAPER_LIGHT } from '../data/scenes';
 import { classNames } from '../utils/format';
 import * as bridge from '../lib/tauri-bridge';
+
+const WALLPAPER_LIGHT = '/2c289357-34ac-4f7f-a87b-992be2963c85.jpg';
 
 const STEPS = ['配置模型', '划词即查', '数据与隐私'];
 
