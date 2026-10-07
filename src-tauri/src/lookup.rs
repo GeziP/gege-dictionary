@@ -11,8 +11,7 @@ use tauri::Emitter;
 pub(crate) const API_KEY_PLACEHOLDER: &str = "••••••••";
 
 pub(crate) fn is_placeholder_api_key(value: &str) -> bool {
-    value == API_KEY_PLACEHOLDER
-        || value.chars().all(|c| c == '•' || c == '*') && value.len() >= 4
+    value == API_KEY_PLACEHOLDER || value.chars().all(|c| c == '•' || c == '*') && value.len() >= 4
 }
 
 pub(crate) fn lookup_cache_key(

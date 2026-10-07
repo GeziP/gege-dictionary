@@ -198,7 +198,11 @@ fn migrate_api_key_storage(database: &db::Database) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn record_event(state: &tauri::State<'_, AppState>, event: &str, extra: serde_json::Value) {
+pub(crate) fn record_event(
+    state: &tauri::State<'_, AppState>,
+    event: &str,
+    extra: serde_json::Value,
+) {
     if let Ok(db) = state.db.lock() {
         let _ = db.record_local_event(event, &extra);
     }
@@ -491,7 +495,9 @@ async fn save_settings(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
         {
-            if lookup::is_placeholder_api_key(&key_val) || (key_val.is_empty() && !stored_key.is_empty()) {
+            if lookup::is_placeholder_api_key(&key_val)
+                || (key_val.is_empty() && !stored_key.is_empty())
+            {
                 eprintln!("[save_settings] placeholder/empty apiKey; keeping stored ciphertext");
                 provider.insert("apiKey".to_string(), serde_json::Value::String(stored_key));
             } else {
@@ -835,7 +841,10 @@ async fn get_last_capture(state: tauri::State<'_, AppState>) -> Result<serde_jso
     } else {
         let sel = val.get("selection").and_then(|v| v.as_str()).unwrap_or("");
         let kind = val.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-        eprintln!("[get_last_capture] returned {}", lookup::selection_meta(sel, kind));
+        eprintln!(
+            "[get_last_capture] returned {}",
+            lookup::selection_meta(sel, kind)
+        );
     }
     Ok(val)
 }
