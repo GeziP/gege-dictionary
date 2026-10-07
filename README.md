@@ -80,13 +80,15 @@
 | **IVD 领域深化** | 结构化展示检测原理、明确上下文中的样本与分析物、前中后分析流程、性能指标、干扰、质控和适用边界 |
 | **低门槛个人术语表** | 界面逐条新增或直接粘贴 Excel 两列表格；JSON / TSV 仅作为高级迁移与备份入口 |
 | **Markdown 富文本** | 解析结果中的 **加粗**、`代码`、列表等自动渲染 |
-| **TTS 朗读** | 调用 Windows 语音引擎朗读单词和例句 |
+| **TTS 朗读** | 调用 Windows 语音引擎朗读单词和例句，优先选英文语音；设置里可挑选本机已安装的语音并用同一引擎试听 |
 | **生词库管理** | 支持搜索、筛选、标签、批量操作、CSV/TSV 预览导入与完整 SQLite 快照导出 |
+| **查词历史** | 记下查过什么：按天分组、可搜索、一键再次打开（答案仍在缓存里就不再花钱）；可关闭、可单条删除、可一键清空，只存本机 |
 | **三档轻量复习** | 每日限量回顾，答对按 1 / 3 / 7 天升档，答错回到第一档 |
+| **学习洞察** | 连续学习天数、近 7 / 30 / 90 天活动曲线、掌握程度分布、复习正确率、常查与易错的词、生词来源，全部来自本机记录 |
 | **阅读会话** | 按来源应用和时间间隔聚合查词记录，支持批量标签、导出与加入复习 |
 | **安全自动更新** | 通过 GitHub Releases 检查并安装签名更新，不上传用户数据 |
 | **多模型支持** | 兼容 OpenAI / Anthropic 协议，支持 GLM、DeepSeek、Kimi、Ollama 等 |
-| **系统托盘常驻** | 最小化到托盘，随时可用 |
+| **系统托盘常驻** | 最小化到托盘，随时可用；托盘里可开关「划词即查」，或「暂停 30 分钟」（随时可取消） |
 | **字体大小调节** | 查词窗口和生词库均可实时调整字体大小 |
 | **剪贴板去重** | 已查过的内容不会重复触发，除非重新复制 |
 | **IDE 友好** | 默认不屏蔽 VS Code / IDEA / 终端；复制英文文档会正常弹窗，可一键关闭 |
@@ -167,18 +169,29 @@ npx tauri build
 gege-dictionary/
 ├── docs/                   # 产品文档
 ├── src/                    # React 前端
-│   ├── pages/              # 页面（Library, Lookup, Onboarding, Settings）
+│   ├── pages/              # 页面（Library, Lookup, Review, Insights, Onboarding, Settings, OcrSelect）
 │   ├── components/         # UI 组件
 │   ├── contexts/           # React Context 状态管理
-│   ├── data/               # 预设数据和 Prompt 模板
-│   ├── lib/                # Tauri Bridge（前后端通信）
+│   ├── data/               # 预设数据（LLM 提供商预设）
+│   ├── hooks/              # 自定义 Hook（连接测试、重新解析、窗口回到前台时刷新…）
+│   ├── lib/                # Tauri Bridge（前后端通信）与纯函数（生词库过滤排序、洞察、错误码…）
 │   └── types/              # TypeScript 类型定义
 ├── src-tauri/              # Rust 后端
 │   ├── src/
-│   │   ├── lib.rs          # 主逻辑、Tauri Commands、托盘
+│   │   ├── lib.rs          # Tauri Commands、托盘、应用状态
+│   │   ├── lookup.rs       # 查词管道：准备、缓存、流式、收尾（计数、历史）
+│   │   ├── llm.rs          # LLM API 调用、错误码、JSON 修复
 │   │   ├── db.rs           # SQLite 数据访问层
-│   │   ├── llm.rs          # LLM API 调用 + JSON 修复
+│   │   ├── migrations.rs   # schema 迁移（当前 v6）
+│   │   ├── insights.rs     # 学习洞察的统计（纯函数）
 │   │   ├── clipboard_watcher.rs  # 剪贴板监控
+│   │   ├── watch_switch.rs # 监听开关与「暂停 30 分钟」
+│   │   ├── content_filter.rs     # 敏感内容与代码过滤
+│   │   ├── glossary.rs     # 个人术语表匹配
+│   │   ├── word_import.rs  # CSV / TSV 导入解析
+│   │   ├── anki.rs         # AnkiConnect
+│   │   ├── ocr.rs          # 截图 OCR（系统 OCR）
+│   │   ├── dpapi.rs        # API Key 的 DPAPI 加密
 │   │   └── tts.rs          # 语音朗读
 │   └── icons/              # 应用图标
 └── package.json            # 前端依赖
@@ -199,12 +212,16 @@ gege-dictionary/
 | [v1.5 开发规格](docs/PRD-v1.5-spec.md) | IDE 主场景、过滤误杀治理、CSP/日志/Key 隐私运行时、本地统计 | 想参与 v1.5+ 开发 |
 | [v1.6 开发规格](docs/PRD-v1.6-spec.md) | 截图 OCR、Anki Connect、上下文重解析、查词窗体验 | 想参与 v1.6 开发 |
 | [v1.7 开发规格](docs/PRD-v1.7-spec.md) | lookup 双路径合并、Anki 批量/映射/noteId、上下文三档与空态 | 想参与 v1.7 开发 |
+| [v1.9 开发规格](docs/PRD-v1.9-spec.md) | 信任债偿还（安全、数据完整性、错误码、托盘与朗读）、查词历史、学习洞察 | 想参与 v1.9+ 开发 |
+| [v1.9–v2.0 路线](docs/ROADMAP-v1.9-v2.0.md) | 这一轮发现的问题清单、v1.9 交付内容，以及 v1.10 / v2.0 规划 | 想了解产品方向 |
 | [v1.6 实机验收清单](docs/QA-machine-checklist-v1.6.md) | 原生 OCR / Anki / 多屏 / 更新通道真机步骤 | 发布与 QA |
 | [v1.4.3 发布说明](docs/RELEASE-NOTES-v1.4.3.md) | 数据安全、迁移/恢复、导入、剪贴板与发布门禁 | 维护者与升级用户 |
 | [v1.4.4 发布说明](docs/RELEASE-NOTES-v1.4.4.md) | 可靠性回归、真实 API 验证、首屏性能与依赖安全 | 维护者与升级用户 |
 | [v1.5.0 发布说明](docs/RELEASE-NOTES-v1.5.0.md) | 主场景可用、隐私运行时、本地统计、PR CI | 维护者与升级用户 |
 | [v1.6.0 发布说明](docs/RELEASE-NOTES-v1.6.0.md) | 截图 OCR、Anki Connect、查词窗体验 | 维护者与升级用户 |
 | [v1.7.0 发布说明](docs/RELEASE-NOTES-v1.7.0.md) | 双路径合并、Anki 批量/映射、上下文三档与空态 | 维护者与升级用户 |
+| [v1.8.0 发布说明](docs/RELEASE-NOTES-v1.8.0.md) | 生词库排序与批量掌握度、`lookup.rs` 拆分 | 维护者与升级用户 |
+| [v1.9.0 发布说明](docs/RELEASE-NOTES-v1.9.0.md) | 安全与数据修复、查词历史、学习洞察、托盘与朗读 | 维护者与升级用户 |
 | [发布说明](docs/RELEASE.md) | updater 私钥保管、GitHub Secrets 与签名发布流程 | 版本维护者 |
 
 开发任务已拆解为 [Issues](https://github.com/GeziP/gege-dictionary/issues)，每个都附带验收清单，欢迎认领。
@@ -213,7 +230,7 @@ gege-dictionary/
 
 - 鸽鸽词典 **没有服务端**，不收集任何用户数据
 - 只有「选中的文本 + 上下文 + Prompt」会发送到你自己配置的 LLM 服务
-- 所有数据（生词库、设置、使用记录、本地统计）保存在本机 `%APPDATA%/GegeDic/` 目录下
+- 所有数据（生词库、查词历史、设置、使用记录、本地统计）保存在本机 `%APPDATA%/GegeDic/` 目录下
 
 ### 取词与过滤（v1.1 / v1.5）
 
@@ -226,6 +243,13 @@ gege-dictionary/
 - 启用 WebView 最小 CSP（禁止远程脚本）
 - 日志只记录长度、类型与摘要哈希，**不打印选中原文或译文正文**
 - 设置接口不向界面下发明文 API Key；Key 以 DPAPI 密文存本机，测试连接由后端解密
+
+### 查词历史（v1.9）
+
+- 查词历史记录你选中的文本、上下文、释义摘要与来源应用，默认开启，只保存在本机数据库，不会发送给模型或任何服务器
+- 在「设置 → 数据 → 查词历史」可以关闭记录、查看条数、一键清空；在「生词库 → 历史」可以删除单条
+- 最多保留最近 500 条；「导出全部数据」得到的是完整 SQLite 快照，其中也包含历史，分享快照前请先清空
+- v1.9 同时修复了一处违背上面「运行时隐私」承诺的日志：模型输出解析失败时不再把输出的前 500 个字符写进日志，只记录长度与出错位置
 
 ### 数据安全与迁移（v1.4.3+）
 
