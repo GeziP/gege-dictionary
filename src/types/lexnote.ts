@@ -161,6 +161,23 @@ export interface ReadingSession {
   wordIds: string[];
 }
 
+/** One remembered lookup: what was asked, what the answer said about it, and how often. */
+export interface LookupHistoryItem {
+  id: number;
+  /** The text that was looked up; cut to a preview when it is very long. */
+  selection: string;
+  lemma: string;
+  translation: string;
+  kind: SelectionKind;
+  sourceApp: string;
+  sourceTitle: string;
+  /** How many times this was looked up. */
+  count: number;
+  /** ISO timestamps (UTC) of the first and the latest lookup. */
+  firstAt: string;
+  lastAt: string;
+}
+
 export interface LookupRequest {
   selection: string;
   context: string;
@@ -279,6 +296,8 @@ export interface AppSettings {
   ideBlacklist?: string[];
   streamingEnabled?: boolean;
   cacheTtlDays?: 0 | 7 | 30 | 90;
+  /** Remember what was looked up (default on); turning it off keeps what is already there. */
+  historyEnabled?: boolean;
   reviewLimit?: 0 | 10 | 20 | 50;
   includeLongFormReview?: boolean;
   sessionGapMinutes?: 15 | 30 | 60;

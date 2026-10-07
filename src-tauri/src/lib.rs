@@ -79,6 +79,14 @@ pub(crate) fn cache_ttl_days(settings: &serde_json::Value) -> i64 {
         .unwrap_or(30)
 }
 
+/// Whether answered lookups are remembered in the history: on, unless the user turned it off.
+pub(crate) fn history_enabled(settings: &serde_json::Value) -> bool {
+    settings
+        .get("historyEnabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
 fn ocr_settings(settings: &serde_json::Value) -> (bool, String) {
     let ocr = settings.get("ocr");
     let enabled = ocr
@@ -788,6 +796,59 @@ async fn get_startup_warnings(
 async fn clear_cache(state: tauri::State<'_, AppState>) -> Result<u64, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.clear_cache()
+}
+
+/// The lookup history, newest first.
+#[tauri::command]
+async fn get_lookup_history(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.list_history()
+}
+
+#[tauri::command]
+async fn delete_lookup_history(
+    state: tauri::State<'_, AppState>,
+    ids: Vec<i64>,
+) -> Result<u64, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.delete_history(&ids)
+}
+
+#[tauri::command]
+async fn clear_lookup_history(state: tauri::State<'_, AppState>) -> Result<u64, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.clear_history()
+}
+
+/// Open the lookup window on a history entry. It asks exactly what was asked the first time,
+/// so an answer that is still cached appears at once and costs nothing.
+#[tauri::command]
+async fn reopen_lookup_from_history(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: i64,
+) -> Result<(), String> {
+    let question = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db.history_lookup(id)?
+    }
+    .ok_or("这条历史记录已经不存在了")?;
+    let kind = question
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("word")
+        .to_string();
+    let mut capture = question;
+    if let Some(object) = capture.as_object_mut() {
+        object.insert("method".into(), serde_json::json!("history"));
+    }
+    if let Ok(mut last) = state.last_capture.lock() {
+        *last = Some(capture);
+    }
+    clipboard_watcher::open_or_reuse_lookup_public(&app, kind == "paragraph");
+    Ok(())
 }
 
 #[tauri::command]
@@ -1681,6 +1742,10 @@ pub fn run() {
             search_words,
             save_word,
             restore_word,
+            get_lookup_history,
+            delete_lookup_history,
+            clear_lookup_history,
+            reopen_lookup_from_history,
             find_word_by_lemma,
             batch_update_words,
             update_word,
@@ -1839,6 +1904,24 @@ mod tests {
         );
         PRAGMA user_version = 0;
     "#;
+
+    #[test]
+    fn history_is_on_unless_the_user_turned_it_off() {
+        assert!(
+            history_enabled(&serde_json::json!({})),
+            "older settings have no key"
+        );
+        assert!(history_enabled(
+            &serde_json::json!({ "historyEnabled": true })
+        ));
+        assert!(!history_enabled(
+            &serde_json::json!({ "historyEnabled": false })
+        ));
+        assert!(
+            history_enabled(&serde_json::json!({ "historyEnabled": "no" })),
+            "only a real boolean switches it off"
+        );
+    }
 
     #[test]
     fn anki_note_pairs_keep_only_results_that_have_a_note_id() {

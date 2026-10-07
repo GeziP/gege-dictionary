@@ -4,6 +4,7 @@ import type {
   GlossaryImportReport,
   GlossaryPage,
   GlossaryTerm,
+  LookupHistoryItem,
   PromptTemplate,
   ReadingSession,
   ReviewState,
@@ -423,6 +424,7 @@ export async function getDbStats(): Promise<{
   tagCount: number;
   cacheCount: number;
   cacheSizeBytes: number;
+  historyCount: number;
   sizeBytes: number;
   dataDir: string;
 }> {
@@ -431,6 +433,29 @@ export async function getDbStats(): Promise<{
 
 export async function clearCache(): Promise<number> {
   return invoke<number>('clear_cache');
+}
+
+/** The remembered lookups, newest first (at most 500). */
+export async function getLookupHistory(): Promise<LookupHistoryItem[]> {
+  return invoke<LookupHistoryItem[]>('get_lookup_history');
+}
+
+/** Forgets the given history entries; resolves to how many were removed. */
+export async function deleteLookupHistory(ids: number[]): Promise<number> {
+  return invoke<number>('delete_lookup_history', { ids });
+}
+
+/** Forgets the whole history (saved words are not touched); resolves to how many were removed. */
+export async function clearLookupHistory(): Promise<number> {
+  return invoke<number>('clear_lookup_history');
+}
+
+/**
+ * Opens the lookup window on a remembered lookup. It asks exactly what was asked
+ * the first time, so an answer that is still cached appears at once and costs nothing.
+ */
+export async function reopenLookupFromHistory(id: number): Promise<void> {
+  return invoke('reopen_lookup_from_history', { id });
 }
 
 export async function backupDatabase(): Promise<string> {

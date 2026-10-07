@@ -507,6 +507,43 @@ fn save_word_with_connection(
     Ok(())
 }
 
+/// How many distinct lookups the history keeps; the oldest are dropped as new ones arrive.
+pub const HISTORY_LIMIT: i64 = 500;
+const HISTORY_SELECTION_CHARS: usize = 2000;
+const HISTORY_CONTEXT_CHARS: usize = 1000;
+const HISTORY_LEMMA_CHARS: usize = 120;
+const HISTORY_TRANSLATION_CHARS: usize = 300;
+/// The list shows a preview of long selections; reopening uses the full text.
+const HISTORY_PREVIEW_CHARS: i64 = 400;
+
+/// What one successful lookup leaves in the history.
+pub struct HistoryRecord<'a> {
+    pub selection: &'a str,
+    pub context: &'a str,
+    pub kind: &'a str,
+    pub lemma: &'a str,
+    pub translation: &'a str,
+    pub source_app: &'a str,
+    pub source_title: &'a str,
+}
+
+fn clipped(text: &str, max_chars: usize) -> String {
+    text.trim().chars().take(max_chars).collect()
+}
+
+/// The same word in another case or with other spacing is one history entry. Sentences and
+/// paragraphs ignore spacing only, exactly like the lookup cache does.
+fn history_key(selection: &str, kind: &str) -> String {
+    format!(
+        "{}\u{1f}{kind}",
+        crate::normalize_selection(selection, kind)
+    )
+}
+
+fn history_timestamp() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
 impl Database {
     pub fn open(path: &str) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| format!("DB open error: {e}"))?;
@@ -608,8 +645,9 @@ impl Database {
         validate_connection(&self.conn)
     }
 
-    /// Restore a validated backup into the currently open connection. A
-    /// safety snapshot is kept long enough to roll back a failed restore.
+    /// Restore a validated backup into the currently open connection. A backup made by an
+    /// earlier schema version is upgraded right after the copy, the way an old database is
+    /// when the app starts. A safety snapshot is kept long enough to roll back a failed restore.
     pub fn restore_from_backup(&mut self, backup_name: &str) -> Result<(), String> {
         if !is_safe_backup_name(backup_name) {
             return Err("备份文件名无效".into());
@@ -621,7 +659,7 @@ impl Database {
             return Err(format!("备份文件不存在: {backup_name}"));
         }
         let source = Connection::open(&backup_path).map_err(|e| format!("打开备份失败: {e}"))?;
-        validate_connection(&source)?;
+        validate_restorable(&source)?;
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S-%3f");
         let mut safety_name = format!("{RESTORE_SAFETY_PREFIX}{stamp}.db");
         let mut safety_path = db_dir.join("backups").join(&safety_name);
@@ -639,7 +677,7 @@ impl Database {
                 .run_to_completion(64, Duration::from_millis(10), None)
                 .map_err(|e| format!("执行恢复失败: {e}"))?;
             drop(backup);
-            self.validate()
+            self.initialize()
         })();
         if let Err(error) = restore_result {
             let rollback = (|| -> Result<(), String> {
@@ -797,6 +835,7 @@ impl Database {
             ],
             "streamingEnabled": true,
             "cacheTtlDays": 30,
+            "historyEnabled": true,
             "reviewLimit": 20,
             "includeLongFormReview": false,
             "sessionGapMinutes": 30,
@@ -2399,6 +2438,145 @@ impl Database {
             .map_err(|e| e.to_string())
     }
 
+    /// Remember a lookup: a new entry, or one more time for an entry that is already there,
+    /// which then moves to the top. Only the newest [`HISTORY_LIMIT`] entries are kept, and a
+    /// blank selection is not worth remembering.
+    pub fn record_history(&self, record: &HistoryRecord<'_>) -> Result<(), String> {
+        self.record_history_at(record, &history_timestamp())
+    }
+
+    fn record_history_at(&self, record: &HistoryRecord<'_>, now: &str) -> Result<(), String> {
+        let selection = clipped(record.selection, HISTORY_SELECTION_CHARS);
+        if selection.is_empty() {
+            return Ok(());
+        }
+        let kind = match record.kind.trim() {
+            "" => "word",
+            kind => kind,
+        };
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        // A repeat refreshes what the entry says but never blanks what an earlier lookup knew:
+        // a lookup without captured context or source keeps the previous ones.
+        tx.execute(
+            "INSERT INTO lookup_history
+                 (history_key, selection, context, lemma, translation, kind,
+                  source_app, source_title, lookup_count, first_at, last_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?9)
+             ON CONFLICT(history_key) DO UPDATE SET
+                 selection = excluded.selection,
+                 lemma = excluded.lemma,
+                 translation = excluded.translation,
+                 context = CASE WHEN excluded.context <> '' THEN excluded.context ELSE context END,
+                 source_app = CASE WHEN excluded.source_app <> '' THEN excluded.source_app ELSE source_app END,
+                 source_title = CASE WHEN excluded.source_title <> '' THEN excluded.source_title ELSE source_title END,
+                 lookup_count = lookup_count + 1,
+                 last_at = excluded.last_at",
+            params![
+                history_key(&selection, kind),
+                selection,
+                clipped(record.context, HISTORY_CONTEXT_CHARS),
+                clipped(record.lemma, HISTORY_LEMMA_CHARS),
+                clipped(record.translation, HISTORY_TRANSLATION_CHARS),
+                kind,
+                record.source_app.trim(),
+                record.source_title.trim(),
+                now,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM lookup_history WHERE id IN (
+                 SELECT id FROM lookup_history ORDER BY last_at DESC, id DESC LIMIT -1 OFFSET ?1)",
+            params![HISTORY_LIMIT],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// The history, newest first. Long selections are cut to a preview: the list is for
+    /// recognising an entry, [`Database::history_lookup`] has the full text.
+    pub fn list_history(&self) -> Result<Vec<Value>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id,
+                        CASE WHEN length(selection) > ?1
+                             THEN substr(selection, 1, ?1) || '…' ELSE selection END,
+                        lemma, translation, kind, source_app, source_title,
+                        lookup_count, first_at, last_at
+                 FROM lookup_history
+                 ORDER BY last_at DESC, id DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![HISTORY_PREVIEW_CHARS], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "selection": row.get::<_, String>(1)?,
+                    "lemma": row.get::<_, String>(2)?,
+                    "translation": row.get::<_, String>(3)?,
+                    "kind": row.get::<_, String>(4)?,
+                    "sourceApp": row.get::<_, String>(5)?,
+                    "sourceTitle": row.get::<_, String>(6)?,
+                    "count": row.get::<_, i64>(7)?,
+                    "firstAt": row.get::<_, String>(8)?,
+                    "lastAt": row.get::<_, String>(9)?,
+                }))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<SqlResult<Vec<_>>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Everything needed to ask the same question again: the full selection and its context.
+    pub fn history_lookup(&self, id: i64) -> Result<Option<Value>, String> {
+        self.conn
+            .query_row(
+                "SELECT selection, context, kind, source_app, source_title
+                 FROM lookup_history WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(serde_json::json!({
+                        "selection": row.get::<_, String>(0)?,
+                        "context": row.get::<_, String>(1)?,
+                        "kind": row.get::<_, String>(2)?,
+                        "sourceApp": row.get::<_, String>(3)?,
+                        "sourceTitle": row.get::<_, String>(4)?,
+                    }))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn delete_history(&self, ids: &[i64]) -> Result<u64, String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let mut removed = 0_u64;
+        {
+            let mut stmt = tx
+                .prepare("DELETE FROM lookup_history WHERE id = ?1")
+                .map_err(|e| e.to_string())?;
+            for id in ids {
+                removed += stmt.execute(params![id]).map_err(|e| e.to_string())? as u64;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(removed)
+    }
+
+    pub fn clear_history(&self) -> Result<u64, String> {
+        self.conn
+            .execute("DELETE FROM lookup_history", [])
+            .map(|count| count as u64)
+            .map_err(|e| e.to_string())
+    }
+
     pub fn get_stats(&self) -> Result<Value, String> {
         let word_count: i64 = self
             .conn
@@ -2422,12 +2600,17 @@ impl Database {
                 |row| row.get(0),
             )
             .map_err(|e| e.to_string())?;
+        let history_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM lookup_history", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
 
         Ok(serde_json::json!({
             "wordCount": word_count,
             "tagCount": tag_count,
             "cacheCount": cache_count,
             "cacheSizeBytes": cache_size_bytes,
+            "historyCount": history_count,
         }))
     }
 }
@@ -2464,8 +2647,29 @@ pub(crate) fn validate_database_file(path: &Path) -> Result<(), String> {
 }
 
 fn validate_schema_contract(conn: &Connection) -> Result<(), String> {
-    const REQUIRED_COLUMNS: &[(&str, &[&str])] = &[
+    validate_schema_contract_as_of(conn, crate::migrations::LATEST_SCHEMA_VERSION)
+}
+
+/// A backup made by this or an earlier version can be restored: afterwards it is upgraded
+/// exactly like an old database the app opens. One made by a newer app cannot, since this
+/// app does not know what it holds. What the backup must contain is what its own version had.
+fn validate_restorable(conn: &Connection) -> Result<(), String> {
+    validate_integrity(conn)?;
+    let version = crate::migrations::current_version(conn)?;
+    if version > crate::migrations::LATEST_SCHEMA_VERSION {
+        return Err(format!(
+            "备份来自更新版本的应用（schema v{version}），请先升级应用再恢复"
+        ));
+    }
+    validate_schema_contract_as_of(conn, version)
+}
+
+/// Checks the tables and columns a database of schema `version` has to have. Each entry says
+/// since which version it exists, so an older backup is held to what its own version had.
+fn validate_schema_contract_as_of(conn: &Connection, version: i64) -> Result<(), String> {
+    const REQUIRED_COLUMNS: &[(i64, &str, &[&str])] = &[
         (
+            0,
             "words",
             &[
                 "id",
@@ -2484,12 +2688,17 @@ fn validate_schema_contract(conn: &Connection) -> Result<(), String> {
                 "data",
             ],
         ),
-        ("word_tags", &["word_id", "tag"]),
-        ("cache", &["cache_key", "model", "response", "created_at"]),
-        ("settings", &["key", "value"]),
-        ("templates", &["id", "data"]),
-        ("usage_log", &["date", "queries", "tokens"]),
+        (0, "word_tags", &["word_id", "tag"]),
         (
+            0,
+            "cache",
+            &["cache_key", "model", "response", "created_at"],
+        ),
+        (0, "settings", &["key", "value"]),
+        (0, "templates", &["id", "data"]),
+        (0, "usage_log", &["date", "queries", "tokens"]),
+        (
+            1,
             "review_state",
             &[
                 "word_id",
@@ -2503,6 +2712,7 @@ fn validate_schema_contract(conn: &Connection) -> Result<(), String> {
             ],
         ),
         (
+            3,
             "glossary_terms",
             &[
                 "id",
@@ -2517,10 +2727,35 @@ fn validate_schema_contract(conn: &Connection) -> Result<(), String> {
                 "updated_at",
             ],
         ),
-        ("local_events", &["id", "date", "event", "count", "extra"]),
+        (
+            4,
+            "local_events",
+            &["id", "date", "event", "count", "extra"],
+        ),
+        (
+            6,
+            "lookup_history",
+            &[
+                "id",
+                "history_key",
+                "selection",
+                "context",
+                "lemma",
+                "translation",
+                "kind",
+                "source_app",
+                "source_title",
+                "lookup_count",
+                "first_at",
+                "last_at",
+            ],
+        ),
     ];
 
-    for (table, required_columns) in REQUIRED_COLUMNS {
+    for (_, table, required_columns) in REQUIRED_COLUMNS
+        .iter()
+        .filter(|(since, _, _)| *since <= version)
+    {
         let exists: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
@@ -3844,6 +4079,223 @@ mod tests {
         assert_eq!(usage["tokens"], 120);
     }
 
+    fn history_db() -> Database {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        db
+    }
+
+    fn lookup<'a>(selection: &'a str, kind: &'a str) -> HistoryRecord<'a> {
+        HistoryRecord {
+            selection,
+            context: "",
+            kind,
+            lemma: "",
+            translation: "",
+            source_app: "",
+            source_title: "",
+        }
+    }
+
+    /// Strictly increasing timestamps, so ordering never depends on the clock.
+    fn at(n: u32) -> String {
+        format!("2026-10-07T12:00:{:02}.{:03}Z", n / 1000, n % 1000)
+    }
+
+    #[test]
+    fn history_keeps_one_entry_per_lookup_and_counts_repeats() {
+        let db = history_db();
+        let first = HistoryRecord {
+            lemma: "run",
+            translation: "跑",
+            ..lookup("Run", "word")
+        };
+        let again = HistoryRecord {
+            translation: "奔跑",
+            ..lookup("  run ", "word")
+        };
+        db.record_history_at(&first, &at(1)).unwrap();
+        db.record_history_at(&again, &at(2)).unwrap();
+
+        let list = db.list_history().unwrap();
+        assert_eq!(list.len(), 1, "case and spacing do not make a new word");
+        assert_eq!(list[0]["count"], 2);
+        assert_eq!(list[0]["selection"], "run", "the latest spelling is shown");
+        assert_eq!(list[0]["translation"], "奔跑");
+        assert_eq!(list[0]["firstAt"], at(1).as_str());
+        assert_eq!(list[0]["lastAt"], at(2).as_str());
+    }
+
+    #[test]
+    fn history_tells_sentences_apart_by_case_and_kinds_apart_always() {
+        let db = history_db();
+        db.record_history_at(&lookup("Time flies", "sentence"), &at(1))
+            .unwrap();
+        db.record_history_at(&lookup("time flies", "sentence"), &at(2))
+            .unwrap();
+        db.record_history_at(&lookup("Time   flies", "sentence"), &at(3))
+            .unwrap();
+        db.record_history_at(&lookup("Time flies", "phrase"), &at(4))
+            .unwrap();
+
+        let counts: Vec<(String, i64)> = db
+            .list_history()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                (
+                    format!(
+                        "{}/{}",
+                        item["selection"].as_str().unwrap(),
+                        item["kind"].as_str().unwrap()
+                    ),
+                    item["count"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            counts,
+            [
+                ("Time flies/phrase".to_string(), 1),
+                ("Time   flies/sentence".to_string(), 2),
+                ("time flies/sentence".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn history_lists_the_newest_first_and_a_repeat_moves_to_the_top() {
+        let db = history_db();
+        for (index, word) in ["alpha", "beta", "gamma"].into_iter().enumerate() {
+            db.record_history_at(&lookup(word, "word"), &at(index as u32 + 1))
+                .unwrap();
+        }
+        let order = |db: &Database| -> Vec<String> {
+            db.list_history()
+                .unwrap()
+                .iter()
+                .map(|item| item["selection"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(order(&db), ["gamma", "beta", "alpha"]);
+
+        db.record_history_at(&lookup("alpha", "word"), &at(10))
+            .unwrap();
+        assert_eq!(order(&db), ["alpha", "gamma", "beta"]);
+    }
+
+    #[test]
+    fn history_keeps_only_the_newest_entries() {
+        let db = history_db();
+        let total = HISTORY_LIMIT as u32 + 5;
+        for index in 0..total {
+            db.record_history_at(&lookup(&format!("word{index}"), "word"), &at(index))
+                .unwrap();
+        }
+        let list = db.list_history().unwrap();
+        assert_eq!(list.len() as i64, HISTORY_LIMIT);
+        assert_eq!(list[0]["selection"], format!("word{}", total - 1));
+        let oldest_kept = list.last().unwrap()["selection"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            oldest_kept, "word5",
+            "word0..word4 were the oldest and are gone"
+        );
+    }
+
+    #[test]
+    fn history_ignores_blank_selections_and_clips_long_text() {
+        let db = history_db();
+        db.record_history_at(&lookup("  \n ", "word"), &at(1))
+            .unwrap();
+        assert!(db.list_history().unwrap().is_empty());
+
+        let long = "字".repeat(5000);
+        db.record_history_at(&lookup(&long, "paragraph"), &at(2))
+            .unwrap();
+        let id = db.list_history().unwrap()[0]["id"].as_i64().unwrap();
+
+        let preview = db.list_history().unwrap()[0]["selection"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            preview.chars().count(),
+            401,
+            "400 characters and an ellipsis"
+        );
+        assert!(preview.ends_with('…'));
+        let full = db.history_lookup(id).unwrap().unwrap();
+        assert_eq!(full["selection"].as_str().unwrap().chars().count(), 2000);
+    }
+
+    #[test]
+    fn a_repeat_without_context_or_source_keeps_what_the_earlier_lookup_knew() {
+        let db = history_db();
+        let with_source = HistoryRecord {
+            context: "He was running late.",
+            source_app: "chrome.exe",
+            source_title: "News",
+            ..lookup("running", "word")
+        };
+        db.record_history_at(&with_source, &at(1)).unwrap();
+        db.record_history_at(&lookup("running", "word"), &at(2))
+            .unwrap();
+
+        let id = db.list_history().unwrap()[0]["id"].as_i64().unwrap();
+        let kept = db.history_lookup(id).unwrap().unwrap();
+        assert_eq!(kept["context"], "He was running late.");
+        assert_eq!(kept["sourceApp"], "chrome.exe");
+        assert_eq!(kept["sourceTitle"], "News");
+
+        let newer = HistoryRecord {
+            context: "Running is fun.",
+            source_app: "word.exe",
+            ..lookup("running", "word")
+        };
+        db.record_history_at(&newer, &at(3)).unwrap();
+        let updated = db.history_lookup(id).unwrap().unwrap();
+        assert_eq!(updated["context"], "Running is fun.");
+        assert_eq!(updated["sourceApp"], "word.exe");
+        assert_eq!(
+            updated["sourceTitle"], "News",
+            "no new title: the old one stays"
+        );
+    }
+
+    #[test]
+    fn history_can_be_reopened_deleted_and_cleared() {
+        let db = history_db();
+        let sentence = HistoryRecord {
+            context: "A sentence before.",
+            ..lookup("Time flies like an arrow.", "sentence")
+        };
+        db.record_history_at(&sentence, &at(1)).unwrap();
+        db.record_history_at(&lookup("alpha", "word"), &at(2))
+            .unwrap();
+        db.record_history_at(&lookup("beta", "word"), &at(3))
+            .unwrap();
+        assert_eq!(db.get_stats().unwrap()["historyCount"], 3);
+
+        let list = db.list_history().unwrap();
+        let sentence_id = list[2]["id"].as_i64().unwrap();
+        let question = db.history_lookup(sentence_id).unwrap().unwrap();
+        assert_eq!(question["selection"], "Time flies like an arrow.");
+        assert_eq!(question["context"], "A sentence before.");
+        assert_eq!(question["kind"], "sentence");
+        assert!(db.history_lookup(987_654).unwrap().is_none());
+
+        let beta_id = list[0]["id"].as_i64().unwrap();
+        assert_eq!(db.delete_history(&[beta_id, 987_654]).unwrap(), 1);
+        assert_eq!(db.list_history().unwrap().len(), 2);
+
+        assert_eq!(db.clear_history().unwrap(), 2);
+        assert!(db.list_history().unwrap().is_empty());
+        assert_eq!(db.get_stats().unwrap()["historyCount"], 0);
+    }
+
     #[test]
     fn importing_thousands_of_rows_stays_fast() {
         let db = Database::open_memory().unwrap();
@@ -4014,6 +4466,91 @@ mod tests {
             })
             .unwrap();
         assert_eq!(lemma, "current value");
+    }
+
+    #[test]
+    fn a_backup_from_an_older_version_is_restored_and_brought_up_to_date() {
+        let root = TestDir::new("restore-older-schema");
+        let path = root.0.join(DB_FILENAME);
+        let mut db = Database::open(path.to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        db.save_word(&serde_json::json!({"id": "kept", "lemma": "kept", "kind": "word"}))
+            .unwrap();
+        let backup_name = backup_database(&db).unwrap();
+
+        // What an earlier version wrote: the same file, but from before the history table.
+        let backup_path = root.0.join("backups").join(&backup_name);
+        {
+            let old = Connection::open(&backup_path).unwrap();
+            old.execute_batch("DROP TABLE lookup_history; PRAGMA user_version = 5;")
+                .unwrap();
+        }
+
+        db.save_word(&serde_json::json!({"id": "later", "lemma": "later", "kind": "word"}))
+            .unwrap();
+        restore_backup(&mut db, &backup_name).unwrap();
+
+        let words = db.get_all_words().unwrap();
+        assert_eq!(words.len(), 1, "the restore replaces what was there");
+        assert_eq!(words[0]["lemma"], "kept");
+        assert_eq!(
+            crate::migrations::current_version(&db.conn).unwrap(),
+            crate::migrations::LATEST_SCHEMA_VERSION
+        );
+        // The upgrade is complete, not just a version number: the new table is usable.
+        db.record_history(&lookup("kept", "word")).unwrap();
+        assert_eq!(db.list_history().unwrap().len(), 1);
+        assert!(
+            list_backups(path.to_str().unwrap())
+                .unwrap()
+                .iter()
+                .any(|item| item["kind"] == "restoreSafety"),
+            "what was there before is kept, in case the restore was a mistake"
+        );
+    }
+
+    #[test]
+    fn a_backup_from_a_newer_version_is_refused_and_nothing_changes() {
+        let root = TestDir::new("restore-newer-schema");
+        let path = root.0.join(DB_FILENAME);
+        let mut db = Database::open(path.to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        db.save_word(&serde_json::json!({"id": "current", "lemma": "current", "kind": "word"}))
+            .unwrap();
+        let backup_name = backup_database(&db).unwrap();
+        {
+            let newer = Connection::open(root.0.join("backups").join(&backup_name)).unwrap();
+            newer.execute_batch("PRAGMA user_version = 99;").unwrap();
+        }
+
+        let error = restore_backup(&mut db, &backup_name).unwrap_err();
+        assert!(error.contains("更新版本"), "{error}");
+        let words = db.get_all_words().unwrap();
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0]["lemma"], "current");
+        assert_eq!(
+            crate::migrations::current_version(&db.conn).unwrap(),
+            crate::migrations::LATEST_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn an_older_backup_must_still_hold_what_its_own_version_had() {
+        let root = TestDir::new("restore-older-incomplete");
+        let path = root.0.join(DB_FILENAME);
+        let mut db = Database::open(path.to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        let backup_name = backup_database(&db).unwrap();
+        {
+            // Claims to be v5, but the table v5 certainly had is gone.
+            let broken = Connection::open(root.0.join("backups").join(&backup_name)).unwrap();
+            broken
+                .execute_batch("DROP TABLE glossary_terms; PRAGMA user_version = 5;")
+                .unwrap();
+        }
+
+        let error = restore_backup(&mut db, &backup_name).unwrap_err();
+        assert!(error.contains("glossary_terms"), "{error}");
     }
 
     #[test]

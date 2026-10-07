@@ -39,6 +39,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   ],
   streamingEnabled: true,
   cacheTtlDays: 30,
+  historyEnabled: true,
   reviewLimit: 20,
   includeLongFormReview: false,
   sessionGapMinutes: 30,

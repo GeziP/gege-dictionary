@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const LATEST_SCHEMA_VERSION: i64 = 5;
+pub const LATEST_SCHEMA_VERSION: i64 = 6;
 
 const REVIEW_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS review_state (
@@ -56,6 +56,27 @@ CREATE INDEX IF NOT EXISTS idx_words_anki ON words(anki_note_id)
 WHERE anki_note_id IS NOT NULL;
 "#;
 
+// One row per distinct lookup (by normalised text and kind), so looking the same word up
+// again raises `lookup_count` instead of adding a row. `context` is kept so that reopening an
+// entry asks the same question and is served from the cache.
+const LOOKUP_HISTORY_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS lookup_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    history_key TEXT NOT NULL UNIQUE,
+    selection TEXT NOT NULL,
+    context TEXT NOT NULL DEFAULT '',
+    lemma TEXT NOT NULL DEFAULT '',
+    translation TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'word',
+    source_app TEXT NOT NULL DEFAULT '',
+    source_title TEXT NOT NULL DEFAULT '',
+    lookup_count INTEGER NOT NULL DEFAULT 1,
+    first_at TEXT NOT NULL,
+    last_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lookup_history_last_at ON lookup_history(last_at DESC);
+"#;
+
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, REVIEW_SCHEMA),
     (
@@ -72,6 +93,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (3, GLOSSARY_SCHEMA),
     (4, LOCAL_EVENTS_SCHEMA),
     (5, ANKI_NOTE_ID_SCHEMA),
+    (6, LOOKUP_HISTORY_SCHEMA),
 ];
 
 pub fn current_version(conn: &Connection) -> Result<i64, String> {
@@ -81,7 +103,7 @@ pub fn current_version(conn: &Connection) -> Result<i64, String> {
 
 pub fn initialize_latest(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(&format!(
-        "{REVIEW_SCHEMA}\n{GLOSSARY_SCHEMA}\n{LOCAL_EVENTS_SCHEMA}"
+        "{REVIEW_SCHEMA}\n{GLOSSARY_SCHEMA}\n{LOCAL_EVENTS_SCHEMA}\n{LOOKUP_HISTORY_SCHEMA}"
     ))
     .map_err(|e| format!("创建最新 schema 失败: {e}"))?;
     // v5 column may already exist on fresh DBs created via db.rs contract.
@@ -187,7 +209,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE words (id TEXT PRIMARY KEY, kind TEXT, saved_at TEXT);")
             .unwrap();
         migrate(&conn, "").unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 5);
+        assert_eq!(current_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
         let first_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM review_state", [], |row| row.get(0))
             .unwrap();
@@ -260,7 +282,7 @@ mod tests {
         .unwrap();
         conn.pragma_update(None, "user_version", 2).unwrap();
         migrate(&conn, "").unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 5);
+        assert_eq!(current_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
         assert_eq!(
             conn.query_row(
                 "SELECT box FROM review_state WHERE word_id='kept'",
@@ -292,7 +314,7 @@ mod tests {
         .unwrap();
         conn.pragma_update(None, "user_version", 3).unwrap();
         migrate(&conn, "").unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 5);
+        assert_eq!(current_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
         let exists: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_events')",
@@ -313,7 +335,7 @@ mod tests {
         .unwrap();
         conn.pragma_update(None, "user_version", 4).unwrap();
         migrate(&conn, "").unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 5);
+        assert_eq!(current_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
         let col: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('words') WHERE name='anki_note_id'",
@@ -322,6 +344,66 @@ mod tests {
             )
             .unwrap();
         assert_eq!(col, 1);
+    }
+
+    fn history_columns(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('lookup_history') ORDER BY cid")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn upgrades_v5_with_lookup_history_and_keeps_existing_words() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE words (id TEXT PRIMARY KEY, kind TEXT, saved_at TEXT);
+             INSERT INTO words VALUES ('kept', 'word', '2026-08-01');",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        migrate(&conn, "").unwrap();
+        assert_eq!(current_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+        assert_eq!(
+            history_columns(&conn),
+            [
+                "id",
+                "history_key",
+                "selection",
+                "context",
+                "lemma",
+                "translation",
+                "kind",
+                "source_app",
+                "source_title",
+                "lookup_count",
+                "first_at",
+                "last_at"
+            ]
+        );
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM words WHERE id='kept'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, 1);
+    }
+
+    #[test]
+    fn a_new_database_has_the_history_table_too() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE words (id TEXT PRIMARY KEY);")
+            .unwrap();
+        initialize_latest(&conn).unwrap();
+        assert!(history_columns(&conn).contains(&"history_key".to_string()));
+        // The same text and kind is one row: `history_key` is unique.
+        let insert = "INSERT INTO lookup_history (history_key, selection, first_at, last_at)
+                      VALUES ('run\u{1f}word', 'run', 't', 't')";
+        conn.execute(insert, []).unwrap();
+        assert!(conn.execute(insert, []).is_err());
     }
 
     #[test]

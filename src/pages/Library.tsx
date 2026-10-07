@@ -15,6 +15,7 @@ import type { Mastery } from '../types/lexnote';
 import { classNames } from '../utils/format';
 import { ReviewOverview } from '../components/review/ReviewOverview';
 import { ReadingSessions } from '../components/library/ReadingSessions';
+import { HistoryTab } from '../components/library/HistoryTab';
 
 const MASTERY_ORDER: Record<string, number> = { new: 0, learning: 1, familiar: 2, mastered: 3 };
 
@@ -33,7 +34,7 @@ export function Library() {
   const [importOpen, setImportOpen] = useState(false);
   const [batchTag, setBatchTag] = useState('');
   const [toast, setToast] = useState<ToastMessage | null>(null);
-  const [viewMode, setViewMode] = useState<'words' | 'sessions'>('words');
+  const [viewMode, setViewMode] = useState<'words' | 'sessions' | 'history'>('words');
   const [ankiBusy, setAnkiBusy] = useState(false);
   const [sort, setSort] = useState<SortState>({ field: 'savedAt', dir: 'desc' });
   const toastId = useRef(0);
@@ -123,6 +124,7 @@ export function Library() {
       <div className="flex h-10 shrink-0 items-center gap-1 border-b border-line bg-surface px-3">
         <button type="button" onClick={() => setViewMode('words')} className={classNames('h-full border-b-2 px-3 text-xs', viewMode === 'words' ? 'border-accent text-accent' : 'border-transparent text-ink-muted')}>词条</button>
         <button type="button" onClick={() => setViewMode('sessions')} className={classNames('h-full border-b-2 px-3 text-xs', viewMode === 'sessions' ? 'border-accent text-accent' : 'border-transparent text-ink-muted')}>会话</button>
+        <button type="button" onClick={() => setViewMode('history')} className={classNames('h-full border-b-2 px-3 text-xs', viewMode === 'history' ? 'border-accent text-accent' : 'border-transparent text-ink-muted')}>历史</button>
       </div>
       {viewMode === 'words' ? (
       <div className="relative flex min-h-0 flex-1">
@@ -252,7 +254,7 @@ export function Library() {
 
         <Toast message={toast} />
       </div>
-      ) : <ReadingSessions />}
+      ) : viewMode === 'sessions' ? <ReadingSessions /> : <HistoryTab />}
     </WindowFrame>);
 
 }
