@@ -692,12 +692,6 @@ async fn get_usage(state: tauri::State<'_, AppState>) -> Result<serde_json::Valu
     db.get_usage()
 }
 
-#[tauri::command]
-async fn increment_usage(state: tauri::State<'_, AppState>, tokens: u32) -> Result<(), String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.increment_usage(tokens)
-}
-
 /// Read `text` aloud. Resolves when playback finishes (or is superseded or
 /// stopped), so the UI can reflect the real speaking state.
 #[tauri::command]
@@ -1715,7 +1709,6 @@ pub fn run() {
             export_glossary,
             preview_glossary_matches,
             get_usage,
-            increment_usage,
             get_local_metrics,
             clear_local_metrics,
             lookup::lookup_word,

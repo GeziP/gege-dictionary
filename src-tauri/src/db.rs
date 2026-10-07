@@ -2130,7 +2130,9 @@ impl Database {
         }))
     }
 
-    pub fn increment_usage(&self, tokens: u32) -> Result<(), String> {
+    /// Count one lookup that returned a result towards today's usage. A lookup answered from the
+    /// cache passes 0 tokens: it is still a lookup the user made, but it cost nothing.
+    pub fn record_lookup(&self, tokens: u32) -> Result<(), String> {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         self.conn
             .execute(
@@ -3819,6 +3821,27 @@ mod tests {
             .iter()
             .map(|word| word["id"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    #[test]
+    fn usage_counts_today_and_this_month_but_not_older_months() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO usage_log (date, queries, tokens) VALUES ('2000-01-15', 7, 7000)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.get_usage().unwrap()["month"], 0);
+
+        db.record_lookup(120).unwrap();
+        db.record_lookup(0).unwrap(); // answered from the cache: counted, but free
+
+        let usage = db.get_usage().unwrap();
+        assert_eq!(usage["today"], 2);
+        assert_eq!(usage["month"], 2);
+        assert_eq!(usage["tokens"], 120);
     }
 
     #[test]

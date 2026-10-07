@@ -208,6 +208,55 @@ fn apply_provider_options(body: &mut Value, base_url: &str) {
     }
 }
 
+/// Fill the template's placeholders in a single pass. Replacing them one after another would
+/// also rewrite a placeholder that happens to appear inside the selected text itself.
+pub(crate) fn build_prompt(template: &str, selection: &str, context: &str) -> String {
+    let mut prompt = String::with_capacity(template.len() + selection.len() + context.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        prompt.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let (token, value) = [
+            ("{{selection}}", selection),
+            ("{{context}}", context),
+            ("{{native_lang}}", "中文"),
+        ]
+        .into_iter()
+        .find(|(token, _)| rest.starts_with(token))
+        // Not one of ours: keep the braces and carry on after them.
+        .unwrap_or(("{{", "{{"));
+        prompt.push_str(value);
+        rest = &rest[token.len()..];
+    }
+    prompt.push_str(rest);
+    prompt
+}
+
+/// Rough token count of `text`: about one token per four narrow characters and one and a half per
+/// CJK one. Providers tokenize differently, so this feeds the usage panel (which says "estimate"),
+/// never a bill.
+pub(crate) fn estimate_tokens(text: &str) -> u32 {
+    let (mut narrow, mut wide) = (0_u32, 0_u32);
+    for c in text.chars() {
+        // Kana, CJK ideographs, hangul, and the full-width punctuation around them.
+        if matches!(
+            c as u32,
+            0x3000..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xFF00..=0xFFEF
+        ) {
+            wide += 1;
+        } else {
+            narrow += 1;
+        }
+    }
+    narrow.div_ceil(4) + (wide * 3).div_ceil(2)
+}
+
+/// Estimated tokens for one model call: the system prompt and `prompt` that went out, plus the
+/// `answer` that came back.
+pub(crate) fn estimate_lookup_tokens(prompt: &str, answer: &str) -> u32 {
+    estimate_tokens(SYSTEM_PROMPT) + estimate_tokens(prompt) + estimate_tokens(answer)
+}
+
 /// Blocking (non-streaming) lookup — used as fallback or when streaming is disabled.
 pub async fn stream_lookup(
     base_url: &str,
@@ -222,10 +271,7 @@ pub async fn stream_lookup(
     _kind: &str,
     template_body: &str,
 ) -> Result<String, String> {
-    let prompt = template_body
-        .replace("{{selection}}", selection)
-        .replace("{{context}}", context)
-        .replace("{{native_lang}}", "中文");
+    let prompt = build_prompt(template_body, selection, context);
 
     let proto = effective_protocol(protocol, base_url);
     eprintln!("[stream_lookup] protocol={protocol}, effective={proto}, url={base_url}");
@@ -275,10 +321,7 @@ pub async fn stream_lookup_sse<F>(
 where
     F: FnMut(&str),
 {
-    let prompt = template_body
-        .replace("{{selection}}", selection)
-        .replace("{{context}}", context)
-        .replace("{{native_lang}}", "中文");
+    let prompt = build_prompt(template_body, selection, context);
 
     let proto = effective_protocol(protocol, base_url);
     match proto {
@@ -1510,6 +1553,67 @@ mod tests {
             let err = parse_entry(raw, "x", "word").unwrap_err();
             assert_eq!(error_code(&err), Some("parse"), "{raw}: {err}");
         }
+    }
+
+    #[test]
+    fn build_prompt_fills_every_placeholder() {
+        let prompt = build_prompt(
+            "{{selection}} | {{context}} | {{native_lang}} | {{selection}}",
+            "word",
+            "a sentence",
+        );
+        assert_eq!(prompt, "word | a sentence | 中文 | word");
+    }
+
+    #[test]
+    fn build_prompt_never_rewrites_placeholders_inside_the_inserted_text() {
+        // The selection is the text the user highlighted; if it happens to contain `{{context}}`
+        // it must reach the model as-is, not be swapped for the context.
+        let prompt = build_prompt(
+            "S={{selection}};C={{context}}",
+            "{{context}}",
+            "{{selection}}",
+        );
+        assert_eq!(prompt, "S={{context}};C={{selection}}");
+    }
+
+    #[test]
+    fn build_prompt_leaves_braces_that_are_not_placeholders_alone() {
+        assert_eq!(
+            build_prompt("{{unknown}} {x} {{ {{selection}}", "w", "c"),
+            "{{unknown}} {x} {{ w"
+        );
+        assert_eq!(
+            build_prompt("no placeholders 中文", "w", "c"),
+            "no placeholders 中文"
+        );
+        assert_eq!(build_prompt("", "w", "c"), "");
+    }
+
+    #[test]
+    fn token_estimates_follow_the_script_of_the_text() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("a"), 1);
+        assert_eq!(estimate_tokens(&"a".repeat(400)), 100);
+        assert_eq!(estimate_tokens("你好世界"), 6);
+        assert_eq!(estimate_tokens("ab你"), 1 + 2);
+        assert_eq!(
+            estimate_tokens("，"),
+            2,
+            "full-width punctuation counts as wide"
+        );
+    }
+
+    #[test]
+    fn a_longer_exchange_is_never_estimated_cheaper() {
+        let short = estimate_lookup_tokens("translate dog", "狗");
+        let long =
+            estimate_lookup_tokens("translate dog in this context", "狗，一种常见的家养动物");
+        assert!(long > short);
+        assert!(
+            short > estimate_tokens(SYSTEM_PROMPT),
+            "the system prompt is always sent"
+        );
     }
 
     #[tokio::test]

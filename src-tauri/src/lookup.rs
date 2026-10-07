@@ -1,4 +1,3 @@
-use crate::db;
 #[cfg(windows)]
 use crate::dpapi;
 use crate::glossary;
@@ -95,19 +94,44 @@ pub(crate) fn annotate_lookup_entry(entry: &mut serde_json::Value, template_name
     }
 }
 
-fn store_lookup_cache(
+/// How a lookup was answered, which decides what it cost.
+#[derive(Clone, Copy)]
+enum Answer<'a> {
+    /// Served from the local cache: still a lookup the user made, but it cost nothing.
+    Cache,
+    /// The model replied `raw` to `prompt`.
+    Model { prompt: &'a str, raw: &'a str },
+}
+
+/// The one place a successful lookup is wrapped up, whichever of the five ways it succeeded.
+/// A fresh answer is tagged with its template and cached; every answer counts towards usage.
+fn finish_lookup(
     state: &tauri::State<'_, AppState>,
-    cache_key: &str,
-    model: &str,
-    entry: &serde_json::Value,
-) {
-    let db_path = match state.db.lock() {
-        Ok(db) => db.path().to_string(),
-        Err(_) => return,
+    prepared: &PreparedLookup,
+    mut entry: serde_json::Value,
+    answer: Answer<'_>,
+) -> serde_json::Value {
+    let tokens = match answer {
+        Answer::Cache => 0,
+        Answer::Model { prompt, raw } => {
+            annotate_lookup_entry(&mut entry, &prepared.template_name);
+            llm::estimate_lookup_tokens(prompt, raw)
+        }
     };
-    if let Ok(db) = db::Database::open(&db_path) {
-        let _ = db.set_cache(cache_key, model, entry);
+    match state.db.lock() {
+        Ok(db) => {
+            if matches!(answer, Answer::Model { .. }) {
+                if let Err(e) = db.set_cache(&prepared.cache_key, &prepared.model, &entry) {
+                    eprintln!("[lookup] could not cache the answer: {e}");
+                }
+            }
+            if let Err(e) = db.record_lookup(tokens) {
+                eprintln!("[lookup] could not record usage: {e}");
+            }
+        }
+        Err(_) => eprintln!("[lookup] database lock poisoned; answer neither cached nor counted"),
     }
+    entry
 }
 
 pub(crate) fn selection_meta(selection: &str, kind: &str) -> String {
@@ -355,7 +379,7 @@ pub async fn lookup_word(
     kind: String,
     force_refresh: bool,
 ) -> Result<serde_json::Value, String> {
-    let prepared = prepare_lookup(
+    let mut prepared = prepare_lookup(
         &state,
         &selection,
         &context,
@@ -364,9 +388,9 @@ pub async fn lookup_word(
         "lookup_word",
     )?;
 
-    if let Some(cached) = prepared.cache_hit {
+    if let Some(cached) = prepared.cache_hit.take() {
         eprintln!("[lookup_word] cache HIT");
-        return Ok(cached);
+        return Ok(finish_lookup(&state, &prepared, cached, Answer::Cache));
     }
 
     eprintln!(
@@ -400,15 +424,18 @@ pub async fn lookup_word(
 
     eprintln!("[lookup_word] LLM OK, len={}", full_text.len());
 
-    let mut entry = llm::parse_entry(&full_text, &selection, &kind).map_err(|e| {
+    let entry = llm::parse_entry(&full_text, &selection, &kind).map_err(|e| {
         eprintln!("[lookup_word] parse FAIL: {e}");
         classify_lookup_error(&e)
     })?;
-    annotate_lookup_entry(&mut entry, &prepared.template_name);
-    store_lookup_cache(&state, &prepared.cache_key, &prepared.model, &entry);
 
+    let prompt = llm::build_prompt(&prepared.template_body, &selection, &context);
+    let answer = Answer::Model {
+        prompt: &prompt,
+        raw: &full_text,
+    };
     eprintln!("[lookup_word] done, returning entry");
-    Ok(entry)
+    Ok(finish_lookup(&state, &prepared, entry, answer))
 }
 
 #[tauri::command]
@@ -421,7 +448,7 @@ pub async fn lookup_word_stream(
     request_id: String,
     force_refresh: bool,
 ) -> Result<(), String> {
-    let prepared = prepare_lookup(
+    let mut prepared = prepare_lookup(
         &state,
         &selection,
         &context,
@@ -430,13 +457,14 @@ pub async fn lookup_word_stream(
         "lookup_stream",
     )?;
 
-    if let Some(cached) = prepared.cache_hit {
+    if let Some(cached) = prepared.cache_hit.take() {
         eprintln!("[lookup_stream] cache HIT");
+        let entry = finish_lookup(&state, &prepared, cached, Answer::Cache);
         let _ = app.emit(
             "lookup://done",
             serde_json::json!({
                 "requestId": request_id,
-                "entry": cached,
+                "entry": entry,
                 "fromCache": true,
             }),
         );
@@ -453,7 +481,7 @@ pub async fn lookup_word_stream(
     let mut first_field_logged = false;
     let app_for_metrics = app.clone();
     let kind_for_metrics = kind.clone();
-    let template_name = prepared.template_name.clone();
+    let prompt = llm::build_prompt(&prepared.template_body, &selection, &context);
 
     let result = llm::stream_lookup_sse(
         &prepared.base_url,
@@ -507,9 +535,12 @@ pub async fn lookup_word_stream(
 
     match result {
         Ok(full_text) => match llm::parse_entry(&full_text, &selection, &kind) {
-            Ok(mut entry) => {
-                annotate_lookup_entry(&mut entry, &template_name);
-                store_lookup_cache(&state, &prepared.cache_key, &prepared.model, &entry);
+            Ok(entry) => {
+                let answer = Answer::Model {
+                    prompt: &prompt,
+                    raw: &full_text,
+                };
+                let entry = finish_lookup(&state, &prepared, entry, answer);
                 let _ = app.emit(
                     "lookup://done",
                     serde_json::json!({
@@ -556,14 +587,12 @@ pub async fn lookup_word_stream(
                 .await
                 {
                     Ok(full_text) => match llm::parse_entry(&full_text, &selection, &kind) {
-                        Ok(mut entry) => {
-                            annotate_lookup_entry(&mut entry, &template_name);
-                            store_lookup_cache(
-                                &state,
-                                &prepared.cache_key,
-                                &prepared.model,
-                                &entry,
-                            );
+                        Ok(entry) => {
+                            let answer = Answer::Model {
+                                prompt: &prompt,
+                                raw: &full_text,
+                            };
+                            let entry = finish_lookup(&state, &prepared, entry, answer);
                             let _ = app.emit(
                                 "lookup://done",
                                 serde_json::json!({
@@ -619,6 +648,7 @@ pub async fn test_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db;
 
     #[test]
     fn annotate_lookup_entry_sets_template_name() {

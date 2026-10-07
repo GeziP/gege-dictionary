@@ -245,10 +245,6 @@ export async function getUsage(): Promise<{ today: number; month: number; tokens
   return invoke('get_usage');
 }
 
-export async function incrementUsage(tokens: number): Promise<void> {
-  return invoke('increment_usage', { tokens });
-}
-
 export async function lookupWord(
   selection: string,
   context: string,

@@ -40,7 +40,6 @@ export function Lookup() {
     saveWord: ctxSaveWord,
     triggerLookup,
     retryLookup,
-    countLookup,
     clearLookup,
   } = useLexNote();
 
@@ -186,7 +185,6 @@ export function Lookup() {
       undoRef.current = { before, stored };
       setExisting(stored);
       setSaved(true);
-      countLookup(0);
       if (undoTimer) clearTimeout(undoTimer);
       setUndoTimer(setTimeout(() => setUndoTimer(null), 5000));
       if (settings.anki?.enabled && settings.anki.autoSend) {
@@ -206,7 +204,7 @@ export function Lookup() {
       savingRef.current = false;
       setSaving(false);
     }
-  }, [entry, existing, lookupContext, lookupSourceApp, lookupSourceTitle, tagInput, ctxSaveWord, countLookup, lookupStatus, saved, settings.anki, undoTimer]);
+  }, [entry, existing, lookupContext, lookupSourceApp, lookupSourceTitle, tagInput, ctxSaveWord, lookupStatus, saved, settings.anki, undoTimer]);
 
   // Undo really undoes the save: a word this save created is deleted, and a
   // word that already existed goes back to exactly how it was. (It used to

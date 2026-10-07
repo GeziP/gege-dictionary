@@ -129,7 +129,6 @@ interface LexNoteValue {
   updateWord: (id: string, patch: Partial<SavedWord>) => void;
   tagWords: (ids: string[], tags: string[]) => void;
   batchSetMastery: (ids: string[], mastery: SavedWord['mastery']) => void;
-  countLookup: (tokens: number) => void;
   saveTemplate: (template: PromptTemplate) => void;
   resetTemplates: () => void;
   triggerLookup: (selection: string, context: string, kind: string, sourceApp?: string, sourceTitle?: string, forceRefresh?: boolean) => void;
@@ -412,19 +411,16 @@ export function LexNoteProvider({
     [isTauri, reloadAfterFailure]
   );
 
-  const countLookup = useCallback(
-    (tokens: number) => {
-      setUsage((prev) => ({
-        today: prev.today + 1,
-        month: prev.month + 1,
-        tokens: prev.tokens + tokens,
-      }));
-      if (isTauri) {
-        bridge.incrementUsage(tokens).catch(console.error);
-      }
-    },
-    [isTauri]
-  );
+  // Lookups happen in another window and are counted by the backend, so this window picks up the
+  // new totals when it is next looked at. (The small lookup and OCR windows show no usage.)
+  useEffect(() => {
+    if (!isTauri || !loadWords) return;
+    const refreshUsage = () => {
+      bridge.getUsage().then(setUsage).catch(console.error);
+    };
+    window.addEventListener('focus', refreshUsage);
+    return () => window.removeEventListener('focus', refreshUsage);
+  }, [isTauri, loadWords]);
 
   const saveTemplate = useCallback(
     (template: PromptTemplate) => {
@@ -624,7 +620,6 @@ export function LexNoteProvider({
     updateWord,
     tagWords,
     batchSetMastery,
-    countLookup,
     saveTemplate,
     resetTemplates,
     triggerLookup,
