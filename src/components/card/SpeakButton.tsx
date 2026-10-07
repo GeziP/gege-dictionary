@@ -3,7 +3,7 @@ import { Volume2Icon, SquareIcon } from 'lucide-react';
 import { useSpeech } from '../../hooks/useSpeech';
 import { useLexNote } from '../../contexts/LexNoteContext';
 import { classNames } from '../../utils/format';
-import { isTauri, speakText } from '../../lib/tauri-bridge';
+import { isTauri, speakText, stopSpeaking } from '../../lib/tauri-bridge';
 
 interface SpeakButtonProps {
   text: string;
@@ -23,17 +23,21 @@ export function SpeakButton({ text, label, size = 14, className }: SpeakButtonPr
   const handleClick = useCallback(() => {
     if (active) {
       stop();
+      if (nativeSpeaking) void stopSpeaking().catch(() => undefined);
       setNativeSpeaking(false);
       return;
     }
     if (isTauri()) {
       setNativeSpeaking(true);
+      // speakText settles when playback really ends (or is superseded/stopped),
+      // so the button state tracks the engine instead of a guessed timeout.
       speakText(text, settings.ttsVoice, settings.ttsRate)
-        .finally(() => setTimeout(() => setNativeSpeaking(false), 1500));
+        .catch((error) => console.warn('Speech failed:', error))
+        .finally(() => setNativeSpeaking(false));
     } else if (supported) {
       speak(text, text);
     }
-  }, [active, text, settings.ttsVoice, settings.ttsRate, speak, stop, supported]);
+  }, [active, nativeSpeaking, text, settings.ttsVoice, settings.ttsRate, speak, stop, supported]);
 
   if (!supported && !isTauri()) return null;
 

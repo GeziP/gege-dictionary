@@ -661,14 +661,26 @@ async fn increment_usage(state: tauri::State<'_, AppState>, tokens: u32) -> Resu
     db.increment_usage(tokens)
 }
 
+/// Read `text` aloud. Resolves when playback finishes (or is superseded or
+/// stopped), so the UI can reflect the real speaking state.
 #[tauri::command]
 async fn speak_text(text: String, voice: String, rate: f64) -> Result<(), String> {
-    tts::speak(&text, &voice, rate)
+    tokio::task::spawn_blocking(move || tts::speak_blocking(&text, &voice, rate))
+        .await
+        .map_err(|e| format!("朗读任务失败: {e}"))?
+}
+
+#[tauri::command]
+async fn stop_speaking() -> Result<(), String> {
+    tts::stop();
+    Ok(())
 }
 
 #[tauri::command]
 async fn list_voices() -> Result<Vec<String>, String> {
-    tts::list_voices()
+    tokio::task::spawn_blocking(tts::list_voices)
+        .await
+        .map_err(|e| format!("语音列表任务失败: {e}"))?
 }
 
 #[tauri::command]
@@ -1636,6 +1648,7 @@ pub fn run() {
             lookup::lookup_word_stream,
             lookup::test_connection,
             speak_text,
+            stop_speaking,
             list_voices,
             export_words_data,
             export_database_snapshot,

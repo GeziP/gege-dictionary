@@ -363,8 +363,14 @@ export async function testConnection(
   return invoke('test_connection', { baseUrl, apiKey, model, protocol: protocol || 'openai' });
 }
 
+/** Resolves when playback has finished, was superseded, or was stopped. */
 export async function speakText(text: string, voice: string, rate: number): Promise<void> {
   return invoke('speak_text', { text, voice, rate });
+}
+
+export async function stopSpeaking(): Promise<void> {
+  if (!IS_TAURI) return;
+  return invoke('stop_speaking');
 }
 
 export async function listVoices(): Promise<string[]> {
@@ -539,6 +545,8 @@ export async function createLookupWindow(
 
 export async function closeLookupWindow(): Promise<void> {
   if (!IS_TAURI) return;
+  // The speech engine is a separate process; don't let it talk over a hidden window.
+  void stopSpeaking().catch(() => undefined);
   try {
     const mod = await import('@tauri-apps/api/webviewWindow');
     const win = await mod.WebviewWindow.getByLabel('lookup');
