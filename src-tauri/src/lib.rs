@@ -10,6 +10,7 @@ mod llm;
 mod lookup;
 mod migrations;
 mod ocr;
+mod review;
 mod tts;
 mod watch_switch;
 mod word_import;
@@ -439,18 +440,21 @@ async fn get_review_queue(
 async fn submit_review(
     state: tauri::State<'_, AppState>,
     word_id: String,
-    correct: bool,
+    // "correct", "hard" or "wrong".
+    answer: String,
 ) -> Result<serde_json::Value, String> {
-    let result = {
+    let answer =
+        review::Answer::parse(&answer).ok_or_else(|| format!("未知的复习答案：{answer}"))?;
+    let outcome = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        db.submit_review(&word_id, correct)?
+        db.submit_review(&word_id, answer)?
     };
     record_event(
         &state,
         "review_card_answered",
-        serde_json::json!({ "result": if correct { "correct" } else { "wrong" } }),
+        serde_json::json!({ "result": answer.as_str() }),
     );
-    Ok(result)
+    Ok(outcome)
 }
 
 /// Streak, activity chart, mastery and review figures, and a few short rankings.

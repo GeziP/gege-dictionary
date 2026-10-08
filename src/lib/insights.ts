@@ -1,6 +1,12 @@
 import { format, parseISO } from 'date-fns';
 import { zhCN } from 'date-fns/locale';
-import type { InsightsDay, LearningInsights, Mastery } from '../types/lexnote';
+import type {
+  InsightsDay,
+  LearningInsights,
+  Mastery,
+  ReviewCalendar,
+  ReviewCalendarDay,
+} from '../types/lexnote';
 
 /** The ranges the page offers, in days. The backend keeps a window between a week and a quarter. */
 export const RANGES = [7, 30, 90] as const;
@@ -9,15 +15,30 @@ export type RangeDays = (typeof RANGES)[number];
 export const MASTERY_LEVELS: Mastery[] = ['new', 'learning', 'familiar', 'mastered'];
 
 /**
- * Right answers as a percentage of all answers, or `null` while nothing was answered.
- * Rounding never claims more than the truth: 100 only without a mistake, 0 only without a success.
+ * Right answers as a percentage of all answers, or `null` while nothing was answered. A card
+ * that was found hard was not answered right. Rounding never claims more than the truth: 100
+ * only when every answer was right, 0 only when none was.
  */
-export function accuracyPercent(correct: number, wrong: number): number | null {
-  if (correct + wrong <= 0) return null;
-  if (wrong <= 0) return 100;
+export function accuracyPercent(correct: number, wrong: number, hard = 0): number | null {
+  const answered = correct + hard + wrong;
+  if (answered <= 0) return null;
+  if (correct >= answered) return 100;
   if (correct <= 0) return 0;
-  return Math.min(99, Math.max(1, Math.round((correct / (correct + wrong)) * 100)));
+  return Math.min(99, Math.max(1, Math.round((correct / answered) * 100)));
 }
+
+/** "答对 75 次，有点难 10 次，答错 25 次"; what was never the answer is left out, apart from right and wrong. */
+export function describeAnswers({ correct, hard, wrong }: { correct: number; hard: number; wrong: number }): string {
+  return [`答对 ${correct} 次`, hard > 0 ? `有点难 ${hard} 次` : '', `答错 ${wrong} 次`].filter(Boolean).join('，');
+}
+
+/** What is said under a word in the ranking of the ones that were missed. */
+export function describeHardWord({ wrong, hard }: { wrong: number; hard: number }): string {
+  return [wrong > 0 ? `答错 ${wrong} 次` : '', hard > 0 ? `有点难 ${hard} 次` : ''].filter(Boolean).join(' · ');
+}
+
+/** How much a word weighs in that ranking: forgetting it counts twice as much as finding it hard, as the backend ranks. */
+export const hardWordWeight = ({ wrong, hard }: { wrong: number; hard: number }): number => wrong * 2 + hard;
 
 /** "10月7日 周三", or the text as it came when it is not a date. */
 export function dayLabel(date: string): string {
@@ -100,3 +121,58 @@ export function streakNote({ streak, daily }: Pick<LearningInsights, 'streak' | 
 /** Whether there is nothing to show yet: no words, no lookups and no active day. */
 export const isBlank = ({ totals, streak, review }: LearningInsights): boolean =>
   totals.words === 0 && totals.lookups === 0 && streak.activeDays === 0 && review.total === 0;
+
+/** How dark a day of the review calendar is drawn: 0 for none, 4 for the busiest day. */
+export type HeatLevel = 0 | 1 | 2 | 3 | 4;
+
+/** The darkness of a day, in quarters of the busiest day; any answer at all is at least a quarter. */
+export function heatLevel(total: number, busiest: number): HeatLevel {
+  if (total <= 0 || busiest <= 0) return 0;
+  return Math.min(4, Math.max(1, Math.ceil((total / busiest) * 4))) as HeatLevel;
+}
+
+/** The most cards answered on a single day of the calendar. */
+export const busiestReviewDay = (days: ReviewCalendarDay[]): number =>
+  days.reduce((most, day) => Math.max(most, day.total), 0);
+
+export interface CalendarCell {
+  day: ReviewCalendarDay;
+  level: HeatLevel;
+}
+
+/**
+ * The calendar as weeks, oldest first, each with its days from Monday on (the backend starts
+ * the calendar on a Monday). The last week stops at today.
+ */
+export function calendarWeeks(calendar: ReviewCalendar): CalendarCell[][] {
+  const busiest = busiestReviewDay(calendar.days);
+  const weeks: CalendarCell[][] = [];
+  calendar.days.forEach((day, index) => {
+    if (index % 7 === 0) weeks.push([]);
+    weeks[weeks.length - 1].push({ day, level: heatLevel(day.total, busiest) });
+  });
+  return weeks;
+}
+
+/**
+ * "10月7日 周三：复习 12 张（答对 9，有点难 2，答错 1）". Answers whose kind was not recorded
+ * are in the total but not in the brackets, which then say how many there are.
+ */
+export function describeReviewDay(day: ReviewCalendarDay): string {
+  const label = dayLabel(day.date);
+  if (day.total <= 0) return `${label}：没有复习`;
+  const parts: string[] = [];
+  if (day.correct > 0) parts.push(`答对 ${day.correct}`);
+  if (day.hard > 0) parts.push(`有点难 ${day.hard}`);
+  if (day.wrong > 0) parts.push(`答错 ${day.wrong}`);
+  const unknown = day.total - day.correct - day.hard - day.wrong;
+  if (unknown > 0) parts.push(`未记录 ${unknown}`);
+  return `${label}：复习 ${day.total} 张（${parts.join('，')}）`;
+}
+
+/** "近 12 周复习了 31 张，分布在 6 天", or that there was nothing. */
+export function describeCalendar(calendar: ReviewCalendar): string {
+  const total = calendar.days.reduce((sum, day) => sum + day.total, 0);
+  const active = calendar.days.filter((day) => day.total > 0).length;
+  return total > 0 ? `近 ${calendar.weeks} 周复习了 ${total} 张，分布在 ${active} 天` : `近 ${calendar.weeks} 周没有复习`;
+}

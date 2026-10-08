@@ -8,19 +8,27 @@ import { useRefreshWhenActive } from '../hooks/useRefreshWhenActive';
 import {
   accuracyPercent,
   busiestDay,
+  busiestReviewDay,
+  calendarWeeks,
   chartBars,
   dayLabel,
+  describeAnswers,
+  describeCalendar,
   describeCounts,
   describeDay,
+  describeHardWord,
+  describeReviewDay,
+  hardWordWeight,
   isBlank,
   masterySegments,
   RANGES,
   rankShare,
   streakNote,
+  type HeatLevel,
   type RangeDays,
 } from '../lib/insights';
 import * as bridge from '../lib/tauri-bridge';
-import type { LearningInsights, Mastery } from '../types/lexnote';
+import type { LearningInsights, Mastery, ReviewCalendar } from '../types/lexnote';
 import { classNames } from '../utils/format';
 
 const RANGE_OPTIONS = RANGES.map((days) => ({ value: String(days), label: `${days} 天` }));
@@ -46,6 +54,18 @@ const BOXES = [
   { label: 'Box 2', hint: '3 天后再见' },
   { label: 'Box 3', hint: '7 天后再见' },
 ];
+
+/** From no cards answered to the busiest day, so that the calendar reads as more from left to right. */
+const HEAT: Record<HeatLevel, string> = {
+  0: 'bg-sunken',
+  1: 'bg-accent/25',
+  2: 'bg-accent/50',
+  3: 'bg-accent/75',
+  4: 'bg-accent',
+};
+const HEAT_LEVELS: HeatLevel[] = [0, 1, 2, 3, 4];
+/** Monday to Sunday; only some days are named, which is enough to find the others. */
+const WEEKDAYS = ['一', '', '三', '', '五', '', '日'];
 
 export function Insights() {
   const [days, setDays] = useState<RangeDays>(30);
@@ -158,6 +178,8 @@ function Report({ data }: { data: LearningInsights }) {
         <ReviewCard data={data} onReview={() => navigate('/review')} />
       </div>
 
+      <ReviewCalendarCard calendar={data.reviewCalendar} />
+
       <div className="grid gap-4 md:grid-cols-3">
         <RankingCard
           title="常查的词"
@@ -169,9 +191,13 @@ function Report({ data }: { data: LearningInsights }) {
         <RankingCard
           title="易错的词"
           id="insights-hard"
-          empty="还没有答错过的词"
+          empty="还没有答错或觉得难的词"
           bar="bg-danger"
-          rows={data.hardWords.map((item) => ({ name: item.lemma, value: item.wrong, text: `答错 ${item.wrong} 次` }))}
+          rows={data.hardWords.map((item) => ({
+            name: item.lemma,
+            value: hardWordWeight(item),
+            text: describeHardWord(item),
+          }))}
         />
         <RankingCard
           title="生词来源"
@@ -298,7 +324,7 @@ function MasteryCard({ data }: { data: LearningInsights }) {
 
 function ReviewCard({ data, onReview }: { data: LearningInsights; onReview: () => void }) {
   const { review } = data;
-  const accuracy = accuracyPercent(review.correct, review.wrong);
+  const accuracy = accuracyPercent(review.correct, review.wrong, review.hard);
   const largest = Math.max(...review.boxCounts);
 
   return (
@@ -308,7 +334,7 @@ function ReviewCard({ data, onReview }: { data: LearningInsights; onReview: () =
           <p className="text-xs text-ink-subtle">答对率</p>
           <p className="mt-0.5 text-2xl font-bold text-ink">{accuracy === null ? '—' : `${accuracy}%`}</p>
           <p className="mt-0.5 text-2xs text-ink-subtle">
-            {accuracy === null ? '还没有答题记录' : `答对 ${review.correct} 次，答错 ${review.wrong} 次`}
+            {accuracy === null ? '还没有答题记录' : describeAnswers(review)}
           </p>
         </div>
         {review.dueToday > 0 ? (
@@ -337,6 +363,59 @@ function ReviewCard({ data, onReview }: { data: LearningInsights; onReview: () =
           ))}
         </ul>
       )}
+    </Card>
+  );
+}
+
+function ReviewCalendarCard({ calendar }: { calendar: ReviewCalendar }) {
+  const weeks = useMemo(() => calendarWeeks(calendar), [calendar]);
+  const busiest = busiestReviewDay(calendar.days);
+  const first = calendar.days[0];
+  const last = calendar.days[calendar.days.length - 1];
+
+  return (
+    <Card title={`近 ${calendar.weeks} 周的复习日历`} id="insights-calendar">
+      <div className="flex gap-2">
+        <div aria-hidden="true" className="flex shrink-0 flex-col gap-[3px] text-2xs text-ink-subtle">
+          {WEEKDAYS.map((name, index) => (
+            <span key={index} className="flex h-[18px] items-center">
+              {name}
+            </span>
+          ))}
+        </div>
+        <div role="img" aria-label={describeCalendar(calendar)} className="flex min-w-0 flex-1 gap-[3px]">
+          {weeks.map((week) => (
+            <div key={week[0].day.date} className="flex min-w-0 flex-1 flex-col gap-[3px]">
+              {week.map(({ day, level }) => (
+                <div
+                  key={day.date}
+                  title={describeReviewDay(day)}
+                  data-level={level}
+                  className={classNames('h-[18px] rounded-sm', HEAT[level])}
+                />
+              ))}
+            </div>
+          ))}
+        </div>
+      </div>
+      {first && last ? (
+        <div className="mt-1 flex justify-between pl-5 text-2xs text-ink-subtle">
+          <span>{dayLabel(first.date)}</span>
+          <span>{dayLabel(last.date)}</span>
+        </div>
+      ) : null}
+      <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-ink-muted">
+        <span aria-hidden="true" className="flex items-center gap-1">
+          少
+          {HEAT_LEVELS.map((level) => (
+            <span key={level} className={classNames('h-2.5 w-2.5 rounded-sm', HEAT[level])} />
+          ))}
+          多
+        </span>
+        <span className="ml-auto text-ink-subtle">
+          {busiest > 0 ? `单日最多 ${busiest} 张` : '这段时间还没有复习'}
+        </span>
+      </div>
     </Card>
   );
 }

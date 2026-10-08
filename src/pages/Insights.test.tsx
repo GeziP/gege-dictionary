@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LexNoteProvider } from '../contexts/LexNoteContext';
-import { blankInsights, insightsFixture } from '../lib/insights.fixture';
+import { blankInsights, insightsFixture, reviewCalendarFixture } from '../lib/insights.fixture';
 import * as bridge from '../lib/tauri-bridge';
 import type { LearningInsights } from '../types/lexnote';
 import { Insights } from './Insights';
@@ -173,7 +173,7 @@ describe('the learning-insights page', () => {
 
     const review = card('复习');
     expect(review.getByText('75%')).toBeInTheDocument();
-    expect(review.getByText('答对 75 次，答错 25 次')).toBeInTheDocument();
+    expect(review.getByText('答对 75 次，有点难 10 次，答错 15 次')).toBeInTheDocument();
     const boxes = within(review.getByRole('list', { name: '复习档位分布' })).getAllByRole('listitem');
     // the box, how many cards are in it, and when its cards come back, as one run of text
     expect(boxes.map((box) => box.textContent)).toEqual([
@@ -196,6 +196,8 @@ describe('the learning-insights page', () => {
     const hard = card('易错的词');
     expect(hard.getByText('serendipity')).toBeInTheDocument();
     expect(hard.getByText('答错 4 次')).toBeInTheDocument();
+    expect(hard.getByText('ephemeral')).toBeInTheDocument();
+    expect(hard.getByText('答错 1 次 · 有点难 3 次')).toBeInTheDocument();
 
     const sources = card('生词来源');
     expect(sources.getByText('chrome.exe')).toBeInTheDocument();
@@ -204,19 +206,46 @@ describe('the learning-insights page', () => {
     expect(sources.getByText('4 个词')).toBeInTheDocument();
   });
 
+  it('draws a calendar of the last twelve weeks, shaded by how many cards were answered each day', async () => {
+    renderPage();
+    await screen.findByRole('group', { name: '生词库' });
+
+    const calendar = screen.getByRole('img', { name: '近 12 周复习了 13 张，分布在 3 天' });
+    // One square for each day, from the Monday of the first week up to today.
+    expect(within(calendar).getAllByTitle(/：/)).toHaveLength(80);
+    const busiest = within(calendar).getByTitle('10月1日 周四：复习 8 张（答对 5，有点难 2，答错 1）');
+    expect(busiest).toHaveAttribute('data-level', '4');
+    expect(within(calendar).getByTitle('10月6日 周二：复习 3 张（答对 2，有点难 1）')).toHaveAttribute('data-level', '2');
+    expect(within(calendar).getByTitle('10月7日 周三：没有复习')).toHaveAttribute('data-level', '0');
+
+    const section = card('近 12 周的复习日历');
+    expect(section.getByText('7月20日 周一')).toBeInTheDocument();
+    expect(section.getByText('10月7日 周三')).toBeInTheDocument();
+    expect(section.getByText('单日最多 8 张')).toBeInTheDocument();
+  });
+
+  it('says that nothing was reviewed, rather than drawing a calendar that looks like data', async () => {
+    answer = (days) => ({ ...insightsFixture({ days }), reviewCalendar: reviewCalendarFixture({}) });
+    renderPage();
+    await screen.findByRole('group', { name: '生词库' });
+
+    expect(screen.getByRole('img', { name: '近 12 周没有复习' })).toBeInTheDocument();
+    expect(card('近 12 周的复习日历').getByText('这段时间还没有复习')).toBeInTheDocument();
+  });
+
   it('says so, rather than showing empty rankings as data, when there is nothing to rank yet', async () => {
     answer = (days) => ({
       ...insightsFixture({ days }),
       oftenLookedUp: [],
       hardWords: [],
       topSources: [],
-      review: { dueToday: 0, total: 0, boxCounts: [0, 0, 0], correct: 0, wrong: 0 },
+      review: { dueToday: 0, total: 0, boxCounts: [0, 0, 0], correct: 0, hard: 0, wrong: 0 },
     });
     renderPage();
     await screen.findByRole('group', { name: '生词库' });
 
     expect(card('常查的词').getByText('还没有查过两次以上的词')).toBeInTheDocument();
-    expect(card('易错的词').getByText('还没有答错过的词')).toBeInTheDocument();
+    expect(card('易错的词').getByText('还没有答错或觉得难的词')).toBeInTheDocument();
     expect(card('生词来源').getByText('还没有记录下来源')).toBeInTheDocument();
     expect(card('复习').getByText('—')).toBeInTheDocument();
     expect(card('复习').getByText('还没有答题记录')).toBeInTheDocument();
@@ -233,7 +262,7 @@ describe('the learning-insights page', () => {
     cleanup();
     answer = (days) => ({
       ...insightsFixture({ days }),
-      review: { dueToday: 0, total: 38, boxCounts: [20, 12, 6], correct: 75, wrong: 25 },
+      review: { dueToday: 0, total: 38, boxCounts: [20, 12, 6], correct: 75, hard: 0, wrong: 25 },
     });
     renderPage();
     await screen.findByRole('group', { name: '生词库' });

@@ -8,6 +8,7 @@ import type {
   LookupHistoryItem,
   PromptTemplate,
   ReadingSession,
+  ReviewAnswer,
   ReviewState,
   ReviewStats,
   SavedWord,
@@ -105,8 +106,9 @@ export async function getReviewQueue(limit?: number): Promise<SavedWord[]> {
   return invoke<SavedWord[]>('get_review_queue', { limit });
 }
 
-export async function submitReview(wordId: string, correct: boolean): Promise<ReviewState> {
-  return invoke<ReviewState>('submit_review', { wordId, correct });
+/** Answers a card: knew it, knew it but only just (it comes back tomorrow), or did not. */
+export async function submitReview(wordId: string, answer: ReviewAnswer): Promise<ReviewState> {
+  return invoke<ReviewState>('submit_review', { wordId, answer });
 }
 
 export async function getReviewStats(): Promise<ReviewStats> {

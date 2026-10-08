@@ -142,12 +142,19 @@ export interface SavedWord extends Entry {
   ankiNoteId?: number;
 }
 
+/**
+ * How a card was answered: knew it, knew it but only just, or did not know it. The backend
+ * stores and reports these three words as they are.
+ */
+export type ReviewAnswer = 'correct' | 'hard' | 'wrong';
+
 export interface ReviewState {
   wordId: string;
   box: 1 | 2 | 3;
   dueAt: string;
-  lastResult?: 'correct' | 'wrong' | null;
+  lastResult?: ReviewAnswer | null;
   correctCount: number;
+  hardCount: number;
   wrongCount: number;
   reviewedAt?: string | null;
   previousBox?: number;
@@ -197,13 +204,36 @@ export interface LearningInsights {
     /** Cards in the review boxes. */
     total: number;
     boxCounts: [number, number, number];
-    /** Right and wrong answers over the cards' whole life. */
+    /** Answers of each kind over the cards' whole life. */
     correct: number;
+    hard: number;
     wrong: number;
   };
+  /** The review cards answered, day by day, over the last twelve weeks. */
+  reviewCalendar: ReviewCalendar;
   topSources: Array<{ source: string; count: number }>;
   oftenLookedUp: Array<{ lemma: string; count: number }>;
-  hardWords: Array<{ lemma: string; wrong: number }>;
+  /** Words that were forgotten or found hard, the worst first. */
+  hardWords: Array<{ lemma: string; wrong: number; hard: number }>;
+}
+
+/** The review cards answered on one local day, and how they were answered. */
+export interface ReviewCalendarDay {
+  /** yyyy-MM-dd. */
+  date: string;
+  /** Every card answered, including those whose kind of answer was not recorded. */
+  total: number;
+  correct: number;
+  hard: number;
+  wrong: number;
+}
+
+export interface ReviewCalendar {
+  /** The Monday the first day falls on, so that days go straight into weeks of seven. */
+  first: string;
+  weeks: number;
+  /** From `first` up to today, oldest first, days without any answer included as zeros. */
+  days: ReviewCalendarDay[];
 }
 
 export interface ReadingSession {

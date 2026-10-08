@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const LATEST_SCHEMA_VERSION: i64 = 6;
+pub const LATEST_SCHEMA_VERSION: i64 = 7;
 
 const REVIEW_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS review_state (
@@ -77,6 +77,12 @@ CREATE TABLE IF NOT EXISTS lookup_history (
 CREATE INDEX IF NOT EXISTS idx_lookup_history_last_at ON lookup_history(last_at DESC);
 "#;
 
+// A third answer, "hard", is counted next to the right and wrong ones. `last_result` is free
+// text, so it needs no change to hold the new answer.
+const REVIEW_HARD_SCHEMA: &str = r#"
+ALTER TABLE review_state ADD COLUMN hard_count INTEGER NOT NULL DEFAULT 0;
+"#;
+
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, REVIEW_SCHEMA),
     (
@@ -94,6 +100,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (4, LOCAL_EVENTS_SCHEMA),
     (5, ANKI_NOTE_ID_SCHEMA),
     (6, LOOKUP_HISTORY_SCHEMA),
+    (7, REVIEW_HARD_SCHEMA),
 ];
 
 pub fn current_version(conn: &Connection) -> Result<i64, String> {
@@ -106,21 +113,33 @@ pub fn initialize_latest(conn: &Connection) -> Result<(), String> {
         "{REVIEW_SCHEMA}\n{GLOSSARY_SCHEMA}\n{LOCAL_EVENTS_SCHEMA}\n{LOOKUP_HISTORY_SCHEMA}"
     ))
     .map_err(|e| format!("创建最新 schema 失败: {e}"))?;
-    // v5 column may already exist on fresh DBs created via db.rs contract.
-    let has_anki = conn
-        .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('words') WHERE name='anki_note_id'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        > 0;
-    if !has_anki {
-        conn.execute_batch(ANKI_NOTE_ID_SCHEMA)
-            .map_err(|e| format!("创建 anki_note_id 失败: {e}"))?;
-    }
+    // Columns that were added to a table after it was first created (the `ALTER TABLE` of a
+    // migration cannot be part of the `CREATE TABLE` above, which the first migration runs too).
+    add_column_if_missing(conn, "words", "anki_note_id", ANKI_NOTE_ID_SCHEMA)?;
+    add_column_if_missing(conn, "review_state", "hard_count", REVIEW_HARD_SCHEMA)?;
     conn.pragma_update(None, "user_version", LATEST_SCHEMA_VERSION)
         .map_err(|e| format!("写入 schema 版本失败: {e}"))
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    add: &str,
+) -> Result<(), String> {
+    let exists = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            [table, column],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| format!("检查 {table}.{column} 失败: {e}"))?
+        > 0;
+    if exists {
+        return Ok(());
+    }
+    conn.execute_batch(add)
+        .map_err(|e| format!("创建 {table}.{column} 失败: {e}"))
 }
 
 pub fn migrate(conn: &Connection, db_path: &str) -> Result<Option<PathBuf>, String> {
@@ -234,6 +253,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(anki_col, 1);
+        assert!(review_columns(&conn).contains(&"hard_count".to_string()));
     }
 
     #[test]
@@ -325,15 +345,40 @@ mod tests {
         assert!(exists);
     }
 
-    #[test]
-    fn upgrades_v4_with_anki_note_id_column() {
+    /// A database as an earlier version left it: one word, and the review table (with that
+    /// word's progress in it) which every version since the first migration has had.
+    fn database_at(version: i64) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE words (id TEXT PRIMARY KEY, kind TEXT, saved_at TEXT);
              INSERT INTO words VALUES ('kept', 'word', '2026-08-01');",
         )
         .unwrap();
-        conn.pragma_update(None, "user_version", 4).unwrap();
+        conn.execute_batch(REVIEW_SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO review_state
+                 (word_id, box, due_at, last_result, correct_count, wrong_count, reviewed_at, created_at)
+             VALUES ('kept', 2, '2026-08-10', 'correct', 4, 1, '2026-08-09', '2026-08-01')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", version).unwrap();
+        conn
+    }
+
+    fn review_columns(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('review_state') ORDER BY cid")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn upgrades_v4_with_anki_note_id_column() {
+        let conn = database_at(4);
         migrate(&conn, "").unwrap();
         assert_eq!(current_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
         let col: i64 = conn
@@ -358,13 +403,7 @@ mod tests {
 
     #[test]
     fn upgrades_v5_with_lookup_history_and_keeps_existing_words() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE words (id TEXT PRIMARY KEY, kind TEXT, saved_at TEXT);
-             INSERT INTO words VALUES ('kept', 'word', '2026-08-01');",
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 5).unwrap();
+        let conn = database_at(5);
         migrate(&conn, "").unwrap();
         assert_eq!(current_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
         assert_eq!(
@@ -404,6 +443,89 @@ mod tests {
                       VALUES ('run\u{1f}word', 'run', 't', 't')";
         conn.execute(insert, []).unwrap();
         assert!(conn.execute(insert, []).is_err());
+    }
+
+    #[test]
+    fn upgrades_v6_with_a_hard_count_and_keeps_the_review_progress() {
+        let conn = database_at(6);
+        migrate(&conn, "").unwrap();
+        assert_eq!(current_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+
+        let (box_number, correct, wrong, hard, last): (i64, i64, i64, i64, String) = conn
+            .query_row(
+                "SELECT box, correct_count, wrong_count, hard_count, last_result
+                 FROM review_state WHERE word_id='kept'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (box_number, correct, wrong, last.as_str()),
+            (2, 4, 1, "correct"),
+            "what was learned is kept"
+        );
+        assert_eq!(hard, 0, "no card was ever answered as hard before");
+        // Cards that start being reviewed after the upgrade begin at zero as well.
+        conn.execute_batch(
+            "INSERT INTO words VALUES ('later', 'word', '2026-09-01');
+             INSERT INTO review_state (word_id, box, due_at, created_at)
+             VALUES ('later', 1, '2026-09-02', '2026-09-01');",
+        )
+        .unwrap();
+        let later: i64 = conn
+            .query_row(
+                "SELECT hard_count FROM review_state WHERE word_id='later'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(later, 0);
+    }
+
+    #[test]
+    fn a_new_database_has_the_hard_count_too() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE words (id TEXT PRIMARY KEY);")
+            .unwrap();
+        initialize_latest(&conn).unwrap();
+        assert!(review_columns(&conn).contains(&"hard_count".to_string()));
+        // Setting the database up a second time (a restart) neither fails nor adds it twice.
+        initialize_latest(&conn).unwrap();
+        assert_eq!(
+            review_columns(&conn)
+                .iter()
+                .filter(|name| name.as_str() == "hard_count")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_failed_upgrade_to_v7_leaves_the_database_at_v6_with_its_progress() {
+        let conn = database_at(6);
+        // The column being there already is a step that cannot be applied.
+        conn.execute_batch(REVIEW_HARD_SCHEMA).unwrap();
+
+        let error = migrate(&conn, "").unwrap_err();
+
+        assert!(error.contains("已回滚"), "{error}");
+        assert_eq!(current_version(&conn).unwrap(), 6);
+        let box_number: i64 = conn
+            .query_row(
+                "SELECT box FROM review_state WHERE word_id='kept'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(box_number, 2);
     }
 
     #[test]
