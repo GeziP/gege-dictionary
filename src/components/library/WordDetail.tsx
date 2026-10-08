@@ -51,7 +51,14 @@ export function WordDetail({
 }) {
   const { updateWord, removeWords, settings, tags } = useLexNote();
   const navigate = useNavigate();
-  const { state: reanalysis, run: reanalyze, rollback } = useReanalysis(word);
+  const {
+    state: reanalysis,
+    run: reanalyze,
+    rollback,
+    keepSavedForm,
+    saveAsOwnWord,
+    discard: discardAnswer,
+  } = useReanalysis(word);
   const [savedFlash, setSavedFlash] = useState(false);
   const [tagDraft, setTagDraft] = useState('');
   const [fontSize, setFontSize] = useState(initialFontSize);
@@ -220,6 +227,9 @@ export function WordDetail({
         onRollback={rollback}
         onRetry={reanalyze}
         onOpenSettings={() => navigate('/settings')}
+        onKeepForm={keepSavedForm}
+        onSaveAsOwn={saveAsOwnWord}
+        onDiscard={discardAnswer}
       />
 
       <div className="space-y-2 px-2 py-2" style={{ fontSize: `${fontSize}px` }}>

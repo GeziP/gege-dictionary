@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -20,9 +20,11 @@ vi.mock('../../lib/tauri-bridge', () => ({
   listenLookupError: vi.fn(),
   listenLookupDelta: vi.fn(),
   lookupWord: vi.fn(),
+  findWordByLemma: vi.fn(),
   saveWord: vi.fn(),
   restoreWord: vi.fn(),
   updateWord: vi.fn(),
+  deleteWords: vi.fn(),
   emitWordSaved: vi.fn(),
   speakText: vi.fn(),
   stopSpeaking: vi.fn(),
@@ -75,14 +77,21 @@ const NEW_ANSWER = {
   syntax: [{ text: 'added', role: 'x', note: '' }],
 } as unknown as Entry;
 
-/** What the provider shows for the word with the given id, plus a way to switch to the other one. */
+/**
+ * What the provider shows for the word with the given id, plus a way to switch
+ * to the other one and one to load the library again, as if something else had
+ * changed it.
+ */
 function Detail() {
-  const { words } = useLexNote();
+  const { words, refreshWords } = useLexNote();
   const [id, setId] = useState('w1');
   return (
     <>
       <button type="button" onClick={() => setId('w2')}>
         show-w2
+      </button>
+      <button type="button" onClick={() => refreshWords()}>
+        refresh-words
       </button>
       <WordDetail word={words.find((word) => word.id === id) ?? null} inline />
     </>
@@ -134,6 +143,8 @@ describe('re-analysing a saved word', () => {
     }));
     vi.mocked(bridge.restoreWord).mockResolvedValue(undefined);
     vi.mocked(bridge.updateWord).mockResolvedValue(undefined);
+    vi.mocked(bridge.deleteWords).mockResolvedValue(undefined);
+    vi.mocked(bridge.findWordByLemma).mockResolvedValue(null);
     vi.mocked(bridge.emitWordSaved).mockResolvedValue(undefined);
   });
 
@@ -314,6 +325,361 @@ describe('re-analysing a saved word', () => {
       expect(alert).toHaveTextContent('保存失败');
       expect(alert).toHaveTextContent('database is locked');
       expect(screen.getByText('旧释义')).toBeInTheDocument();
+    });
+  });
+
+  describe('when the answer names another form of the word', () => {
+    // The word was saved as "running" (NEW_ANSWER is the model saying it is a form of "run").
+    const running = () => saved({ lemma: 'running' });
+    const choice = () => screen.findByRole('group', { name: /请选择怎么处理/ });
+    const pick = async (user: ReturnType<typeof userEvent.setup>, name: string) =>
+      user.click(within(await choice()).getByRole('button', { name }));
+    const savedDraft = () => vi.mocked(bridge.saveWord).mock.calls[0][0];
+    /** The library as something else left it: the provider loads it again and shows what is there. */
+    const reloadLibrary = async (
+      user: ReturnType<typeof userEvent.setup>,
+      library: SavedWord[],
+    ) => {
+      vi.mocked(bridge.getAllWords).mockResolvedValue(library);
+      const loads = vi.mocked(bridge.getAllWords).mock.calls.length;
+      await user.click(screen.getByRole('button', { name: 'refresh-words' }));
+      await waitFor(() => expect(vi.mocked(bridge.getAllWords).mock.calls.length).toBe(loads + 1));
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    };
+
+    it('asks what to do with the answer instead of saving it', async () => {
+      const user = userEvent.setup();
+      renderDetail([running()]);
+      await shown('running');
+
+      await user.click(reanalyzeButton());
+
+      const group = await choice();
+      expect(group).toHaveTextContent('模型认为原形是「run」，你保存的是「running」');
+      expect(group).not.toHaveTextContent('词库里已有');
+      expect(within(group).getByRole('button', { name: '更新「running」' })).toBeEnabled();
+      expect(within(group).getByRole('button', { name: '另存为「run」' })).toBeEnabled();
+      expect(within(group).getByRole('button', { name: '都不要' })).toBeEnabled();
+      expect(bridge.saveWord).not.toHaveBeenCalled();
+      expect(screen.getByText('旧释义')).toBeInTheDocument();
+      expect(reanalyzeButton()).toBeEnabled();
+    });
+
+    it('says so when the library has the other form already, and that it is updated, not added', async () => {
+      const user = userEvent.setup();
+      vi.mocked(bridge.findWordByLemma).mockResolvedValue(saved({ id: 'w-run', lemma: 'run' }));
+      renderDetail([running()]);
+      await shown('running');
+
+      await user.click(reanalyzeButton());
+
+      expect(await choice()).toHaveTextContent('词库里已有「run」，会更新它，不会重复添加');
+      expect(bridge.findWordByLemma).toHaveBeenCalledWith('run', 'word');
+    });
+
+    describe('replacing the content of the word as it is', () => {
+      it('puts the new content in and keeps the form the word is saved under', async () => {
+        const user = userEvent.setup();
+        renderDetail([running()]);
+        await shown('running');
+        await user.click(reanalyzeButton());
+
+        await pick(user, '更新「running」');
+
+        expect(await screen.findByText('已用 qwen-test 重新解析')).toBeInTheDocument();
+        expect(bridge.saveWord).toHaveBeenCalledTimes(1);
+        expect(savedDraft()).toMatchObject({
+          id: 'w1',
+          lemma: 'running',
+          translation: '新释义',
+          mastery: 'familiar',
+          tags: ['travel'],
+          note: '我的笔记',
+        });
+        expect(screen.getByRole('heading', { name: 'running' })).toBeInTheDocument();
+        expect(screen.getByText('新释义')).toBeInTheDocument();
+        expect(screen.queryByRole('group', { name: /请选择怎么处理/ })).not.toBeInTheDocument();
+      });
+
+      it('can be rolled back like any other re-analysis', async () => {
+        const user = userEvent.setup();
+        renderDetail([running()]);
+        await shown('running');
+        await user.click(reanalyzeButton());
+        await pick(user, '更新「running」');
+        await screen.findByText('已用 qwen-test 重新解析');
+
+        await user.click(screen.getByRole('button', { name: '回滚' }));
+
+        await waitFor(() => expect(bridge.restoreWord).toHaveBeenCalledTimes(1));
+        expect(vi.mocked(bridge.restoreWord).mock.calls[0][0]).toMatchObject({
+          id: 'w1',
+          lemma: 'running',
+          translation: '旧释义',
+        });
+      });
+
+      it('uses the word as it is by then, not as it was when the model was asked', async () => {
+        const user = userEvent.setup();
+        renderDetail([running()]);
+        await shown('running');
+        await user.click(reanalyzeButton());
+        await choice();
+
+        await user.click(screen.getByRole('button', { name: '已掌握' }));
+        await pick(user, '更新「running」');
+
+        await screen.findByText('已用 qwen-test 重新解析');
+        expect(savedDraft()).toMatchObject({ id: 'w1', mastery: 'mastered', note: '我的笔记' });
+      });
+
+      it('keeps the choice open, with the reason, when saving fails, and can be tried again', async () => {
+        const user = userEvent.setup();
+        vi.mocked(bridge.saveWord).mockRejectedValueOnce('database is locked');
+        renderDetail([running()]);
+        await shown('running');
+        await user.click(reanalyzeButton());
+
+        await pick(user, '更新「running」');
+
+        const group = await choice();
+        expect(await within(group).findByRole('alert')).toHaveTextContent('保存失败：database is locked');
+        expect(within(group).getByRole('button', { name: '更新「running」' })).toBeEnabled();
+        expect(screen.getByText('旧释义')).toBeInTheDocument();
+
+        await user.click(within(group).getByRole('button', { name: '更新「running」' }));
+
+        expect(await screen.findByText('已用 qwen-test 重新解析')).toBeInTheDocument();
+        expect(bridge.saveWord).toHaveBeenCalledTimes(2);
+        expect(bridge.lookupWord).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe('saving the answer as a word of its own', () => {
+      beforeEach(() => {
+        // A new word comes back as it was sent, with the one lookup it was made by.
+        vi.mocked(bridge.saveWord).mockImplementation(async (word) => word);
+      });
+
+      it('saves it under the form it names and leaves the open word alone', async () => {
+        const user = userEvent.setup();
+        renderDetail([running()]);
+        await shown('running');
+        await user.click(reanalyzeButton());
+
+        await pick(user, '另存为「run」');
+
+        expect(await screen.findByText('新的解析已另存为「run」，这个词条保持原样')).toBeInTheDocument();
+        expect(screen.getByText('已用 qwen-test 解析')).toBeInTheDocument();
+        expect(bridge.saveWord).toHaveBeenCalledTimes(1);
+        expect(savedDraft()).toMatchObject({
+          lemma: 'run',
+          translation: '新释义',
+          context: 'He was running late.',
+          sourceApp: 'Reader',
+          sourceTitle: 'A Book',
+          tags: [],
+          note: '',
+          mastery: 'new',
+          lookups: 1,
+        });
+        expect(savedDraft().id).not.toBe('w1');
+        expect(screen.getByRole('heading', { name: 'running' })).toBeInTheDocument();
+        expect(screen.getByText('旧释义')).toBeInTheDocument();
+        expect(bridge.restoreWord).not.toHaveBeenCalled();
+      });
+
+      it('saves it as the word the library has under that form, so that is not made twice', async () => {
+        const user = userEvent.setup();
+        const run = saved({ id: 'w-run', lemma: 'run', selection: 'run', translation: '跑' });
+        vi.mocked(bridge.findWordByLemma).mockResolvedValue(run);
+        renderDetail([running(), run]);
+        await shown('running');
+        await user.click(reanalyzeButton());
+
+        await pick(user, '另存为「run」');
+
+        await screen.findByText('新的解析已另存为「run」，这个词条保持原样');
+        expect(savedDraft()).toMatchObject({ id: 'w-run', lemma: 'run', translation: '新释义' });
+      });
+
+      it('asks the library again when the choice is made, not when the question was put', async () => {
+        const user = userEvent.setup();
+        renderDetail([running()]);
+        await shown('running');
+        await user.click(reanalyzeButton());
+        await choice();
+        expect(bridge.findWordByLemma).toHaveBeenCalledTimes(1);
+
+        // Meanwhile the other form was saved, say from the lookup window.
+        vi.mocked(bridge.findWordByLemma).mockResolvedValue(saved({ id: 'w-run', lemma: 'run' }));
+        await pick(user, '另存为「run」');
+
+        await screen.findByText('新的解析已另存为「run」，这个词条保持原样');
+        expect(bridge.findWordByLemma).toHaveBeenCalledTimes(2);
+        expect(savedDraft().id).toBe('w-run');
+      });
+
+      it('takes a word it made back by deleting it', async () => {
+        const user = userEvent.setup();
+        renderDetail([running()]);
+        await shown('running');
+        await user.click(reanalyzeButton());
+        await pick(user, '另存为「run」');
+        await screen.findByText('新的解析已另存为「run」，这个词条保持原样');
+        const loads = vi.mocked(bridge.getAllWords).mock.calls.length;
+
+        await user.click(screen.getByRole('button', { name: '撤销' }));
+
+        await waitFor(() => expect(bridge.deleteWords).toHaveBeenCalledWith([savedDraft().id]));
+        await waitFor(() => expect(vi.mocked(bridge.getAllWords).mock.calls.length).toBe(loads + 1));
+        expect(screen.queryByText('新的解析已另存为「run」，这个词条保持原样')).not.toBeInTheDocument();
+        expect(bridge.restoreWord).not.toHaveBeenCalled();
+      });
+
+      it('takes a refresh of a word that was there back by putting it as it was, keeping what the user did since', async () => {
+        const user = userEvent.setup();
+        const run = saved({ id: 'w-run', lemma: 'run', selection: 'run', translation: '跑', lookups: 5, note: '' });
+        vi.mocked(bridge.findWordByLemma).mockResolvedValue(run);
+        vi.mocked(bridge.saveWord).mockImplementation(async (word) => ({ ...word, lookups: 6 }));
+        renderDetail([running(), run]);
+        await shown('running');
+        await user.click(reanalyzeButton());
+        await pick(user, '另存为「run」');
+        await screen.findByText('新的解析已另存为「run」，这个词条保持原样');
+        // The user tagged it in the meantime.
+        await reloadLibrary(user, [
+          running(),
+          { ...savedDraft(), lookups: 6, tags: ['verbs'] } as SavedWord,
+        ]);
+
+        await user.click(screen.getByRole('button', { name: '撤销' }));
+
+        await waitFor(() => expect(bridge.restoreWord).toHaveBeenCalledTimes(1));
+        expect(vi.mocked(bridge.restoreWord).mock.calls[0][0]).toMatchObject({
+          id: 'w-run',
+          translation: '跑',
+          lookups: 5,
+          tags: ['verbs'],
+        });
+        expect(bridge.deleteWords).not.toHaveBeenCalled();
+      });
+
+      it('does not delete a word it made once the user has done something with it', async () => {
+        const user = userEvent.setup();
+        renderDetail([running()]);
+        await shown('running');
+        await user.click(reanalyzeButton());
+        await pick(user, '另存为「run」');
+        await screen.findByText('新的解析已另存为「run」，这个词条保持原样');
+        await reloadLibrary(user, [running(), { ...savedDraft(), note: '我后来写的' } as SavedWord]);
+
+        await user.click(screen.getByRole('button', { name: '撤销' }));
+
+        expect(await screen.findByText(/撤销失败：「run」在这之后被你改动过，所以没有删除/)).toBeInTheDocument();
+        expect(bridge.deleteWords).not.toHaveBeenCalled();
+        expect(screen.getByRole('button', { name: '撤销' })).toBeEnabled();
+      });
+
+      it('says so when taking it back fails, and leaves the way back open', async () => {
+        const user = userEvent.setup();
+        vi.mocked(bridge.deleteWords).mockRejectedValue('database is locked');
+        renderDetail([running()]);
+        await shown('running');
+        await user.click(reanalyzeButton());
+        await pick(user, '另存为「run」');
+        await screen.findByText('新的解析已另存为「run」，这个词条保持原样');
+
+        await user.click(screen.getByRole('button', { name: '撤销' }));
+
+        expect(await screen.findByText(/撤销失败：database is locked/)).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: '撤销' })).toBeEnabled();
+      });
+
+      it('has nothing to undo for a word that was deleted in the meantime', async () => {
+        const user = userEvent.setup();
+        renderDetail([running()]);
+        await shown('running');
+        await user.click(reanalyzeButton());
+        await pick(user, '另存为「run」');
+        await screen.findByText('新的解析已另存为「run」，这个词条保持原样');
+        await reloadLibrary(user, [running()]);
+
+        await user.click(screen.getByRole('button', { name: '撤销' }));
+
+        await waitFor(() =>
+          expect(screen.queryByText('新的解析已另存为「run」，这个词条保持原样')).not.toBeInTheDocument(),
+        );
+        expect(bridge.deleteWords).not.toHaveBeenCalled();
+        expect(bridge.restoreWord).not.toHaveBeenCalled();
+      });
+    });
+
+    it('drops the answer on request, and nothing was saved', async () => {
+      const user = userEvent.setup();
+      renderDetail([running()]);
+      await shown('running');
+      await user.click(reanalyzeButton());
+
+      await pick(user, '都不要');
+
+      expect(screen.queryByRole('group', { name: /请选择怎么处理/ })).not.toBeInTheDocument();
+      expect(bridge.saveWord).not.toHaveBeenCalled();
+      expect(screen.getByText('旧释义')).toBeInTheDocument();
+    });
+
+    it('forgets the question when another word is shown, with nothing saved', async () => {
+      const user = userEvent.setup();
+      renderDetail([running(), saved({ id: 'w2', lemma: 'walk', selection: 'walk', translation: '走' })]);
+      await shown('running');
+      await user.click(reanalyzeButton());
+      await choice();
+
+      await user.click(screen.getByRole('button', { name: 'show-w2' }));
+      await shown('walk');
+
+      expect(screen.queryByRole('group', { name: /请选择怎么处理/ })).not.toBeInTheDocument();
+      expect(bridge.saveWord).not.toHaveBeenCalled();
+    });
+
+    it('does not decide for the user when the answer comes after they have left the word', async () => {
+      const user = userEvent.setup();
+      let answer!: (entry: Entry) => void;
+      vi.mocked(bridge.lookupWord).mockReturnValue(
+        new Promise<Entry>((resolve) => {
+          answer = resolve;
+        }),
+      );
+      renderDetail([running(), saved({ id: 'w2', lemma: 'walk', selection: 'walk', translation: '走' })]);
+      await shown('running');
+      await user.click(reanalyzeButton());
+      await user.click(screen.getByRole('button', { name: 'show-w2' }));
+      await shown('walk');
+
+      await act(async () => {
+        answer(NEW_ANSWER);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      });
+
+      expect(bridge.saveWord).not.toHaveBeenCalled();
+      expect(bridge.findWordByLemma).not.toHaveBeenCalled();
+      expect(screen.queryByRole('group', { name: /请选择怎么处理/ })).not.toBeInTheDocument();
+      expect(screen.getByText('走')).toBeInTheDocument();
+    });
+
+    it('does not ask when the answer names the same form with another spelling', async () => {
+      const user = userEvent.setup();
+      vi.mocked(bridge.lookupWord).mockResolvedValue({ ...NEW_ANSWER, lemma: ' RUN ' } as Entry);
+      renderDetail([saved({ lemma: 'Run' })]);
+      await shown('Run');
+
+      await user.click(reanalyzeButton());
+
+      expect(await screen.findByText('已用 qwen-test 重新解析')).toBeInTheDocument();
+      expect(savedDraft()).toMatchObject({ id: 'w1', lemma: 'Run' });
+      expect(screen.queryByRole('group', { name: /请选择怎么处理/ })).not.toBeInTheDocument();
     });
   });
 

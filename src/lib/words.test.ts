@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import type { Entry, SavedWord } from '../types/lexnote';
 import {
+  newWordId,
   normalizeTag,
+  otherLemma,
   reanalysisDraft,
   reanalysisRequest,
   rollbackDraft,
+  separateDraft,
+  untouchedSince,
   upsertSavedWord,
 } from './words';
 
@@ -115,6 +119,99 @@ describe('reanalysisDraft', () => {
       note: '我的笔记',
       ankiNoteId: 1700000000123,
     });
+  });
+
+  it('keeps the form the word is saved under, whatever form the answer names', () => {
+    const draft = reanalysisDraft(stored({ lemma: 'running' }), fresh({ lemma: 'run' }));
+    expect(draft.lemma).toBe('running');
+    expect(draft.translation).toBe('新释义');
+  });
+});
+
+describe('otherLemma', () => {
+  it('names the form the answer gives when it is not the form the word is saved under', () => {
+    expect(otherLemma(stored({ lemma: 'running' }), fresh({ lemma: 'run' }))).toBe('run');
+  });
+
+  it('is nothing when the answer names the same form', () => {
+    expect(otherLemma(stored({ lemma: 'run' }), fresh({ lemma: 'run' }))).toBeNull();
+  });
+
+  it('does not take spacing or letter case for another form, as the backend does not', () => {
+    expect(otherLemma(stored({ lemma: 'Hello  World' }), fresh({ lemma: ' hello world ' }))).toBeNull();
+  });
+
+  it('gives the form as the answer spells it, without the spaces around it', () => {
+    expect(otherLemma(stored({ lemma: 'running' }), fresh({ lemma: '  Run ' }))).toBe('Run');
+  });
+
+  it('is nothing for an answer that names no form at all', () => {
+    expect(otherLemma(stored(), fresh({ lemma: '' }))).toBeNull();
+    expect(otherLemma(stored(), fresh({ lemma: '   ' }))).toBeNull();
+    expect(otherLemma(stored(), fresh({ lemma: undefined }))).toBeNull();
+  });
+});
+
+describe('separateDraft', () => {
+  const answer = fresh({ id: 'answer-id', lemma: 'run', kind: 'word' });
+
+  it('makes a new word of the answer, collected where the open word was', () => {
+    const draft = separateDraft(stored({ lemma: 'running' }), answer, null);
+    expect(draft).toMatchObject({
+      lemma: 'run',
+      translation: '新释义',
+      context: 'He was running late.',
+      sourceApp: 'Reader',
+      sourceTitle: 'A Book',
+    });
+    expect(draft.id).not.toBe('w1');
+    expect(draft.id).not.toBe('');
+  });
+
+  it('leaves what the user attached to the open word with that word', () => {
+    const draft = separateDraft(stored({ lemma: 'running' }), answer, null);
+    expect(draft).toMatchObject({ tags: [], mastery: 'new', lookups: 1, note: '' });
+    expect(draft).not.toHaveProperty('ankiNoteId');
+  });
+
+  it('is saved as the word the library has under that form, so it is not made twice', () => {
+    const draft = separateDraft(stored({ lemma: 'running' }), answer, stored({ id: 'w-run', lemma: 'run' }));
+    expect(draft.id).toBe('w-run');
+  });
+
+  it('is dated now, not when the open word was collected', () => {
+    const before = Date.now();
+    const draft = separateDraft(stored({ lemma: 'running' }), answer, null);
+    expect(new Date(draft.savedAt).getTime()).toBeGreaterThanOrEqual(before);
+  });
+});
+
+describe('newWordId', () => {
+  it('is not the same twice', () => {
+    expect(newWordId()).not.toBe(newWordId());
+  });
+});
+
+describe('untouchedSince', () => {
+  const saved = stored({ ankiNoteId: undefined, tags: [], note: '', mastery: 'new', lookups: 1 });
+
+  it('is true for a word nobody has done anything with', () => {
+    expect(untouchedSince(saved, { ...saved })).toBe(true);
+  });
+
+  it.each([
+    ['studied', { mastery: 'learning' }],
+    ['annotated', { note: '我写了点什么' }],
+    ['tagged', { tags: ['verbs'] }],
+    ['looked up again', { lookups: 2 }],
+    ['sent to Anki', { ankiNoteId: 42 }],
+  ])('is false for a word that was %s', (_what, change) => {
+    expect(untouchedSince(saved, { ...saved, ...change } as SavedWord)).toBe(false);
+  });
+
+  it('is false when a tag was replaced by another of the same count', () => {
+    const tagged = { ...saved, tags: ['a'] } as SavedWord;
+    expect(untouchedSince(tagged, { ...tagged, tags: ['b'] })).toBe(false);
   });
 });
 

@@ -322,14 +322,13 @@ fn merged_lookup_word(existing: &Value, incoming: &Value) -> Value {
             );
         }
     }
-    let same_lemma = normalize_import_lemma(str_field(existing, "lemma"))
-        == normalize_import_lemma(str_field(incoming, "lemma"));
-    if same_lemma {
-        merged.insert(
-            "lemma".into(),
-            Value::String(str_field(existing, "lemma").to_string()),
-        );
-    }
+    // The word is the one that is saved, so it keeps the spelling it is saved
+    // under. (`save_lookup_result` only gets here with an answer for the same
+    // lemma; it refuses one for another.)
+    merged.insert(
+        "lemma".into(),
+        Value::String(str_field(existing, "lemma").to_string()),
+    );
     if !str_field(existing, "note").trim().is_empty() {
         merged.insert(
             "note".into(),
@@ -1113,6 +1112,20 @@ impl Database {
             "" => None,
             id => word_json_by_id(&tx, id)?,
         };
+        // A lookup refreshes the word it is about. An answer for another lemma
+        // than the one this word is saved under is not a refresh: saving it here
+        // would turn "running" into "run" without asking, and into a second
+        // "run" where one is saved already. Whoever means it saves the answer as
+        // a word of its own: with no id, or with the id of the word that has
+        // that lemma.
+        if let Some(stored) = &by_id {
+            let saved_lemma = str_field(stored, "lemma").trim();
+            if normalize_import_lemma(saved_lemma) != normalize_import_lemma(lemma) {
+                return Err(format!(
+                    "这条解析的原形是「{lemma}」，而这个词条保存的是「{saved_lemma}」，没有保存"
+                ));
+            }
+        }
         let existing = match by_id {
             Some(word) => Some(word),
             None => find_word_with_connection(&tx, lemma, Some(kind))?,
@@ -4114,6 +4127,61 @@ mod tests {
         assert_eq!(merged["lemma"], "Hello  World", "stored spelling is kept");
         assert_eq!(merged["translation"], "世界你好");
         assert_eq!(merged["lookups"], 2);
+        assert_eq!(db.get_all_words().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_answer_for_another_lemma_is_not_saved_over_the_word_with_that_id() {
+        let db = new_db();
+        let running = db
+            .save_lookup_result(&lookup_entry("running", "word", "跑步"))
+            .unwrap();
+        let run = db
+            .save_lookup_result(&lookup_entry("run", "word", "跑"))
+            .unwrap();
+        let mut answer = lookup_entry("run", "word", "新释义");
+        answer["id"] = running["id"].clone();
+
+        let error = db.save_lookup_result(&answer).unwrap_err();
+
+        assert!(
+            error.contains("「run」") && error.contains("「running」"),
+            "{error}"
+        );
+        // Nothing changed: "running" is not renamed, and there is no second "run".
+        assert_eq!(db.get_all_words().unwrap().len(), 2);
+        assert_eq!(
+            db.find_word_by_lemma("running", None).unwrap().unwrap(),
+            running
+        );
+        assert_eq!(db.find_word_by_lemma("run", None).unwrap().unwrap(), run);
+
+        // Saved as the word it is about, the same answer is a refresh like any other.
+        answer["id"] = run["id"].clone();
+        let merged = db.save_lookup_result(&answer).unwrap();
+        assert_eq!(merged["id"], run["id"]);
+        assert_eq!(merged["translation"], "新释义");
+        assert_eq!(merged["lookups"], 2);
+        assert_eq!(db.get_all_words().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_answer_that_spells_the_lemma_differently_still_refreshes_the_word() {
+        let db = new_db();
+        let run = db
+            .save_lookup_result(&lookup_entry("Run", "word", "跑"))
+            .unwrap();
+        let mut answer = lookup_entry("  run ", "word", "又一次");
+        answer["id"] = run["id"].clone();
+
+        let merged = db.save_lookup_result(&answer).unwrap();
+
+        assert_eq!(merged["id"], run["id"]);
+        assert_eq!(merged["translation"], "又一次");
+        assert_eq!(
+            merged["lemma"], "Run",
+            "the word keeps the spelling it is saved under"
+        );
         assert_eq!(db.get_all_words().unwrap().len(), 1);
     }
 

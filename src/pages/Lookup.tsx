@@ -23,7 +23,7 @@ import { RichText } from '../components/ui/RichText';
 import { DomainAnalysis } from '../components/domain/DomainAnalysis';
 import * as bridge from '../lib/tauri-bridge';
 import { resolveLookupShortcut } from '../lib/lookup-keys';
-import { MAX_TAG_CHARS, normalizeTag } from '../lib/words';
+import { MAX_TAG_CHARS, newWordId, normalizeTag } from '../lib/words';
 
 export function Lookup() {
   const {
@@ -170,7 +170,7 @@ export function Lookup() {
       // link, so the placeholders below are used for a brand new word only.
       const stored = await ctxSaveWord({
         ...entry,
-        id: before?.id ?? `w-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        id: before?.id ?? newWordId(),
         savedAt: new Date().toISOString(),
         context: lookupContext,
         sourceApp: lookupSourceApp,
