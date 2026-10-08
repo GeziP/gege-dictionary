@@ -1215,6 +1215,8 @@ mod tests {
         assert_eq!(hit["_templateName"], "标准模板 [word]");
 
         assert!(db.get_cache("missing", 30).unwrap().is_none());
+        // Windows cannot remove a folder while a connection still holds a file in it open.
+        drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -2167,6 +2167,8 @@ mod tests {
             db::Database::open(root.join(db::LEGACY_DB_FILENAME).to_str().unwrap()).unwrap();
         legacy.initialize().unwrap();
         assert!(!configured_data_dir_has_database(&root));
+        // Windows cannot remove a folder while a connection still holds a file in it open.
+        drop(legacy);
         let _ = std::fs::remove_dir_all(&root);
     }
 

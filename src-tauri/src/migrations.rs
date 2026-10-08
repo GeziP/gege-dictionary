@@ -544,6 +544,8 @@ mod tests {
         let backup = create_premigration_backup(db_path.to_str().unwrap(), 0).unwrap();
         assert_eq!(backup.parent(), Some(dir.join("backups").as_path()));
         assert!(backup.exists());
+        // Windows cannot remove a folder while a connection still holds a file in it open.
+        drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
