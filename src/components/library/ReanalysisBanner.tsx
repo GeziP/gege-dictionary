@@ -26,7 +26,10 @@ export function ReanalysisBanner({
       >
         <SparklesIcon size={13} className="mt-0.5 shrink-0 text-accent" />
         <div className="min-w-0 flex-1">
-          <p className="text-[11px] font-medium text-ink">已用 {state.model} 重新解析</p>
+          <p className="text-[11px] font-medium text-ink">
+            已用 {state.model}
+            {state.viaBackup ? '（备用模型）' : ''} 重新解析
+          </p>
           {state.rollbackError ? (
             <p className="mt-0.5 break-words text-[10px] text-danger">
               回滚失败：{state.rollbackError}

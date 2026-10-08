@@ -1,4 +1,4 @@
-import type { ApiProtocol, PromptTemplate, ProviderConfig } from '../types/lexnote';
+import type { ApiProtocol, BackupProviderConfig, PromptTemplate, ProviderConfig } from '../types/lexnote';
 
 export interface ProviderPreset {
   id: string;
@@ -85,6 +85,12 @@ export const DEFAULT_PROVIDER: ProviderConfig = {
   temperature: 0.3,
   maxTokens: 2000,
   timeoutSeconds: 60
+};
+
+/** Nothing is configured, and nothing is asked, until the user switches the backup on. */
+export const DEFAULT_BACKUP_PROVIDER: BackupProviderConfig = {
+  ...DEFAULT_PROVIDER,
+  enabled: false
 };
 
 export const DEFAULT_TEMPLATES: PromptTemplate[] = [

@@ -395,13 +395,18 @@ export async function unregisterOcrHotkey(shortcut = 'Control+Shift+O'): Promise
   await invoke('apply_ocr_hotkey_from_settings');
 }
 
+/**
+ * Tries a model service with one short request. A key that is only the placeholder stands for the
+ * stored one, which is the backup's when `backup` is set and the main service's otherwise.
+ */
 export async function testConnection(
   baseUrl: string,
   apiKey: string,
   model: string,
-  protocol?: string
+  protocol?: string,
+  backup = false
 ): Promise<{ ok: boolean; latency: number; model: string }> {
-  return invoke('test_connection', { baseUrl, apiKey, model, protocol: protocol || 'openai' });
+  return invoke('test_connection', { baseUrl, apiKey, model, protocol: protocol || 'openai', backup });
 }
 
 /** Resolves when playback has finished, was superseded, or was stopped. */

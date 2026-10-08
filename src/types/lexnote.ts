@@ -118,6 +118,16 @@ export interface Entry {
   domainAnalysis?: DomainAnalysis;
 }
 
+/** What the backend adds to a lookup answer on top of the entry itself. */
+export type EntryMetadata = Entry & {
+  _templateName?: string;
+  fromCache?: boolean;
+  /** The model that wrote the answer; answers cached before v1.10 do not say. */
+  _model?: string;
+  /** Set when the main model could not answer and the backup one did. */
+  _viaBackup?: boolean;
+};
+
 export interface SavedWord extends Entry {
   savedAt: string;
   context: string;
@@ -278,6 +288,15 @@ export interface ProviderConfig {
   timeoutSeconds: number;
 }
 
+/**
+ * A second model service for the moments the main one cannot answer: it is too busy, down,
+ * unreachable or too slow. It is asked once, and only after the main one failed in one of those
+ * ways; a rejected key or an unknown model never sends a lookup to it.
+ */
+export interface BackupProviderConfig extends ProviderConfig {
+  enabled: boolean;
+}
+
 export interface PromptTemplate {
   id: string;
   name: string;
@@ -297,6 +316,8 @@ export interface LocalMetrics {
   filtered: number;
   filteredByReason: Record<string, number>;
   streamFallback: number;
+  /** Lookups that the backup model answered because the main one was struggling. */
+  backupUsed: number;
   streamFirstFieldBuckets: Record<string, number>;
   reviewAnswered: number;
   sessionsViewed: number;
@@ -335,6 +356,7 @@ export interface OcrSettings {
 
 export interface AppSettings {
   provider: ProviderConfig;
+  backupProvider: BackupProviderConfig;
   clipboardWatch: boolean;
   clipboardMode?: 'smart' | 'full' | 'double';
   clipboardBlacklist?: string[];
@@ -352,6 +374,7 @@ export interface AppSettings {
   autoCheckUpdates?: boolean;
   skippedUpdateVersion?: string;
   apiKeyError?: string;
+  backupApiKeyError?: string;
   theme: 'light' | 'dark' | 'system';
   cardScale: 'compact' | 'default' | 'large';
   /** boolean is legacy: true→selection_only, false→off */

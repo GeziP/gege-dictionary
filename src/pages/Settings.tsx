@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { WindowFrame } from '../components/shell/WindowFrame';
 import { ProviderSection } from '../components/settings/ProviderSection';
+import { BackupProviderSection } from '../components/settings/BackupProviderSection';
 import { CaptureSection } from '../components/settings/CaptureSection';
 import { PromptSection } from '../components/settings/PromptSection';
 import { AppearanceSection } from '../components/settings/AppearanceSection';
@@ -54,7 +55,12 @@ export function Settings() {
 
       <div className="thin-scroll min-h-0 flex-1 overflow-y-auto p-4">
         <div className="mx-auto max-w-3xl">
-          {tab === 'provider' ? <ProviderSection /> : null}
+          {tab === 'provider' ? (
+            <div className="space-y-3">
+              <ProviderSection />
+              <BackupProviderSection />
+            </div>
+          ) : null}
           {tab === 'capture' ? <CaptureSection /> : null}
           {tab === 'prompt' ? <PromptSection /> : null}
           {tab === 'glossary' ? <GlossarySection /> : null}

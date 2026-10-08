@@ -52,6 +52,28 @@ pub(crate) fn error_code(err: &str) -> Option<&str> {
     ERROR_CODES.contains(&code).then_some(code)
 }
 
+/// `err` without its `[code] ` prefix: what is left to say to the user.
+pub(crate) fn error_detail(err: &str) -> &str {
+    match error_code(err) {
+        // The prefix is `[`, the code and `]`, after any leading whitespace.
+        Some(code) => err.trim_start()[code.len() + 2..].trim_start(),
+        None => err.trim(),
+    }
+}
+
+/// Whether asking another model service could fix `err`.
+///
+/// Only the failures that say "this service is struggling right now" qualify: it is too busy
+/// (429), failing on its own side (5xx), too slow, or out of reach. Everything else is the
+/// user's to fix (a wrong key or model, a request the service refuses) or is about the answer
+/// itself (empty, cut off, not JSON), and a second service would only hide it.
+pub(crate) fn another_provider_may_help(err: &str) -> bool {
+    matches!(
+        error_code(err),
+        Some("rate_limit" | "server" | "timeout" | "network")
+    )
+}
+
 pub struct IncrementalJsonExtractor {
     buffer: String,
     emitted: HashSet<String>,
@@ -1634,6 +1656,50 @@ mod tests {
         ] {
             assert_eq!(error_code(text), None, "{text:?}");
         }
+    }
+
+    #[test]
+    fn error_detail_drops_the_code_and_nothing_else() {
+        assert_eq!(
+            error_detail("[server] 服务端错误（503）"),
+            "服务端错误（503）"
+        );
+        assert_eq!(error_detail("  [timeout]   slow  "), "slow  ");
+        // Something that does not carry a registered code is all detail.
+        assert_eq!(error_detail(" [bogus] x "), "[bogus] x");
+        assert_eq!(error_detail("plain"), "plain");
+        assert_eq!(error_detail(""), "");
+        for code in ERROR_CODES {
+            assert_eq!(error_detail(&coded(code, "boom")), "boom", "{code}");
+        }
+    }
+
+    #[test]
+    fn only_a_struggling_service_is_worth_a_second_opinion() {
+        // The service is busy, failing, slow or out of reach: another one may well answer.
+        for code in ["rate_limit", "server", "timeout", "network"] {
+            assert!(another_provider_may_help(&coded(code, "x")), "{code}");
+        }
+        // Configuration, a refused request and a bad answer are not cured by another service.
+        for code in [
+            "no_key",
+            "auth",
+            "model",
+            "http",
+            "parse",
+            "empty",
+            "truncated",
+            "api",
+            "internal",
+            "unknown",
+        ] {
+            assert!(!another_provider_may_help(&coded(code, "x")), "{code}");
+        }
+        // Without a code nothing is known, and nothing is guessed from the wording.
+        assert!(!another_provider_may_help("请求超时 timeout 429 503"));
+        assert!(!another_provider_may_help(""));
+        // Every registered code is decided on purpose: this list and the two above must cover all.
+        assert_eq!(ERROR_CODES.len(), 4 + 10);
     }
 
     #[test]

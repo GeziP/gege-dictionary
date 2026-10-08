@@ -96,6 +96,9 @@ export function LocalStatsSection() {
                 })()}
               />
             </div>
+            <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
+              <StatCard label="备用模型接管" value={String(metrics.backupUsed ?? 0)} />
+            </div>
             {Object.keys(metrics.streamFirstFieldBuckets || {}).length > 0 && (
               <div className="mt-3">
                 <p className="mb-1 text-[11px] font-medium text-ink-muted">流式首字段耗时分桶</p>

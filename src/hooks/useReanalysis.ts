@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useLexNote } from '../contexts/LexNoteContext';
 import * as bridge from '../lib/tauri-bridge';
 import { reanalysisDraft, reanalysisRequest, rollbackDraft } from '../lib/words';
-import type { Entry, SavedWord } from '../types/lexnote';
+import type { Entry, EntryMetadata, SavedWord } from '../types/lexnote';
 
 export type ReanalysisState =
   | { status: 'idle' }
@@ -13,6 +13,8 @@ export type ReanalysisState =
       before: SavedWord;
       /** The model that wrote the new answer. */
       model: string;
+      /** Whether that was the backup model, because the one that is configured could not answer. */
+      viaBackup: boolean;
       /** Why the last rollback attempt failed, if it did. */
       rollbackError?: string;
     }
@@ -72,7 +74,9 @@ export function useReanalysis(word: SavedWord | null) {
       show({ status: 'error', error: `[internal] 新的解析已生成，但保存失败：${String(error)}` });
       return;
     }
-    show({ status: 'done', before: target, model });
+    // Say who really wrote it: the backup answers when the model that is configured cannot.
+    const { _model: answeredBy, _viaBackup: viaBackup } = entry as EntryMetadata;
+    show({ status: 'done', before: target, model: answeredBy || model, viaBackup: viaBackup === true });
   }, [saveWord, model]);
 
   const rollback = useCallback(async () => {

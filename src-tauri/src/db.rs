@@ -2353,6 +2353,7 @@ impl Database {
             "filtered": event_sum("clipboard_filtered")?,
             "filteredByReason": filtered_by_reason,
             "streamFallback": event_sum("lookup_stream_fallback")?,
+            "backupUsed": event_sum("lookup_backup_used")?,
             "streamFirstFieldBuckets": stream_first,
             "reviewAnswered": event_sum("review_card_answered")?,
             "sessionsViewed": event_sum("reading_session_viewed")?,
