@@ -1,10 +1,19 @@
 import React from 'react';
 import { ArrowDownIcon, ArrowUpIcon, ArrowUpDownIcon } from 'lucide-react';
+import { useRowWindow } from '../../hooks/useRowWindow';
 import type { SortField, SortState } from '../../lib/library-list';
 import type { SavedWord } from '../../types/lexnote';
 import { classNames, relativeTime } from '../../utils/format';
 import { Chip } from '../ui/Chip';
 import { MasteryBadge } from '../ui/MasteryBadge';
+
+/**
+ * From this many words on, the table draws only the rows that are on screen. Below it, drawing
+ * all of them is cheap, and it keeps every row reachable for find-in-page and the Tab key.
+ */
+export const WINDOW_FROM = 400;
+/** The columns of the table, which the spacer rows of a windowed table have to span. */
+const COLUMNS = 8;
 
 interface WordTableProps {
   words: SavedWord[];
@@ -31,17 +40,30 @@ interface RowProps {
   word: SavedWord;
   selected: boolean;
   active: boolean;
+  /** Where the row is in a table that draws only some of its rows (the header row is 1). */
+  rowIndex?: number;
   onToggleSelect: (id: string) => void;
   onActivate: (id: string) => void;
 }
 
 // Rows are memoized: selecting one word or opening another changes the props of two rows, not of
 // every row in a library of thousands, so the rest are not rendered again.
-const WordRow = React.memo(function WordRow({ word, selected, active, onToggleSelect, onActivate }: RowProps) {
+// A row is one line, whatever a word or a translation looks like: the table that draws only the
+// visible rows needs them all to be as tall as each other.
+const WordRow = React.memo(function WordRow({
+  word,
+  selected,
+  active,
+  rowIndex,
+  onToggleSelect,
+  onActivate,
+}: RowProps) {
   return (
     <tr
+      data-row
+      aria-rowindex={rowIndex}
       className={classNames(
-        'border-b border-line transition-colors',
+        'whitespace-nowrap border-b border-line transition-colors',
         active ? 'bg-accent-soft' : 'hover:bg-raised',
       )}
     >
@@ -54,19 +76,19 @@ const WordRow = React.memo(function WordRow({ word, selected, active, onToggleSe
           className="h-3.5 w-3.5 accent-[color:var(--accent)]"
         />
       </td>
-      <td className="py-1 pr-3">
+      <td className="max-w-[16rem] py-1 pr-3">
         <button
           type="button"
           onClick={() => onActivate(word.id)}
-          className="-mx-1 flex items-baseline gap-1.5 rounded-sm px-1 py-1 text-left hover:underline"
+          className="-mx-1 flex max-w-full items-baseline gap-1.5 rounded-sm px-1 py-1 text-left hover:underline"
         >
-          <span className="font-serif text-base font-bold text-ink">{word.lemma}</span>
-          <span className="text-2xs text-ink-subtle">{word.pos}</span>
+          <span className="min-w-0 truncate font-serif text-base font-bold text-ink">{word.lemma}</span>
+          <span className="shrink-0 text-2xs text-ink-subtle">{word.pos}</span>
         </button>
       </td>
       <td className="max-w-[12rem] truncate py-2 pr-3 text-ink-muted">{word.translation}</td>
-      <td className="hidden py-2 pr-3 xl:table-cell">
-        <span className="flex flex-wrap items-center gap-1">
+      <td className="hidden max-w-[12rem] py-2 pr-3 xl:table-cell">
+        <span className="flex flex-nowrap items-center gap-1 overflow-hidden">
           {word.tags.slice(0, 2).map((tag) => (
             <Chip key={tag} label={tag} tone="muted" />
           ))}
@@ -87,6 +109,15 @@ const WordRow = React.memo(function WordRow({ word, selected, active, onToggleSe
   );
 });
 
+/** Stands in for the rows of a long table that are not drawn, so that the scroll bar stays honest. */
+function SpacerRow({ height }: { height: number }) {
+  return (
+    <tr aria-hidden="true" data-spacer style={{ height }}>
+      <td colSpan={COLUMNS} className="p-0" />
+    </tr>
+  );
+}
+
 const WordCard = React.memo(function WordCard({
   word,
   active,
@@ -100,8 +131,10 @@ const WordCard = React.memo(function WordCard({
     <button
       type="button"
       onClick={() => onActivate(word.id)}
+      // The browser skips the layout and painting of the cards that are off screen, which is what
+      // keeps a library of thousands of cards light (their height is remembered once seen).
       className={classNames(
-        'flex flex-col rounded-lg border bg-surface p-3 text-left transition-colors',
+        'flex flex-col rounded-lg border bg-surface p-3 text-left transition-colors [contain-intrinsic-size:auto_150px] [content-visibility:auto]',
         active ? 'border-accent' : 'border-line hover:border-line-strong'
       )}>
 
@@ -136,6 +169,13 @@ export function WordTable({
   onToggleAll,
   onActivate
 }: WordTableProps) {
+  const windowed = density === 'table' && words.length > WINDOW_FROM;
+  const { scrollerRef, rows, measure } = useRowWindow({ count: words.length, enabled: windowed });
+  const bodyRef = React.useRef<HTMLTableSectionElement>(null);
+  React.useLayoutEffect(() => {
+    if (windowed && bodyRef.current) measure(bodyRef.current.querySelectorAll<HTMLElement>('tr[data-row]'));
+  }, [windowed, rows.start, rows.end, measure]);
+
   const cycle = (field: SortField) => {
     if (!onSortChange) return;
     if (!sort || sort.field !== field) {
@@ -165,11 +205,15 @@ export function WordTable({
   }
 
   return (
-    <div className="thin-scroll min-h-0 flex-1 overflow-auto">
-      <table className="w-full border-collapse text-left text-xs">
+    <div ref={scrollerRef} className="thin-scroll min-h-0 flex-1 overflow-auto">
+      <table
+        // Screen readers are told how long the list really is, though only a part of it is drawn.
+        aria-rowcount={windowed ? words.length + 1 : undefined}
+        className="w-full border-collapse text-left text-xs"
+      >
         <caption className="sr-only">生词列表，点击单词打开详情</caption>
         <thead className="sticky top-0 z-10 bg-raised">
-          <tr className="border-b border-line text-2xs tracking-wide text-ink-subtle">
+          <tr aria-rowindex={windowed ? 1 : undefined} className="border-b border-line text-2xs tracking-wide text-ink-subtle">
             <th scope="col" className="w-10 px-3 py-2">
               <input
                 type="checkbox"
@@ -204,17 +248,20 @@ export function WordTable({
             </th>
           </tr>
         </thead>
-        <tbody>
-          {words.map((word) => (
+        <tbody ref={bodyRef}>
+          {windowed && rows.before > 0 ? <SpacerRow height={rows.before} /> : null}
+          {(windowed ? words.slice(rows.start, rows.end) : words).map((word, index) => (
             <WordRow
               key={word.id}
               word={word}
               selected={selectedIds.has(word.id)}
               active={activeId === word.id}
+              rowIndex={windowed ? rows.start + index + 2 : undefined}
               onToggleSelect={onToggleSelect}
               onActivate={onActivate}
             />
           ))}
+          {windowed && rows.after > 0 ? <SpacerRow height={rows.after} /> : null}
         </tbody>
       </table>
     </div>
