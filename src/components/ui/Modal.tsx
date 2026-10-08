@@ -1,6 +1,7 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
 import { XIcon } from 'lucide-react';
+import { useFocusTrap } from '../../hooks/useFocusTrap';
 
 interface ModalProps {
   title: string;
@@ -12,6 +13,9 @@ interface ModalProps {
 }
 
 export function Modal({ title, description, onClose, footer, width = 560, children }: ModalProps) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(dialogRef);
+
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
       if (event.key === 'Escape') onClose();
@@ -28,14 +32,16 @@ export function Modal({ title, description, onClose, footer, width = 560, childr
         aria-hidden="true" />
       
       <motion.div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-label={title}
+        tabIndex={-1}
         initial={{ opacity: 0, y: 8, scale: 0.99 }}
         animate={{ opacity: 1, y: 0, scale: 1 }}
         transition={{ duration: 0.16 }}
         style={{ width }}
-        className="relative flex max-h-full min-h-0 flex-col overflow-hidden rounded-xl border border-line bg-surface shadow-window">
+        className="relative flex max-h-full min-h-0 flex-col overflow-hidden rounded-xl border border-line bg-surface shadow-window outline-none">
         
         <div className="flex items-start gap-3 border-b border-line px-4 py-3">
           <div className="min-w-0">
