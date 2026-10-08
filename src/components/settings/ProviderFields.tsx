@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
-import { EyeIcon, EyeOffIcon, ShieldCheckIcon } from 'lucide-react';
-import { PROVIDER_PRESETS } from '../../data/providers';
+import React, { useId, useState } from 'react';
+import { ExternalLinkIcon, EyeIcon, EyeOffIcon, ShieldCheckIcon } from 'lucide-react';
+import { NO_KEY_NOTE, PROVIDER_PRESETS, presetChanges, presetOf } from '../../data/providers';
 import type { ProviderConfig } from '../../types/lexnote';
 import { classNames } from '../../utils/format';
 import { TextInput } from '../ui/TextInput';
@@ -23,8 +23,12 @@ interface ProviderFieldsProps {
  * (a preset or a Base URL), which model, and the key, which is never shown once it is stored.
  */
 export function ProviderFields({ provider, onChange, keyError }: ProviderFieldsProps) {
+  const keyId = useId();
   const [showKey, setShowKey] = useState(false);
   const [editingKey, setEditingKey] = useState(false);
+  // Where the key of the service is made, when the Base URL is one of the presets.
+  const servicePreset = presetOf(provider.baseUrl);
+  const keyPage = servicePreset?.keyUrl ?? null;
 
   return (
     <>
@@ -33,11 +37,11 @@ export function ProviderFields({ provider, onChange, keyError }: ProviderFieldsP
           <button
             key={preset.id}
             type="button"
-            onClick={() => onChange({ name: preset.name, protocol: preset.protocol, baseUrl: preset.baseUrl, model: preset.model })}
+            onClick={() => onChange(presetChanges(preset, provider))}
             title={`${preset.hint}（${preset.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI'} 协议）`}
             className={classNames(
               'rounded-full border px-2.5 py-1 text-[11px] transition-colors',
-              provider.baseUrl === preset.baseUrl
+              servicePreset?.id === preset.id
                 ? 'border-accent bg-accent-soft text-accent'
                 : 'border-line text-ink-muted hover:border-line-strong'
             )}
@@ -69,8 +73,25 @@ export function ProviderFields({ provider, onChange, keyError }: ProviderFieldsP
           <span className="mb-1 block text-[11px] text-ink-muted">Model</span>
           <TextInput value={provider.model} onChange={(event) => onChange({ model: event.target.value })} />
         </label>
-        <label className="block sm:col-span-2">
-          <span className="mb-1 block text-[11px] text-ink-muted">API Key</span>
+        <div className="sm:col-span-2">
+          {/* The caption is the only label of the box: a label that held the buttons as well would
+              lend its text to the first of them, and a click on the text would press it. */}
+          <div className="mb-1 flex items-center gap-2 text-[11px] text-ink-muted">
+            <label htmlFor={keyId}>API Key</label>
+            {keyPage ? (
+              <a
+                href={keyPage}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-0.5 text-accent hover:underline"
+              >
+                如何获取 <ExternalLinkIcon size={10} aria-hidden="true" />
+              </a>
+            ) : null}
+            {servicePreset && keyPage === null ? (
+              <span className="text-ink-subtle">{NO_KEY_NOTE}</span>
+            ) : null}
+          </div>
           {provider.hasApiKey && !editingKey ? (
             <div className="mb-1.5 flex items-center gap-2 rounded-md border border-line bg-sunken px-2.5 py-1.5 text-[12px]">
               <ShieldCheckIcon size={13} className="text-positive" />
@@ -81,6 +102,8 @@ export function ProviderFields({ provider, onChange, keyError }: ProviderFieldsP
                 onClick={() => {
                   setEditingKey(true);
                   onChange({ apiKey: '', hasApiKey: false });
+                  // The button goes with the row, and the focus with it: it belongs in the box.
+                  document.getElementById(keyId)?.focus();
                 }}
               >
                 更换 Key
@@ -88,6 +111,7 @@ export function ProviderFields({ provider, onChange, keyError }: ProviderFieldsP
             </div>
           ) : null}
           <TextInput
+            id={keyId}
             type={showKey || editingKey ? 'text' : 'password'}
             value={editingKey || showKey ? provider.apiKey : ''}
             placeholder={!editingKey && !showKey && provider.apiKey ? maskApiKey(provider.apiKey) : '输入 API Key'}
@@ -111,8 +135,7 @@ export function ProviderFields({ provider, onChange, keyError }: ProviderFieldsP
             经 Windows DPAPI 加密后存储；界面不显示明文，也不会写入日志
           </span>
           {keyError && <span className="mt-1 block text-[11px] text-danger">{keyError}</span>}
-        </label>
-      </div>
+        </div>      </div>
     </>
   );
 }

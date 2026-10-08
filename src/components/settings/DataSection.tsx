@@ -32,7 +32,7 @@ interface DbInfo {
 }
 
 export function DataSection() {
-  const { settings, updateSettings, usage, settingsSaveStatus, settingsSaveError, refreshAppState, flushSettings } = useLexNote();
+  const { settings, updateSettings, usage, refreshAppState, flushSettings } = useLexNote();
   const isTauri = bridge.isTauri();
   const [status, setStatus] = useState<{ type: 'ok' | 'error'; msg: string } | null>(null);
   const [backups, setBackups] = useState<Backup[]>([]);
@@ -376,8 +376,6 @@ export function DataSection() {
           {status.msg}
         </p>
       )}
-      {settingsSaveStatus === 'saving' && <p className="rounded-md border border-line bg-raised px-3 py-2 text-[11px] text-ink-muted">设置保存中…</p>}
-      {settingsSaveStatus === 'error' && settingsSaveError && <p className="rounded-md border border-danger/30 bg-danger/5 px-3 py-2 text-[11px] text-danger">设置保存失败，已回滚：{settingsSaveError}</p>}
     </div>
   );
 }

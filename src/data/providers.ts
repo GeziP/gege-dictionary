@@ -7,7 +7,8 @@ export interface ProviderPreset {
   baseUrl: string;
   model: string;
   hint: string;
-  keyUrl: string;
+  /** The page where the key is made; `null` for a service that asks for none (a local gateway). */
+  keyUrl: string | null;
 }
 
 export const PROVIDER_PRESETS: ProviderPreset[] = [
@@ -18,7 +19,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   baseUrl: 'https://open.bigmodel.cn/api/anthropic',
   model: 'GLM-5.2',
   hint: 'Anthropic 兼容协议，国内直连',
-  keyUrl: 'open.bigmodel.cn'
+  keyUrl: 'https://open.bigmodel.cn'
 },
 {
   id: 'openai',
@@ -27,7 +28,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   baseUrl: 'https://api.openai.com/v1',
   model: 'gpt-4o-mini',
   hint: '结构化输出支持最好，成本适中',
-  keyUrl: 'platform.openai.com/api-keys'
+  keyUrl: 'https://platform.openai.com/api-keys'
 },
 {
   id: 'deepseek',
@@ -36,7 +37,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   baseUrl: 'https://api.deepseek.com',
   model: 'deepseek-v4-flash',
   hint: 'V4 Flash，中文释义质量好、响应快',
-  keyUrl: 'platform.deepseek.com'
+  keyUrl: 'https://platform.deepseek.com'
 },
 {
   id: 'kimi',
@@ -45,7 +46,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   baseUrl: 'https://api.moonshot.cn/v1',
   model: 'moonshot-v1-8k',
   hint: '国内直连，长上下文',
-  keyUrl: 'platform.moonshot.cn'
+  keyUrl: 'https://platform.moonshot.cn'
 },
 {
   id: 'anthropic',
@@ -54,7 +55,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   baseUrl: 'https://api.anthropic.com',
   model: 'claude-sonnet-4-20250514',
   hint: 'Claude 原生接口',
-  keyUrl: 'console.anthropic.com/settings/keys'
+  keyUrl: 'https://console.anthropic.com/settings/keys'
 },
 {
   id: 'openrouter',
@@ -63,7 +64,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   baseUrl: 'https://openrouter.ai/api/v1',
   model: 'anthropic/claude-3.5-haiku',
   hint: '一个 Key 调用多家模型',
-  keyUrl: 'openrouter.ai/keys'
+  keyUrl: 'https://openrouter.ai/keys'
 },
 {
   id: 'local',
@@ -72,9 +73,53 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   baseUrl: 'http://127.0.0.1:11434/v1',
   model: 'qwen2.5:14b',
   hint: 'Ollama / LM Studio，完全离线',
-  keyUrl: '无需 Key'
+  keyUrl: null
 }];
 
+
+/**
+ * What a service that asks for no key is given in its place: the app does not look anything up
+ * without a key, and a local gateway takes whatever it is sent.
+ */
+export const NO_KEY_PLACEHOLDER = 'ollama';
+
+/** What the box for the key says beside a service that asks for none. */
+export const NO_KEY_NOTE = '这个服务不校验 Key，已填入占位符，保持原样即可';
+
+/** What a Base URL says about the service: the same address, with or without a closing slash or `/v1`, in either case. */
+function serviceAddress(baseUrl: string): string {
+  return baseUrl.trim().toLowerCase().replace(/\/+$/, '').replace(/\/v1$/, '');
+}
+
+/** The preset whose service this Base URL is the address of, if any. */
+export function presetOf(baseUrl: string): ProviderPreset | undefined {
+  const address = serviceAddress(baseUrl);
+  if (!address) return undefined;
+  return PROVIDER_PRESETS.find((preset) => serviceAddress(preset.baseUrl) === address);
+}
+
+/**
+ * What choosing a preset changes in the settings of a model service. A preset that needs no key
+ * also fills in the placeholder when there is no key yet, so that it works as soon as it is chosen;
+ * and a service that does need one does not inherit that placeholder, which no service accepts.
+ */
+export function presetChanges(
+  preset: ProviderPreset,
+  current: Pick<ProviderConfig, 'apiKey' | 'hasApiKey'>,
+): Partial<ProviderConfig> {
+  const changes: Partial<ProviderConfig> = {
+    name: preset.name,
+    protocol: preset.protocol,
+    baseUrl: preset.baseUrl,
+    model: preset.model,
+  };
+  if (preset.keyUrl === null) {
+    if (!current.apiKey && !current.hasApiKey) changes.apiKey = NO_KEY_PLACEHOLDER;
+  } else if (current.apiKey === NO_KEY_PLACEHOLDER) {
+    changes.apiKey = '';
+  }
+  return changes;
+}
 
 export const DEFAULT_PROVIDER: ProviderConfig = {
   name: '',
