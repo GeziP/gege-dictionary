@@ -2,7 +2,8 @@
 //! days something happened); everything that takes thought lives here as pure functions, so it
 //! can be tested without a clock or a database.
 
-use chrono::{DateTime, Days, Local, NaiveDate, NaiveDateTime};
+use crate::review::Answer;
+use chrono::{DateTime, Datelike, Days, Local, NaiveDate, NaiveDateTime};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,6 +19,80 @@ pub struct Facts {
     pub saved: PerDay,
     /// Review cards answered.
     pub reviews: PerDay,
+}
+
+/// How the review cards answered on one day were answered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Answers {
+    pub correct: i64,
+    pub hard: i64,
+    pub wrong: i64,
+    /// Answers whose kind was not recorded, or is not one this version knows, so that the
+    /// parts still add up to everything that was answered.
+    pub other: i64,
+}
+
+impl Answers {
+    pub fn total(&self) -> i64 {
+        self.correct + self.hard + self.wrong + self.other
+    }
+
+    pub fn add(&mut self, answer: Option<Answer>, count: i64) {
+        match answer {
+            Some(Answer::Correct) => self.correct += count,
+            Some(Answer::Hard) => self.hard += count,
+            Some(Answer::Wrong) => self.wrong += count,
+            None => self.other += count,
+        }
+    }
+}
+
+/// The answer a `review_card_answered` event stands for, from the `extra` it was stored with.
+pub fn answer_of(extra: &str) -> Option<Answer> {
+    serde_json::from_str::<Value>(extra)
+        .ok()?
+        .get("result")?
+        .as_str()
+        .and_then(Answer::parse)
+}
+
+/// How many weeks the review calendar shows. Local events are kept for 90 days, and twelve
+/// weeks are at most 84, so the calendar never has days that were forgotten.
+pub const CALENDAR_WEEKS: u32 = 12;
+
+/// A calendar of the review cards answered, one entry for every day from the Monday `weeks - 1`
+/// weeks before this week's up to `today`, zeros included. Being weeks of seven days from a
+/// Monday, the days go straight into columns of a grid.
+pub fn review_calendar(
+    today: NaiveDate,
+    answers: &BTreeMap<NaiveDate, Answers>,
+    weeks: u32,
+) -> Value {
+    let weeks = weeks.max(1);
+    let this_monday = today
+        .checked_sub_days(Days::new(u64::from(today.weekday().num_days_from_monday())))
+        .unwrap_or(today);
+    let first = this_monday
+        .checked_sub_days(Days::new(u64::from(weeks - 1) * 7))
+        .unwrap_or(this_monday);
+
+    let mut days = Vec::new();
+    let mut day = first;
+    while day <= today {
+        let counted = answers.get(&day).copied().unwrap_or_default();
+        days.push(json!({
+            "date": day_key(day),
+            "total": counted.total(),
+            "correct": counted.correct,
+            "hard": counted.hard,
+            "wrong": counted.wrong,
+        }));
+        match day.succ_opt() {
+            Some(next) => day = next,
+            None => break,
+        }
+    }
+    json!({ "first": day_key(first), "weeks": weeks, "days": days })
 }
 
 impl Facts {
@@ -334,5 +409,135 @@ mod tests {
     fn a_window_is_at_least_one_day() {
         let result = activity(0, day(2026, 10, 7), &facts());
         assert_eq!(result["daily"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_answer_is_read_from_the_extra_of_its_event() {
+        assert_eq!(answer_of(r#"{"result":"correct"}"#), Some(Answer::Correct));
+        assert_eq!(answer_of(r#"{"result":"hard"}"#), Some(Answer::Hard));
+        assert_eq!(answer_of(r#"{"result":"wrong"}"#), Some(Answer::Wrong));
+        for unknown in [
+            "",
+            "{}",
+            "[]",
+            "null",
+            "not json",
+            r#"{"result":"easy"}"#,
+            r#"{"result":3}"#,
+        ] {
+            assert_eq!(answer_of(unknown), None, "{unknown:?}");
+        }
+    }
+
+    #[test]
+    fn the_answers_of_a_day_add_up() {
+        let mut answers = Answers::default();
+        answers.add(Some(Answer::Correct), 5);
+        answers.add(Some(Answer::Hard), 2);
+        answers.add(Some(Answer::Wrong), 1);
+        answers.add(None, 4);
+        assert_eq!(
+            answers,
+            Answers {
+                correct: 5,
+                hard: 2,
+                wrong: 1,
+                other: 4
+            }
+        );
+        assert_eq!(answers.total(), 12);
+    }
+
+    #[test]
+    fn the_calendar_starts_on_a_monday_and_ends_today() {
+        // Wednesday the 7th of October: this week began on Monday the 5th.
+        let calendar = review_calendar(day(2026, 10, 7), &BTreeMap::new(), 12);
+        let days = calendar["days"].as_array().unwrap();
+        assert_eq!(calendar["first"], "2026-07-20");
+        assert_eq!(calendar["weeks"], 12);
+        assert_eq!(days.len(), 11 * 7 + 3);
+        assert_eq!(days[0]["date"], "2026-07-20");
+        assert_eq!(
+            days[77]["date"], "2026-10-05",
+            "this week's Monday begins the last column"
+        );
+        assert_eq!(days[79]["date"], "2026-10-07");
+    }
+
+    #[test]
+    fn the_calendar_is_as_long_as_the_weeks_it_covers() {
+        let length = |today: NaiveDate, weeks: u32| {
+            review_calendar(today, &BTreeMap::new(), weeks)["days"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        assert_eq!(
+            length(day(2026, 10, 11), 12),
+            12 * 7,
+            "a Sunday ends its week"
+        );
+        assert_eq!(
+            length(day(2026, 10, 5), 12),
+            11 * 7 + 1,
+            "a Monday begins one"
+        );
+        assert_eq!(length(day(2026, 10, 7), 1), 3);
+        assert_eq!(
+            review_calendar(day(2026, 10, 7), &BTreeMap::new(), 0)["weeks"],
+            1,
+            "there is always this week"
+        );
+        assert!(
+            length(day(2026, 10, 11), CALENDAR_WEEKS) <= 90,
+            "never beyond what the local events keep"
+        );
+    }
+
+    #[test]
+    fn the_calendar_puts_the_answers_of_each_day_on_that_day() {
+        let mut answers = BTreeMap::new();
+        answers.insert(
+            day(2026, 10, 6),
+            Answers {
+                correct: 3,
+                hard: 2,
+                wrong: 1,
+                other: 1,
+            },
+        );
+        answers.insert(
+            day(2026, 7, 20),
+            Answers {
+                correct: 1,
+                ..Answers::default()
+            },
+        );
+        // A day too early for the calendar, and tomorrow (a clock that was wrong once).
+        for outside in [day(2026, 7, 19), day(2026, 10, 8)] {
+            answers.insert(
+                outside,
+                Answers {
+                    correct: 9,
+                    ..Answers::default()
+                },
+            );
+        }
+
+        let calendar = review_calendar(day(2026, 10, 7), &answers, 12);
+        let days = calendar["days"].as_array().unwrap();
+        assert_eq!(
+            days[78],
+            json!({"date": "2026-10-06", "total": 7, "correct": 3, "hard": 2, "wrong": 1}),
+            "answers of an unknown kind count in the total only"
+        );
+        assert_eq!(days[0]["total"], 1, "the first day is in");
+        assert_eq!(
+            days[79]["total"], 0,
+            "a day without answers is a zero, not a gap"
+        );
+        assert!(days
+            .iter()
+            .all(|entry| entry["date"] != "2026-07-19" && entry["date"] != "2026-10-08"));
     }
 }

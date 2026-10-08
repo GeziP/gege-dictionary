@@ -4,12 +4,14 @@ mod content_filter;
 mod db;
 #[cfg(windows)]
 mod dpapi;
+mod enrich;
 mod glossary;
 mod insights;
 mod llm;
 mod lookup;
 mod migrations;
 mod ocr;
+mod review;
 mod tts;
 mod watch_switch;
 mod word_import;
@@ -165,72 +167,145 @@ async fn apply_ocr_hotkey_from_settings(app: AppHandle) -> Result<(), String> {
     apply_ocr_hotkey(&app)
 }
 
+/// Where the settings keep each of the two model services - the main one and the backup - and
+/// where they note why a stored API key could not be used. Both are stored alike.
+struct ProviderKey {
+    /// The settings object that describes the service.
+    settings_key: &'static str,
+    /// The settings entry that tells the user why the stored key could not be used.
+    error_key: &'static str,
+    /// How the service is introduced in an error that is not shown next to its own fields.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    label: &'static str,
+}
+
+const PROVIDER_KEYS: [ProviderKey; 2] = [
+    ProviderKey {
+        settings_key: "provider",
+        error_key: "apiKeyError",
+        label: "",
+    },
+    ProviderKey {
+        settings_key: "backupProvider",
+        error_key: "backupApiKeyError",
+        label: "备用模型的 ",
+    },
+];
+
+/// What migrating one stored API key did.
 #[cfg(windows)]
-fn migrate_api_key_storage(database: &db::Database) -> Result<(), String> {
-    let mut settings = database.get_settings()?;
-    let Some(provider) = settings.get_mut("provider").and_then(|p| p.as_object_mut()) else {
-        return Ok(());
-    };
-    let key = provider
-        .get("apiKey")
-        .and_then(|v| v.as_str())
+enum KeyMigration {
+    /// Nothing to do: there is no key, or it is encrypted and can be read.
+    Untouched,
+    /// The settings changed and are to be saved.
+    Changed,
+    /// The key could not be made safe, so it was cleared from the settings (which are to be
+    /// saved, too). This says why.
+    Failed(String),
+}
+
+/// Throw a stored key away and say why, where the settings page shows it.
+#[cfg(windows)]
+fn reject_stored_key(settings: &mut serde_json::Value, provider: &ProviderKey, reason: &str) {
+    if let Some(entry) = settings
+        .get_mut(provider.settings_key)
+        .and_then(|entry| entry.as_object_mut())
+    {
+        entry.insert("apiKey".into(), serde_json::Value::String(String::new()));
+    }
+    if let Some(root) = settings.as_object_mut() {
+        root.insert(
+            provider.error_key.into(),
+            serde_json::Value::String(reason.into()),
+        );
+    }
+}
+
+/// Make sure the API key of one service is stored encrypted: a plaintext key is encrypted, and
+/// one that cannot be read by this Windows user is cleared, never kept.
+#[cfg(windows)]
+fn migrate_provider_key(settings: &mut serde_json::Value, provider: &ProviderKey) -> KeyMigration {
+    let key = settings
+        .get(provider.settings_key)
+        .and_then(|entry| entry.get("apiKey"))
+        .and_then(|value| value.as_str())
         .unwrap_or("")
         .to_string();
     if key.is_empty() {
-        return Ok(());
+        return KeyMigration::Untouched;
     }
 
     if dpapi::is_encrypted(&key) {
-        if let Err(e) = dpapi::decrypt(&key) {
-            provider.insert("apiKey".into(), serde_json::Value::String(String::new()));
-            settings.as_object_mut().map(|root| {
-                root.insert(
-                    "apiKeyError".into(),
-                    serde_json::Value::String(
-                        "API Key 无法在当前 Windows 用户下解密，请重新配置".into(),
-                    ),
-                )
-            });
-            database.save_settings(&settings)?;
-            eprintln!("[startup] DPAPI decrypt failed; encrypted key was cleared: {e}");
-        }
-        return Ok(());
+        return match dpapi::decrypt(&key) {
+            Ok(_) => KeyMigration::Untouched,
+            Err(e) => {
+                reject_stored_key(
+                    settings,
+                    provider,
+                    "API Key 无法在当前 Windows 用户下解密，请重新配置",
+                );
+                eprintln!(
+                    "[startup] {}: DPAPI decrypt failed; encrypted key was cleared: {e}",
+                    provider.settings_key
+                );
+                KeyMigration::Changed
+            }
+        };
     }
 
-    let encrypted = match dpapi::encrypt(&key) {
+    match dpapi::encrypt(&key) {
         Ok(encrypted) if dpapi::decrypt(&encrypted).ok().as_deref() == Some(key.as_str()) => {
-            encrypted
+            if let Some(entry) = settings
+                .get_mut(provider.settings_key)
+                .and_then(|entry| entry.as_object_mut())
+            {
+                entry.insert("apiKey".into(), serde_json::Value::String(encrypted));
+            }
+            if let Some(root) = settings.as_object_mut() {
+                root.remove(provider.error_key);
+            }
+            eprintln!(
+                "[startup] Migrated plaintext {} API Key to DPAPI storage",
+                provider.settings_key
+            );
+            KeyMigration::Changed
         }
         Ok(_) => {
-            provider.insert("apiKey".into(), serde_json::Value::String(String::new()));
-            settings.as_object_mut().map(|root| {
-                root.insert(
-                    "apiKeyError".into(),
-                    serde_json::Value::String("API Key 加密校验失败，请重新配置".into()),
-                )
-            });
-            database.save_settings(&settings)?;
-            return Err("API Key 自动加密校验失败，明文 Key 已清除".into());
+            reject_stored_key(settings, provider, "API Key 加密校验失败，请重新配置");
+            KeyMigration::Failed(format!(
+                "{}API Key 自动加密校验失败，明文 Key 已清除",
+                provider.label
+            ))
         }
         Err(e) => {
-            provider.insert("apiKey".into(), serde_json::Value::String(String::new()));
-            settings.as_object_mut().map(|root| {
-                root.insert(
-                    "apiKeyError".into(),
-                    serde_json::Value::String("API Key 加密失败，请重新配置".into()),
-                )
-            });
-            database.save_settings(&settings)?;
-            return Err(format!("API Key 自动加密失败，明文 Key 已清除: {e}"));
+            reject_stored_key(settings, provider, "API Key 加密失败，请重新配置");
+            KeyMigration::Failed(format!(
+                "{}API Key 自动加密失败，明文 Key 已清除: {e}",
+                provider.label
+            ))
         }
-    };
-    provider.insert("apiKey".into(), serde_json::Value::String(encrypted));
-    if let Some(root) = settings.as_object_mut() {
-        root.remove("apiKeyError");
     }
-    database.save_settings(&settings)?;
-    eprintln!("[startup] Migrated plaintext API Key to DPAPI storage");
-    Ok(())
+}
+
+#[cfg(windows)]
+fn migrate_api_key_storage(database: &db::Database) -> Result<(), String> {
+    let mut settings = database.get_settings()?;
+    let mut changed = false;
+    let mut failure = None;
+    for provider in &PROVIDER_KEYS {
+        match migrate_provider_key(&mut settings, provider) {
+            KeyMigration::Untouched => {}
+            KeyMigration::Changed => changed = true,
+            KeyMigration::Failed(reason) => {
+                changed = true;
+                failure.get_or_insert(reason);
+            }
+        }
+    }
+    if changed {
+        database.save_settings(&settings)?;
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 pub(crate) fn record_event(
@@ -366,18 +441,21 @@ async fn get_review_queue(
 async fn submit_review(
     state: tauri::State<'_, AppState>,
     word_id: String,
-    correct: bool,
+    // "correct", "hard" or "wrong".
+    answer: String,
 ) -> Result<serde_json::Value, String> {
-    let result = {
+    let answer =
+        review::Answer::parse(&answer).ok_or_else(|| format!("未知的复习答案：{answer}"))?;
+    let outcome = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        db.submit_review(&word_id, correct)?
+        db.submit_review(&word_id, answer)?
     };
     record_event(
         &state,
         "review_card_answered",
-        serde_json::json!({ "result": if correct { "correct" } else { "wrong" } }),
+        serde_json::json!({ "result": answer.as_str() }),
     );
-    Ok(result)
+    Ok(outcome)
 }
 
 /// Streak, activity chart, mastery and review figures, and a few short rankings.
@@ -465,51 +543,58 @@ async fn get_all_tags(state: tauri::State<'_, AppState>) -> Result<Vec<String>, 
     db.get_all_tags()
 }
 
+/// Never send a stored API key to the WebView: only a placeholder where there is a key that can
+/// be used, and a flag that says so. Both model services are treated alike.
+#[cfg(windows)]
+fn redact_api_keys(settings: &mut serde_json::Value) {
+    for provider in &PROVIDER_KEYS {
+        let Some(entry) = settings
+            .get_mut(provider.settings_key)
+            .and_then(|entry| entry.as_object_mut())
+        else {
+            continue;
+        };
+        let stored = entry
+            .get("apiKey")
+            .and_then(|value| value.as_str())
+            .map(|key| key.to_string());
+        // What the page is shown in place of the key (if the key is to be replaced at all), and
+        // whether there is a key it can rely on.
+        let (shown, has_key) = match stored {
+            None => (None, false),
+            Some(key) if dpapi::is_encrypted(&key) => match dpapi::decrypt(&key) {
+                Ok(_) => (Some(lookup::API_KEY_PLACEHOLDER), true),
+                Err(e) => {
+                    eprintln!(
+                        "[get_settings] {}: DPAPI decrypt failed: {e}, clearing key",
+                        provider.settings_key
+                    );
+                    (Some(""), false)
+                }
+            },
+            Some(key) => {
+                let has_key = !key.is_empty();
+                (has_key.then_some(lookup::API_KEY_PLACEHOLDER), has_key)
+            }
+        };
+        if let Some(shown) = shown {
+            entry.insert("apiKey".into(), serde_json::Value::String(shown.into()));
+        }
+        entry.insert("hasApiKey".into(), serde_json::Value::Bool(has_key));
+    }
+}
+
 #[tauri::command]
 async fn get_settings(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    let mut settings = db.get_settings()?;
+    // Read under the lock; decrypting (to tell whether a key can be used) is done without it.
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut settings = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db.get_settings()?
+    };
 
-    // Never send the plaintext API key to the WebView; only a placeholder + flag.
     #[cfg(windows)]
-    if let Some(provider) = settings.get_mut("provider").and_then(|p| p.as_object_mut()) {
-        if let Some(key_val) = provider
-            .get("apiKey")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-        {
-            if dpapi::is_encrypted(&key_val) {
-                match dpapi::decrypt(&key_val) {
-                    Ok(_plain) => {
-                        provider.insert(
-                            "apiKey".to_string(),
-                            serde_json::Value::String(lookup::API_KEY_PLACEHOLDER.to_string()),
-                        );
-                        provider.insert("hasApiKey".to_string(), serde_json::Value::Bool(true));
-                    }
-                    Err(e) => {
-                        eprintln!("[get_settings] DPAPI decrypt failed: {e}, clearing key");
-                        provider.insert(
-                            "apiKey".to_string(),
-                            serde_json::Value::String(String::new()),
-                        );
-                        provider.insert("hasApiKey".to_string(), serde_json::Value::Bool(false));
-                    }
-                }
-            } else {
-                let has = !key_val.is_empty();
-                if has {
-                    provider.insert(
-                        "apiKey".to_string(),
-                        serde_json::Value::String(lookup::API_KEY_PLACEHOLDER.to_string()),
-                    );
-                }
-                provider.insert("hasApiKey".to_string(), serde_json::Value::Bool(has));
-            }
-        } else {
-            provider.insert("hasApiKey".to_string(), serde_json::Value::Bool(false));
-        }
-    }
+    redact_api_keys(&mut settings);
 
     Ok(settings)
 }
@@ -530,6 +615,76 @@ fn secure_api_key_for_storage(incoming: &str, stored: &str) -> Result<String, St
         return Err("API Key 加密校验失败，设置未保存".into());
     }
     Ok(encrypted)
+}
+
+/// Make the API keys of settings that came from the settings page ready to be stored. The page
+/// only holds the placeholder for a key it was given, so the placeholder - and an empty key, which
+/// never deletes one - keep the ciphertext that is stored for that service; a key that was typed
+/// in is encrypted, unless it is the one that is stored already. That avoids invoking DPAPI for
+/// unrelated edits, and keeps saving possible when Windows is locked or the credential service
+/// is busy.
+#[cfg(windows)]
+fn secure_api_keys_for_storage(
+    settings: &mut serde_json::Value,
+    stored: &serde_json::Value,
+) -> Result<(), String> {
+    for provider in &PROVIDER_KEYS {
+        let stored_key = stored
+            .get(provider.settings_key)
+            .and_then(|entry| entry.get("apiKey"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let Some(entry) = settings
+            .get_mut(provider.settings_key)
+            .and_then(|entry| entry.as_object_mut())
+        else {
+            continue;
+        };
+        let Some(incoming) = entry
+            .get("apiKey")
+            .and_then(|value| value.as_str())
+            .map(|key| key.to_string())
+        else {
+            continue;
+        };
+
+        let secured = if lookup::is_placeholder_api_key(&incoming)
+            || (incoming.is_empty() && !stored_key.is_empty())
+        {
+            eprintln!(
+                "[save_settings] {}: placeholder/empty apiKey; keeping stored ciphertext",
+                provider.settings_key
+            );
+            stored_key.to_string()
+        } else {
+            eprintln!(
+                "[save_settings] {}: apiKey len={}, already_encrypted={}",
+                provider.settings_key,
+                incoming.len(),
+                dpapi::is_encrypted(&incoming)
+            );
+            secure_api_key_for_storage(&incoming, stored_key)
+                .map_err(|error| format!("{}{error}", provider.label))?
+        };
+        entry.insert("apiKey".into(), serde_json::Value::String(secured));
+    }
+    Ok(())
+}
+
+/// Drop what only travels to the settings page and is never stored: whether a key is stored, and
+/// why one could not be used.
+fn strip_key_status(settings: &mut serde_json::Value) {
+    for provider in &PROVIDER_KEYS {
+        if let Some(entry) = settings
+            .get_mut(provider.settings_key)
+            .and_then(|entry| entry.as_object_mut())
+        {
+            entry.remove("hasApiKey");
+        }
+        if let Some(root) = settings.as_object_mut() {
+            root.remove(provider.error_key);
+        }
+    }
 }
 
 #[tauri::command]
@@ -556,50 +711,17 @@ async fn save_settings(
         }
     }
 
-    // Reuse the existing ciphertext when the plaintext key did not change.
-    // This avoids invoking DPAPI for unrelated settings edits and remains safe
-    // when Windows is locked or the credential service is temporarily busy.
+    // The stored settings are read first, and the lock is let go of before DPAPI is called:
+    // it can be slow, and nothing else should wait for it.
     #[cfg(windows)]
-    let stored_key = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        db.get_settings()?
-            .get("provider")
-            .and_then(|provider| provider.get("apiKey"))
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
-
-    #[cfg(windows)]
-    if let Some(provider) = settings.get_mut("provider").and_then(|p| p.as_object_mut()) {
-        if let Some(key_val) = provider
-            .get("apiKey")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-        {
-            if lookup::is_placeholder_api_key(&key_val)
-                || (key_val.is_empty() && !stored_key.is_empty())
-            {
-                eprintln!("[save_settings] placeholder/empty apiKey; keeping stored ciphertext");
-                provider.insert("apiKey".to_string(), serde_json::Value::String(stored_key));
-            } else {
-                eprintln!(
-                    "[save_settings] apiKey len={}, already_encrypted={}",
-                    key_val.len(),
-                    dpapi::is_encrypted(&key_val)
-                );
-                let secured = secure_api_key_for_storage(&key_val, &stored_key)?;
-                provider.insert("apiKey".to_string(), serde_json::Value::String(secured));
-            }
-        }
+    {
+        let stored = {
+            let db = state.db.lock().map_err(|e| e.to_string())?;
+            db.get_settings()?
+        };
+        secure_api_keys_for_storage(&mut settings, &stored)?;
     }
-    if let Some(provider) = settings.get_mut("provider").and_then(|p| p.as_object_mut()) {
-        provider.remove("hasApiKey");
-    }
-
-    if let Some(root) = settings.as_object_mut() {
-        root.remove("apiKeyError");
-    }
+    strip_key_status(&mut settings);
 
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.save_settings(&settings)
@@ -1776,6 +1898,7 @@ pub fn run() {
             last_looked_up: Mutex::new(None),
             startup_warnings: Mutex::new(startup_warnings),
         })
+        .manage(enrich::Enrichment::default())
         .invoke_handler(tauri::generate_handler![
             get_all_words,
             search_words,
@@ -1819,6 +1942,11 @@ pub fn run() {
             lookup::lookup_word,
             lookup::lookup_word_stream,
             lookup::test_connection,
+            enrich::get_enrichment_status,
+            enrich::start_enrichment,
+            enrich::pause_enrichment,
+            enrich::resume_enrichment,
+            enrich::stop_enrichment,
             speak_text,
             stop_speaking,
             list_voices,
@@ -2039,6 +2167,8 @@ mod tests {
             db::Database::open(root.join(db::LEGACY_DB_FILENAME).to_str().unwrap()).unwrap();
         legacy.initialize().unwrap();
         assert!(!configured_data_dir_has_database(&root));
+        // Windows cannot remove a folder while a connection still holds a file in it open.
+        drop(legacy);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2223,5 +2353,188 @@ mod tests {
         let stored = database.get_settings().unwrap();
         assert_eq!(stored["provider"]["apiKey"], "");
         assert!(stored["apiKeyError"].as_str().is_some());
+        // Nothing was said about a service that has no key.
+        assert!(stored.get("backupApiKeyError").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_plaintext_backup_key_is_migrated_to_dpapi_like_the_main_key() {
+        let database = db::Database::open_memory().unwrap();
+        database.initialize().unwrap();
+        let mut settings = database.get_settings().unwrap();
+        settings["provider"]["apiKey"] = serde_json::Value::String("sk-main-plain".into());
+        settings["backupProvider"] =
+            serde_json::json!({ "enabled": true, "apiKey": "sk-backup-plain" });
+        database.save_settings(&settings).unwrap();
+
+        migrate_api_key_storage(&database).unwrap();
+
+        let stored = database.get_settings().unwrap();
+        for (service, plain) in [
+            ("provider", "sk-main-plain"),
+            ("backupProvider", "sk-backup-plain"),
+        ] {
+            let encrypted = stored[service]["apiKey"].as_str().unwrap();
+            assert!(dpapi::is_encrypted(encrypted), "{service}");
+            assert_eq!(dpapi::decrypt(encrypted).unwrap(), plain, "{service}");
+        }
+        // The rest of the backup is as it was left.
+        assert_eq!(stored["backupProvider"]["enabled"], true);
+        assert!(stored.get("apiKeyError").is_none() && stored.get("backupApiKeyError").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_unreadable_backup_key_is_cleared_with_its_own_error_and_the_main_key_is_left_alone() {
+        let database = db::Database::open_memory().unwrap();
+        database.initialize().unwrap();
+        let main_key = dpapi::encrypt("sk-main-secret").unwrap();
+        let mut settings = database.get_settings().unwrap();
+        settings["provider"]["apiKey"] = serde_json::Value::String(main_key.clone());
+        settings["backupProvider"] =
+            serde_json::json!({ "enabled": true, "apiKey": "dpapi:v1:not-base64!" });
+        database.save_settings(&settings).unwrap();
+
+        migrate_api_key_storage(&database).unwrap();
+
+        let stored = database.get_settings().unwrap();
+        assert_eq!(stored["backupProvider"]["apiKey"], "");
+        assert!(stored["backupApiKeyError"].as_str().is_some());
+        assert_eq!(stored["provider"]["apiKey"], main_key.as_str());
+        assert!(stored.get("apiKeyError").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_page_only_ever_gets_a_placeholder_for_either_key() {
+        let mut settings = serde_json::json!({
+            "provider": { "apiKey": dpapi::encrypt("sk-main-secret").unwrap(), "model": "m" },
+            "backupProvider": { "apiKey": dpapi::encrypt("sk-backup-secret").unwrap(), "enabled": true },
+        });
+
+        redact_api_keys(&mut settings);
+
+        for service in ["provider", "backupProvider"] {
+            assert_eq!(
+                settings[service]["apiKey"],
+                lookup::API_KEY_PLACEHOLDER,
+                "{service}"
+            );
+            assert_eq!(settings[service]["hasApiKey"], true, "{service}");
+        }
+        let sent = settings.to_string();
+        for secret in ["sk-main-secret", "sk-backup-secret", "dpapi:"] {
+            assert!(!sent.contains(secret), "{secret} must not reach the page");
+        }
+        assert_eq!(settings["provider"]["model"], "m");
+        assert_eq!(settings["backupProvider"]["enabled"], true);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn what_cannot_be_used_is_reported_as_no_key_and_what_is_missing_stays_missing() {
+        let mut settings = serde_json::json!({
+            "provider": { "apiKey": "dpapi:v1:not-base64!" },
+            "backupProvider": { "apiKey": "", "enabled": false },
+        });
+        redact_api_keys(&mut settings);
+        assert_eq!(
+            (
+                settings["provider"]["apiKey"].as_str(),
+                settings["provider"]["hasApiKey"].as_bool()
+            ),
+            (Some(""), Some(false))
+        );
+        assert_eq!(
+            (
+                settings["backupProvider"]["apiKey"].as_str(),
+                settings["backupProvider"]["hasApiKey"].as_bool()
+            ),
+            (Some(""), Some(false))
+        );
+
+        // A plaintext key that is still waiting for its migration is not shown either.
+        let mut leftover = serde_json::json!({ "provider": { "apiKey": "sk-plain" } });
+        redact_api_keys(&mut leftover);
+        assert_eq!(leftover["provider"]["apiKey"], lookup::API_KEY_PLACEHOLDER);
+        assert!(!leftover.to_string().contains("sk-plain"));
+
+        // A backup that was never set up is not made up by the redaction.
+        assert!(leftover.get("backupProvider").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_placeholder_from_the_page_keeps_the_ciphertext_of_its_own_service() {
+        let main_key = dpapi::encrypt("sk-main-secret").unwrap();
+        let backup_key = dpapi::encrypt("sk-backup-secret").unwrap();
+        let stored = serde_json::json!({
+            "provider": { "apiKey": main_key },
+            "backupProvider": { "apiKey": backup_key },
+        });
+        let mut incoming = serde_json::json!({
+            "provider": { "apiKey": lookup::API_KEY_PLACEHOLDER, "hasApiKey": true, "model": "m2" },
+            // The page cleared the field, which never deletes a stored key.
+            "backupProvider": { "apiKey": "", "hasApiKey": false, "enabled": true },
+            "apiKeyError": "old", "backupApiKeyError": "old",
+        });
+
+        secure_api_keys_for_storage(&mut incoming, &stored).unwrap();
+        strip_key_status(&mut incoming);
+
+        assert_eq!(incoming["provider"]["apiKey"], stored["provider"]["apiKey"]);
+        assert_eq!(
+            incoming["backupProvider"]["apiKey"],
+            stored["backupProvider"]["apiKey"]
+        );
+        assert_eq!(incoming["provider"]["model"], "m2");
+        assert_eq!(incoming["backupProvider"]["enabled"], true);
+        // What only travels to the page is not stored.
+        for gone in ["apiKeyError", "backupApiKeyError"] {
+            assert!(incoming.get(gone).is_none(), "{gone}");
+        }
+        for service in ["provider", "backupProvider"] {
+            assert!(incoming[service].get("hasApiKey").is_none(), "{service}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_typed_backup_key_is_encrypted_without_touching_the_main_key() {
+        let main_key = dpapi::encrypt("sk-main-secret").unwrap();
+        let stored = serde_json::json!({ "provider": { "apiKey": main_key } });
+        let mut incoming = serde_json::json!({
+            "provider": { "apiKey": lookup::API_KEY_PLACEHOLDER },
+            "backupProvider": { "apiKey": "sk-new-backup", "enabled": true },
+        });
+
+        secure_api_keys_for_storage(&mut incoming, &stored).unwrap();
+
+        assert_eq!(incoming["provider"]["apiKey"], stored["provider"]["apiKey"]);
+        let backup = incoming["backupProvider"]["apiKey"].as_str().unwrap();
+        assert!(dpapi::is_encrypted(backup));
+        assert_eq!(dpapi::decrypt(backup).unwrap(), "sk-new-backup");
+        assert!(!incoming.to_string().contains("sk-new-backup"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_backup_that_was_never_set_up_is_saved_without_a_key_and_without_dpapi() {
+        let stored = serde_json::json!({ "provider": { "apiKey": "" } });
+        let mut incoming = serde_json::json!({
+            "provider": { "apiKey": "" },
+            "backupProvider": { "apiKey": "", "enabled": false },
+        });
+
+        secure_api_keys_for_storage(&mut incoming, &stored).unwrap();
+
+        assert_eq!(incoming["backupProvider"]["apiKey"], "");
+        assert_eq!(incoming["provider"]["apiKey"], "");
+        // The placeholder is never kept as if it were a key.
+        let mut stale =
+            serde_json::json!({ "backupProvider": { "apiKey": lookup::API_KEY_PLACEHOLDER } });
+        secure_api_keys_for_storage(&mut stale, &stored).unwrap();
+        assert_eq!(stale["backupProvider"]["apiKey"], "");
     }
 }

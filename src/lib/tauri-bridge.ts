@@ -1,5 +1,7 @@
 import type {
   AppSettings,
+  EnrichmentProgress,
+  EnrichmentStatus,
   Entry,
   GlossaryImportReport,
   GlossaryPage,
@@ -8,6 +10,7 @@ import type {
   LookupHistoryItem,
   PromptTemplate,
   ReadingSession,
+  ReviewAnswer,
   ReviewState,
   ReviewStats,
   SavedWord,
@@ -105,8 +108,9 @@ export async function getReviewQueue(limit?: number): Promise<SavedWord[]> {
   return invoke<SavedWord[]>('get_review_queue', { limit });
 }
 
-export async function submitReview(wordId: string, correct: boolean): Promise<ReviewState> {
-  return invoke<ReviewState>('submit_review', { wordId, correct });
+/** Answers a card: knew it, knew it but only just (it comes back tomorrow), or did not. */
+export async function submitReview(wordId: string, answer: ReviewAnswer): Promise<ReviewState> {
+  return invoke<ReviewState>('submit_review', { wordId, answer });
 }
 
 export async function getReviewStats(): Promise<ReviewStats> {
@@ -116,6 +120,39 @@ export async function getReviewStats(): Promise<ReviewStats> {
 /** Streak, activity chart, mastery and review figures for the last `days` days (7 to 90). */
 export async function getLearningInsights(days: number): Promise<LearningInsights> {
   return invoke<LearningInsights>('get_learning_insights', { days });
+}
+
+/** How the batch enrichment stands: the words waiting for it, today's tokens and the run, if any. */
+export async function getEnrichmentStatus(): Promise<EnrichmentStatus> {
+  return invoke<EnrichmentStatus>('get_enrichment_status');
+}
+
+/**
+ * Starts filling in the words that have only a form and a meaning: all of them, or those of `ids`
+ * that are. Rejects when there is nothing to do or a run is still going on.
+ */
+export async function startEnrichment(ids?: string[]): Promise<EnrichmentProgress> {
+  return invoke<EnrichmentProgress>('start_enrichment', { ids });
+}
+
+/** No new request is sent until it is resumed; the one on its way is let finish. */
+export async function pauseEnrichment(): Promise<EnrichmentProgress> {
+  return invoke<EnrichmentProgress>('pause_enrichment');
+}
+
+export async function resumeEnrichment(): Promise<EnrichmentProgress> {
+  return invoke<EnrichmentProgress>('resume_enrichment');
+}
+
+/** Ends the run after the request on its way; what is done stays done. */
+export async function stopEnrichment(): Promise<EnrichmentProgress> {
+  return invoke<EnrichmentProgress>('stop_enrichment');
+}
+
+export async function listenEnrichmentProgress(
+  handler: (progress: EnrichmentProgress) => void,
+): Promise<() => void> {
+  return listen('enrichment://progress', handler as (payload: unknown) => void);
 }
 
 export async function resetReviewState(wordId: string): Promise<void> {
@@ -395,13 +432,18 @@ export async function unregisterOcrHotkey(shortcut = 'Control+Shift+O'): Promise
   await invoke('apply_ocr_hotkey_from_settings');
 }
 
+/**
+ * Tries a model service with one short request. A key that is only the placeholder stands for the
+ * stored one, which is the backup's when `backup` is set and the main service's otherwise.
+ */
 export async function testConnection(
   baseUrl: string,
   apiKey: string,
   model: string,
-  protocol?: string
+  protocol?: string,
+  backup = false
 ): Promise<{ ok: boolean; latency: number; model: string }> {
-  return invoke('test_connection', { baseUrl, apiKey, model, protocol: protocol || 'openai' });
+  return invoke('test_connection', { baseUrl, apiKey, model, protocol: protocol || 'openai', backup });
 }
 
 /** Resolves when playback has finished, was superseded, or was stopped. */

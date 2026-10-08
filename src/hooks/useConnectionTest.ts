@@ -26,22 +26,25 @@ export function connectionOkText(state: Extract<ConnectionTestState, { status: '
  * Runs the provider connection test and keeps its result honest. A result belongs to the
  * settings it was measured against, so it is dropped the moment one of them changes, and a
  * slow test that finishes afterwards cannot bring a stale answer back.
+ *
+ * `backup` says that the service under test is the backup one, which decides whose stored key a
+ * placeholder key stands for.
  */
-export function useConnectionTest({ baseUrl, apiKey, model, protocol }: ProviderUnderTest) {
+export function useConnectionTest({ baseUrl, apiKey, model, protocol }: ProviderUnderTest, backup = false) {
   const [state, setState] = useState<ConnectionTestState>(IDLE);
   const latestRun = useRef(0);
 
   useEffect(() => {
     latestRun.current += 1;
     setState(IDLE);
-  }, [baseUrl, apiKey, model, protocol]);
+  }, [baseUrl, apiKey, model, protocol, backup]);
 
   const test = useCallback(async () => {
     const run = ++latestRun.current;
     setState({ status: 'testing' });
     try {
       const { testConnection } = await import('../lib/tauri-bridge');
-      const result = await testConnection(baseUrl, apiKey, model, protocol);
+      const result = await testConnection(baseUrl, apiKey, model, protocol, backup);
       if (run !== latestRun.current) return;
       setState({
         status: 'ok',
@@ -52,7 +55,7 @@ export function useConnectionTest({ baseUrl, apiKey, model, protocol }: Provider
       if (run !== latestRun.current) return;
       setState({ status: 'error', message: connectionTestMessage(error) });
     }
-  }, [baseUrl, apiKey, model, protocol]);
+  }, [baseUrl, apiKey, model, protocol, backup]);
 
   return { state, test };
 }

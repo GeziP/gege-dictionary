@@ -118,6 +118,16 @@ export interface Entry {
   domainAnalysis?: DomainAnalysis;
 }
 
+/** What the backend adds to a lookup answer on top of the entry itself. */
+export type EntryMetadata = Entry & {
+  _templateName?: string;
+  fromCache?: boolean;
+  /** The model that wrote the answer; answers cached before v1.10 do not say. */
+  _model?: string;
+  /** Set when the main model could not answer and the backup one did. */
+  _viaBackup?: boolean;
+};
+
 export interface SavedWord extends Entry {
   savedAt: string;
   context: string;
@@ -132,12 +142,19 @@ export interface SavedWord extends Entry {
   ankiNoteId?: number;
 }
 
+/**
+ * How a card was answered: knew it, knew it but only just, or did not know it. The backend
+ * stores and reports these three words as they are.
+ */
+export type ReviewAnswer = 'correct' | 'hard' | 'wrong';
+
 export interface ReviewState {
   wordId: string;
   box: 1 | 2 | 3;
   dueAt: string;
-  lastResult?: 'correct' | 'wrong' | null;
+  lastResult?: ReviewAnswer | null;
   correctCount: number;
+  hardCount: number;
   wrongCount: number;
   reviewedAt?: string | null;
   previousBox?: number;
@@ -148,6 +165,55 @@ export interface ReviewStats {
   boxCounts: [number, number, number];
   nextDueAt?: string | null;
   total: number;
+}
+
+export type EnrichmentPace = 'gentle' | 'normal' | 'fast';
+
+/** Where a batch enrichment run stands. `stopping` is a run that was stopped and is finishing its last request. */
+export type EnrichmentState = 'idle' | 'running' | 'paused' | 'stopping' | 'finished' | 'stopped';
+
+/** Why a run ended before it was through, other than because the user stopped it. */
+export interface EnrichmentStopReason {
+  /** A lookup error code (`no_key`, `auth`, `model`, `rate_limit`, ...), `budget`, or `repeated`. */
+  code: string;
+  /** The backend's own `[code] message` wording. */
+  message: string;
+}
+
+export interface EnrichmentFailure {
+  lemma: string;
+  code: string;
+  message: string;
+}
+
+/** What the backend says about a run, as it goes. */
+export interface EnrichmentProgress {
+  /** Which run this is since the app was started (0: none yet). */
+  run: number;
+  state: EnrichmentState;
+  /** The words the run set out to do. */
+  total: number;
+  done: number;
+  failed: number;
+  /** Words that no longer needed it when their turn came. */
+  skipped: number;
+  /** Estimated tokens the run has used. */
+  tokens: number;
+  /** The word being asked about. */
+  current: string | null;
+  stoppedBecause: EnrichmentStopReason | null;
+  /** The first words that failed, and why; `failed` counts all of them. */
+  failures: EnrichmentFailure[];
+}
+
+export interface EnrichmentStatus {
+  /** Words that have only a form and a meaning: what a run would work on. */
+  pending: number;
+  /** Estimated tokens used today by lookups and the batch together. */
+  tokensToday: number;
+  /** The most the day's use may grow to by the batch; null when there is no limit. */
+  dailyLimit: number | null;
+  progress: EnrichmentProgress;
 }
 
 /** What happened on one local calendar day. */
@@ -187,13 +253,36 @@ export interface LearningInsights {
     /** Cards in the review boxes. */
     total: number;
     boxCounts: [number, number, number];
-    /** Right and wrong answers over the cards' whole life. */
+    /** Answers of each kind over the cards' whole life. */
     correct: number;
+    hard: number;
     wrong: number;
   };
+  /** The review cards answered, day by day, over the last twelve weeks. */
+  reviewCalendar: ReviewCalendar;
   topSources: Array<{ source: string; count: number }>;
   oftenLookedUp: Array<{ lemma: string; count: number }>;
-  hardWords: Array<{ lemma: string; wrong: number }>;
+  /** Words that were forgotten or found hard, the worst first. */
+  hardWords: Array<{ lemma: string; wrong: number; hard: number }>;
+}
+
+/** The review cards answered on one local day, and how they were answered. */
+export interface ReviewCalendarDay {
+  /** yyyy-MM-dd. */
+  date: string;
+  /** Every card answered, including those whose kind of answer was not recorded. */
+  total: number;
+  correct: number;
+  hard: number;
+  wrong: number;
+}
+
+export interface ReviewCalendar {
+  /** The Monday the first day falls on, so that days go straight into weeks of seven. */
+  first: string;
+  weeks: number;
+  /** From `first` up to today, oldest first, days without any answer included as zeros. */
+  days: ReviewCalendarDay[];
 }
 
 export interface ReadingSession {
@@ -278,6 +367,15 @@ export interface ProviderConfig {
   timeoutSeconds: number;
 }
 
+/**
+ * A second model service for the moments the main one cannot answer: it is too busy, down,
+ * unreachable or too slow. It is asked once, and only after the main one failed in one of those
+ * ways; a rejected key or an unknown model never sends a lookup to it.
+ */
+export interface BackupProviderConfig extends ProviderConfig {
+  enabled: boolean;
+}
+
 export interface PromptTemplate {
   id: string;
   name: string;
@@ -297,6 +395,8 @@ export interface LocalMetrics {
   filtered: number;
   filteredByReason: Record<string, number>;
   streamFallback: number;
+  /** Lookups that the backup model answered because the main one was struggling. */
+  backupUsed: number;
   streamFirstFieldBuckets: Record<string, number>;
   reviewAnswered: number;
   sessionsViewed: number;
@@ -335,6 +435,7 @@ export interface OcrSettings {
 
 export interface AppSettings {
   provider: ProviderConfig;
+  backupProvider: BackupProviderConfig;
   clipboardWatch: boolean;
   clipboardMode?: 'smart' | 'full' | 'double';
   clipboardBlacklist?: string[];
@@ -347,11 +448,18 @@ export interface AppSettings {
   reviewLimit?: 0 | 10 | 20 | 50;
   includeLongFormReview?: boolean;
   sessionGapMinutes?: 15 | 30 | 60;
+  /** The most tokens (lookups and batch together) the day's use may grow to by the batch enrichment; 0 is no limit. */
+  enrichDailyTokens?: number;
+  /** How quickly the batch enrichment sends its requests. */
+  enrichPace?: EnrichmentPace;
+  /** The days of a week (1 to 7) the user wants to learn on; 0 is no goal. */
+  weeklyGoalDays?: number;
   activeDomainProfile: DomainProfile;
   analysisStyle: AnalysisStyle;
   autoCheckUpdates?: boolean;
   skippedUpdateVersion?: string;
   apiKeyError?: string;
+  backupApiKeyError?: string;
   theme: 'light' | 'dark' | 'system';
   cardScale: 'compact' | 'default' | 'large';
   /** boolean is legacy: true→selection_only, false→off */

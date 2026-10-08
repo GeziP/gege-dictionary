@@ -1,6 +1,6 @@
 import React from 'react';
 import { motion } from 'framer-motion';
-import { BookMarkedIcon, DownloadIcon, GraduationCapIcon, TagIcon, Trash2Icon, XIcon } from 'lucide-react';
+import { BookMarkedIcon, DownloadIcon, GraduationCapIcon, SparklesIcon, TagIcon, Trash2Icon, XIcon } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { TextInput } from '../ui/TextInput';
 import { MASTERY_META } from '../ui/MasteryBadge';
@@ -11,10 +11,15 @@ interface SelectionBarProps {
   batchTag: string;
   ankiEnabled?: boolean;
   ankiBusy?: boolean;
+  /** How many of the selected words have nothing but a meaning and could be filled in. */
+  enrichableCount?: number;
+  /** Why they cannot be filled in right now (a run is going on), if that is so. */
+  enrichBlocked?: string;
   onBatchTagChange: (value: string) => void;
   onApplyTag: () => void;
   onExport: () => void;
   onSendAnki?: () => void;
+  onEnrich?: () => void;
   onSetMastery?: (mastery: Mastery) => void;
   onDelete: () => void;
   onClear: () => void;
@@ -25,10 +30,13 @@ export function SelectionBar({
   batchTag,
   ankiEnabled = false,
   ankiBusy = false,
+  enrichableCount = 0,
+  enrichBlocked,
   onBatchTagChange,
   onApplyTag,
   onExport,
   onSendAnki,
+  onEnrich,
   onSetMastery,
   onDelete,
   onClear,
@@ -83,6 +91,17 @@ export function SelectionBar({
           </select>
         </div>
       )}
+      {onEnrich && enrichableCount > 0 ? (
+        <Button
+          size="sm"
+          icon={<SparklesIcon size={13} aria-hidden="true" />}
+          onClick={onEnrich}
+          disabled={Boolean(enrichBlocked)}
+          title={enrichBlocked ?? '让主模型补全所选词里只有释义的那些，只填空缺的部分'}
+        >
+          补全所选（{enrichableCount}）
+        </Button>
+      ) : null}
       {ankiEnabled && onSendAnki ? (
         <Button
           size="sm"

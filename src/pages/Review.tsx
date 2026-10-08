@@ -1,12 +1,23 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { CheckIcon, RotateCcwIcon, XIcon } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { CheckIcon, ClockIcon, RotateCcwIcon, XIcon } from 'lucide-react';
 import { WindowFrame } from '../components/shell/WindowFrame';
 import { Button } from '../components/ui/Button';
 import { CardDetails } from '../components/card/CardDetails';
 import { SpeakButton } from '../components/card/SpeakButton';
 import { useLexNote } from '../contexts/LexNoteContext';
 import * as bridge from '../lib/tauri-bridge';
-import type { ReviewState, SavedWord } from '../types/lexnote';
+import type { ReviewAnswer, ReviewState, SavedWord } from '../types/lexnote';
+
+/**
+ * The ways to answer a card, left to right and by the keys 1, 2 and 3. "认识" is still 1, where
+ * it always was; "有点难" is the new middle: not forgotten, so it stays in its box, but not
+ * easy either, so it comes back tomorrow.
+ */
+const ANSWERS: Array<{ answer: ReviewAnswer; key: string; label: string; icon: React.ReactNode; hint: string }> = [
+  { answer: 'correct', key: '1', label: '认识', icon: <CheckIcon size={15} />, hint: '升一档，隔更久再见' },
+  { answer: 'hard', key: '2', label: '有点难', icon: <ClockIcon size={15} />, hint: '留在原档，明天再见' },
+  { answer: 'wrong', key: '3', label: '不认识', icon: <XIcon size={15} />, hint: '回到 Box 1，明天再见' },
+];
 
 export function Review() {
   const { settings, refreshWords } = useLexNote();
@@ -36,14 +47,26 @@ export function Review() {
   useEffect(() => { load(); }, [load]);
 
   const current = queue[index];
-  const answer = useCallback(async (correct: boolean) => {
-    if (!current || !flipped) return;
+  const saving = useRef(false);
+  const answer = useCallback(async (result: ReviewAnswer) => {
+    // One answer at a time: a key held down or a double click would otherwise record the card
+    // twice and move on past the next one without it being seen.
+    if (!current || !flipped || saving.current) return;
+    saving.current = true;
     try {
-      const state = await bridge.submitReview(current.id, correct);
+      const state = await bridge.submitReview(current.id, result);
       setAnswers((previous) => [...previous, state]);
     } catch (reason) {
-      if (!String(reason).includes('删除')) setError(String(reason));
+      // A word deleted meanwhile has no card left to answer, so move on. Any other failure
+      // means the answer was not recorded: stay on the card, say why, and let it be given again.
+      if (!String(reason).includes('删除')) {
+        setError(String(reason));
+        return;
+      }
+    } finally {
+      saving.current = false;
     }
+    setError('');
     setIndex((previous) => previous + 1);
     setFlipped(false);
     refreshWords();
@@ -54,12 +77,12 @@ export function Review() {
       if (event.code === 'Space') {
         event.preventDefault();
         if (current) setFlipped(true);
-      } else if (flipped && event.key === '1') {
-        event.preventDefault();
-        answer(true);
-      } else if (flipped && event.key === '2') {
-        event.preventDefault();
-        answer(false);
+      } else if (flipped) {
+        const chosen = ANSWERS.find((item) => item.key === event.key);
+        if (chosen) {
+          event.preventDefault();
+          answer(chosen.answer);
+        }
       }
     };
     window.addEventListener('keydown', onKey);
@@ -67,6 +90,7 @@ export function Review() {
   }, [answer, current, flipped]);
 
   const correct = answers.filter((item) => item.lastResult === 'correct').length;
+  const hard = answers.filter((item) => item.lastResult === 'hard').length;
   const promoted = answers.filter((item) => (item.previousBox ?? item.box) < item.box).length;
   const reset = answers.filter((item) => item.lastResult === 'wrong').length;
   const progress = useMemo(() => queue.length ? Math.min(100, index / queue.length * 100) : 0, [index, queue.length]);
@@ -82,32 +106,48 @@ export function Review() {
           {error ? <p className="mb-3 rounded border border-danger/30 bg-danger/5 p-3 text-xs text-danger">{error}</p> : null}
           {!loading && current ? (
             <article className="overflow-hidden rounded-xl border border-line bg-surface shadow-card">
-              <button
-                type="button"
-                className="block min-h-64 w-full px-8 py-10 text-center"
-                onClick={() => setFlipped(true)}
-                aria-label={flipped ? '卡片背面' : '翻面'}
-              >
-                <p className="text-xs text-ink-subtle">{index + 1} / {queue.length} · Box {current.reviewState?.box ?? 1}</p>
-                <div className="mt-8 flex items-center justify-center gap-3">
-                  <h2 className="font-serif text-4xl font-bold text-ink">{current.lemma}</h2>
-                  <SpeakButton text={current.lemma} label={`朗读 ${current.lemma}`} />
-                </div>
-                {current.ipaUS ? <p className="mt-2 font-ipa text-base text-ink-muted">{current.ipaUS}</p> : null}
-                {!flipped ? <p className="mt-12 text-sm text-ink-subtle">先回忆含义，点击或按空格翻面</p> : (
-                  <div className="mt-8 border-l-2 border-accent bg-accent-soft p-4 text-left">
-                    <p className="text-lg font-medium text-ink">{current.contextMeaning || current.translation}</p>
-                    <p className="mt-1 text-sm text-ink-muted">{current.translation}</p>
-                    {current.context ? <p className="mt-3 border-t border-accent-line pt-3 text-xs italic text-ink-muted">{current.context}</p> : null}
-                    <p className="mt-2 text-[11px] text-ink-subtle">{current.sourceApp}{current.sourceTitle ? ` · ${current.sourceTitle}` : ''}</p>
+              <div className="relative min-h-64 px-8 py-10 text-center">
+                {/*
+                  The whole face turns the card over, except the speaker beside the word: hearing
+                  the word is part of recalling it, and must not give the meaning away. So the
+                  speaker is not inside the button that flips the card, but above it.
+                */}
+                <button
+                  type="button"
+                  className="absolute inset-0 h-full w-full"
+                  onClick={() => setFlipped(true)}
+                  aria-label={flipped ? '卡片背面' : '翻面'}
+                />
+                <div className="pointer-events-none relative">
+                  <p className="text-xs text-ink-subtle">{index + 1} / {queue.length} · Box {current.reviewState?.box ?? 1}</p>
+                  <div className="mt-8 flex items-center justify-center gap-3">
+                    <h2 className="font-serif text-4xl font-bold text-ink">{current.lemma}</h2>
+                    <SpeakButton className="pointer-events-auto" text={current.lemma} label={`朗读 ${current.lemma}`} />
                   </div>
-                )}
-              </button>
+                  {current.ipaUS ? <p className="mt-2 font-ipa text-base text-ink-muted">{current.ipaUS}</p> : null}
+                  {!flipped ? <p className="mt-12 text-sm text-ink-subtle">先回忆含义，点击或按空格翻面</p> : (
+                    <div className="mt-8 border-l-2 border-accent bg-accent-soft p-4 text-left">
+                      <p className="text-lg font-medium text-ink">{current.contextMeaning || current.translation}</p>
+                      <p className="mt-1 text-sm text-ink-muted">{current.translation}</p>
+                      {current.context ? <p className="mt-3 border-t border-accent-line pt-3 text-xs italic text-ink-muted">{current.context}</p> : null}
+                      <p className="mt-2 text-[11px] text-ink-subtle">{current.sourceApp}{current.sourceTitle ? ` · ${current.sourceTitle}` : ''}</p>
+                    </div>
+                  )}
+                </div>
+              </div>
               {flipped ? <CardDetails entry={current} revealed={6} streaming={false} /> : null}
               {flipped ? (
-                <div className="flex gap-3 border-t border-line p-4">
-                  <Button fullWidth icon={<CheckIcon size={15} />} onClick={() => answer(true)}>认识（1）</Button>
-                  <Button fullWidth icon={<XIcon size={15} />} onClick={() => answer(false)}>不认识（2）</Button>
+                <div className="border-t border-line p-4">
+                  <div className="flex gap-3">
+                    {ANSWERS.map(({ answer: result, key, label, icon, hint }) => (
+                      <Button key={result} fullWidth icon={icon} title={hint} onClick={() => answer(result)}>
+                        {label}（{key}）
+                      </Button>
+                    ))}
+                  </div>
+                  <p className="mt-2 text-center text-2xs text-ink-subtle">
+                    认识会升档；有点难留在原档，明天再见；不认识回到 Box 1。
+                  </p>
                 </div>
               ) : null}
             </article>
@@ -116,7 +156,9 @@ export function Review() {
             <div className="rounded-xl border border-line bg-surface px-8 py-14 text-center">
               <h2 className="text-xl font-semibold text-ink">{answers.length ? '本次回顾完成' : '今天没有到期词'}</h2>
               {answers.length ? (
-                <p className="mt-3 text-sm text-ink-muted">共 {answers.length} 词，答对 {correct}，升档 {promoted}，回落 {reset}</p>
+                <p className="mt-3 text-sm text-ink-muted">
+                  共 {answers.length} 词，答对 {correct}，{hard > 0 ? `有点难 ${hard}，` : ''}升档 {promoted}，回落 {reset}
+                </p>
               ) : <p className="mt-3 text-sm text-ink-muted">可以安心阅读，新收藏会从明天开始出现。</p>}
               <Button className="mt-6" icon={<RotateCcwIcon size={15} />} onClick={() => load(true)}>继续复习全部到期词</Button>
             </div>

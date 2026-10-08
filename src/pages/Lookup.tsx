@@ -17,15 +17,13 @@ import { useLexNote } from '../contexts/LexNoteContext';
 import { Skeleton } from '../components/ui/Skeleton';
 import { SpeakButton } from '../components/card/SpeakButton';
 import { LookupErrorState } from '../components/card/LookupErrorState';
-import type { Entry, SavedWord } from '../types/lexnote';
+import type { EntryMetadata, SavedWord } from '../types/lexnote';
 import { classNames } from '../utils/format';
 import { RichText } from '../components/ui/RichText';
 import { DomainAnalysis } from '../components/domain/DomainAnalysis';
 import * as bridge from '../lib/tauri-bridge';
 import { resolveLookupShortcut } from '../lib/lookup-keys';
-import { MAX_TAG_CHARS, normalizeTag } from '../lib/words';
-
-type EntryMetadata = Entry & { _templateName?: string; fromCache?: boolean };
+import { MAX_TAG_CHARS, newWordId, normalizeTag } from '../lib/words';
 
 export function Lookup() {
   const {
@@ -172,7 +170,7 @@ export function Lookup() {
       // link, so the placeholders below are used for a brand new word only.
       const stored = await ctxSaveWord({
         ...entry,
-        id: before?.id ?? `w-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        id: before?.id ?? newWordId(),
         savedAt: new Date().toISOString(),
         context: lookupContext,
         sourceApp: lookupSourceApp,
@@ -633,7 +631,15 @@ export function Lookup() {
             {(entry as EntryMetadata).fromCache && (
               <span className="rounded-full bg-positive/15 px-1.5 py-px text-[9px] font-medium text-positive">缓存</span>
             )}
-            <span className="ml-auto">{settings.provider.model}</span>
+            {(entry as EntryMetadata)._viaBackup && (
+              <span
+                title="主模型这次没能回答（太忙、出错或超时），由备用模型回答"
+                className="rounded-full bg-accent-soft px-1.5 py-px text-[9px] font-medium text-accent"
+              >
+                备用模型
+              </span>
+            )}
+            <span className="ml-auto">{(entry as EntryMetadata)._model || settings.provider.model}</span>
           </div>
         )}
 

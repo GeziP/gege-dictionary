@@ -1,4 +1,6 @@
+use crate::enrich;
 use crate::glossary::{self, GlossaryTerm};
+use crate::review::{self, Answer, Step};
 use rusqlite::{
     backup::Backup, params, params_from_iter, Connection, OptionalExtension, Result as SqlResult,
     Row,
@@ -18,6 +20,15 @@ const AUTO_BACKUP_PREFIX: &str = "gege-backup-";
 const PREMIGRATION_BACKUP_PREFIX: &str = "gege-premigrate-";
 const RESTORE_SAFETY_PREFIX: &str = "gege-restore-safety-";
 const MIN_FREE_SPACE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Which rows of `words` are bare, for [`Database::bare_words`]. It has to say what
+/// [`enrich::is_bare`] says about the document (a test holds the two to each other). The `CASE`
+/// keeps one row with a damaged document from failing the whole query.
+const BARE_WORDS_SQL: &str = "COALESCE(NULLIF(kind, ''), 'word') IN ('word', 'phrase')
+    AND CASE WHEN json_valid(data)
+        THEN COALESCE(json_array_length(data, '$.senses'), 0) = 0
+         AND COALESCE(json_array_length(data, '$.examples'), 0) = 0
+        ELSE 0 END";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -311,14 +322,13 @@ fn merged_lookup_word(existing: &Value, incoming: &Value) -> Value {
             );
         }
     }
-    let same_lemma = normalize_import_lemma(str_field(existing, "lemma"))
-        == normalize_import_lemma(str_field(incoming, "lemma"));
-    if same_lemma {
-        merged.insert(
-            "lemma".into(),
-            Value::String(str_field(existing, "lemma").to_string()),
-        );
-    }
+    // The word is the one that is saved, so it keeps the spelling it is saved
+    // under. (`save_lookup_result` only gets here with an answer for the same
+    // lemma; it refuses one for another.)
+    merged.insert(
+        "lemma".into(),
+        Value::String(str_field(existing, "lemma").to_string()),
+    );
     if !str_field(existing, "note").trim().is_empty() {
         merged.insert(
             "note".into(),
@@ -839,6 +849,9 @@ impl Database {
             "reviewLimit": 20,
             "includeLongFormReview": false,
             "sessionGapMinutes": 30,
+            "enrichDailyTokens": enrich::DEFAULT_DAILY_TOKENS,
+            "enrichPace": "normal",
+            "weeklyGoalDays": 0,
             "activeDomainProfile": "general",
             "analysisStyle": "standard",
             "autoCheckUpdates": true,
@@ -1100,6 +1113,20 @@ impl Database {
             "" => None,
             id => word_json_by_id(&tx, id)?,
         };
+        // A lookup refreshes the word it is about. An answer for another lemma
+        // than the one this word is saved under is not a refresh: saving it here
+        // would turn "running" into "run" without asking, and into a second
+        // "run" where one is saved already. Whoever means it saves the answer as
+        // a word of its own: with no id, or with the id of the word that has
+        // that lemma.
+        if let Some(stored) = &by_id {
+            let saved_lemma = str_field(stored, "lemma").trim();
+            if normalize_import_lemma(saved_lemma) != normalize_import_lemma(lemma) {
+                return Err(format!(
+                    "这条解析的原形是「{lemma}」，而这个词条保存的是「{saved_lemma}」，没有保存"
+                ));
+            }
+        }
         let existing = match by_id {
             Some(word) => Some(word),
             None => find_word_with_connection(&tx, lemma, Some(kind))?,
@@ -1361,6 +1388,79 @@ impl Database {
         })
     }
 
+    /// The words that have nothing but a form and a meaning (see [`enrich::is_bare`]), oldest
+    /// first, as their ids and lemmas. With `only`, just those of the given ids.
+    pub fn bare_words(&self, only: Option<&[String]>) -> Result<Vec<enrich::Candidate>, String> {
+        let wanted: Option<HashSet<&str>> =
+            only.map(|ids| ids.iter().map(String::as_str).collect());
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT id, lemma FROM words WHERE {BARE_WORDS_SQL} ORDER BY saved_at ASC, id ASC"
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(enrich::Candidate {
+                    id: row.get(0)?,
+                    lemma: row.get(1)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let mut words = Vec::new();
+        for row in rows {
+            let candidate = row.map_err(|e| e.to_string())?;
+            if wanted
+                .as_ref()
+                .is_none_or(|wanted| wanted.contains(candidate.id.as_str()))
+            {
+                words.push(candidate);
+            }
+        }
+        Ok(words)
+    }
+
+    /// How many words [`Database::bare_words`] would give.
+    pub fn count_bare_words(&self) -> Result<usize, String> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM words WHERE {BARE_WORDS_SQL}"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// Put what a model answered into the word where the word has nothing yet (see
+    /// [`enrich::fill_gaps`]). The word is read and written in one transaction, so a note the
+    /// user types meanwhile is not lost, and a word that was deleted or filled in elsewhere since
+    /// the batch looked at it is left alone. An answer with nothing to add is an error rather
+    /// than a word that is "done" and still bare, which the next run would ask for again.
+    pub fn fill_in_word(&self, id: &str, answer: &Value) -> Result<enrich::Filled, String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let Some(word) = word_json_by_id(&tx, id)? else {
+            return Ok(enrich::Filled::Gone);
+        };
+        if !enrich::is_bare(&word) {
+            return Ok(enrich::Filled::NotBare);
+        }
+        let filled = enrich::fill_gaps(&word, answer);
+        if enrich::is_bare(&filled) {
+            return Err(crate::llm::coded(
+                "empty",
+                "模型没有给出义项或例句，词条保持原样",
+            ));
+        }
+        save_word_with_connection(&tx, &filled, self.include_long_form_review())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(enrich::Filled::Done(Box::new(filled)))
+    }
+
     pub fn get_review_queue(&self, limit: Option<u32>) -> Result<Vec<Value>, String> {
         let requested = limit.unwrap_or_else(|| {
             self.get_settings()
@@ -1370,7 +1470,7 @@ impl Database {
         });
         let sql = if requested == 0 {
             "SELECT w.data, r.word_id, r.box, r.due_at, r.last_result,
-                    r.correct_count, r.wrong_count, r.reviewed_at
+                    r.correct_count, r.wrong_count, r.reviewed_at, r.hard_count
              FROM review_state r JOIN words w ON w.id = r.word_id
              WHERE date(r.due_at) <= date('now', 'localtime')
              ORDER BY date(r.due_at) ASC, r.box ASC, datetime(w.saved_at) ASC"
@@ -1378,7 +1478,7 @@ impl Database {
         } else {
             format!(
                 "SELECT w.data, r.word_id, r.box, r.due_at, r.last_result,
-                        r.correct_count, r.wrong_count, r.reviewed_at
+                        r.correct_count, r.wrong_count, r.reviewed_at, r.hard_count
                  FROM review_state r JOIN words w ON w.id = r.word_id
                  WHERE date(r.due_at) <= date('now', 'localtime')
                  ORDER BY date(r.due_at) ASC, r.box ASC, datetime(w.saved_at) ASC LIMIT {}",
@@ -1398,6 +1498,7 @@ impl Database {
                         "correctCount": row.get::<_, i64>(5)?,
                         "wrongCount": row.get::<_, i64>(6)?,
                         "reviewedAt": row.get::<_, Option<String>>(7)?,
+                        "hardCount": row.get::<_, i64>(8)?,
                     }),
                 ))
             })
@@ -1414,41 +1515,47 @@ impl Database {
         Ok(queue)
     }
 
-    pub fn submit_review(&self, word_id: &str, correct: bool) -> Result<Value, String> {
+    pub fn submit_review(&self, word_id: &str, answer: Answer) -> Result<Value, String> {
         let tx = self
             .conn
             .unchecked_transaction()
             .map_err(|e| e.to_string())?;
-        let (current_box, correct_count, wrong_count): (i64, i64, i64) = tx
+        let (current_box, correct_count, hard_count, wrong_count): (i64, i64, i64, i64) = tx
             .query_row(
-                "SELECT box, correct_count, wrong_count FROM review_state WHERE word_id=?1",
+                "SELECT box, correct_count, hard_count, wrong_count FROM review_state WHERE word_id=?1",
                 params![word_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
-            .map_err(|e| format!("复习记录不存在: {e}"))?;
-        let next_box = if correct { (current_box + 1).min(3) } else { 1 };
-        let days = match next_box {
-            1 => 1,
-            2 => 3,
-            _ => 7,
-        };
-        let mastery = match next_box {
-            1 => "new",
-            2 => "learning",
-            _ => "mastered",
-        };
-        let result = if correct { "correct" } else { "wrong" };
+            .map_err(|e| match e {
+                // A card goes with its word (the row is deleted along with it), so a missing
+                // one means the word is gone. The review screen tells that apart from a
+                // failure to save, and moves on instead of asking for the answer again.
+                rusqlite::Error::QueryReturnedNoRows => "生词已被删除，这张卡片无需再复习".to_string(),
+                other => format!("读取复习记录失败: {other}"),
+            })?;
+        let Step {
+            next_box,
+            days,
+            mastery,
+        } = review::schedule(current_box, answer);
+        let result = answer.as_str();
+        let (correct_count, hard_count, wrong_count) = (
+            correct_count + i64::from(answer == Answer::Correct),
+            hard_count + i64::from(answer == Answer::Hard),
+            wrong_count + i64::from(answer == Answer::Wrong),
+        );
         tx.execute(
             "UPDATE review_state SET box=?2, due_at=date('now','localtime',?3),
-                    last_result=?4, correct_count=?5, wrong_count=?6,
+                    last_result=?4, correct_count=?5, hard_count=?6, wrong_count=?7,
                     reviewed_at=datetime('now','localtime') WHERE word_id=?1",
             params![
                 word_id,
                 next_box,
                 format!("+{days} days"),
                 result,
-                correct_count + i64::from(correct),
-                wrong_count + i64::from(!correct)
+                correct_count,
+                hard_count,
+                wrong_count
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -1477,8 +1584,9 @@ impl Database {
                 .checked_add_days(chrono::Days::new(days as u64))
                 .map(|date| date.format("%Y-%m-%d").to_string()),
             "lastResult": result,
-            "correctCount": correct_count + i64::from(correct),
-            "wrongCount": wrong_count + i64::from(!correct),
+            "correctCount": correct_count,
+            "hardCount": hard_count,
+            "wrongCount": wrong_count,
             "previousBox": current_box,
         }))
     }
@@ -1526,7 +1634,7 @@ impl Database {
                 "INSERT INTO review_state (word_id, box, due_at, created_at)
              VALUES (?1,1,date('now','localtime','+1 day'),datetime('now'))
              ON CONFLICT(word_id) DO UPDATE SET box=1,due_at=excluded.due_at,last_result=NULL,
-               correct_count=0,wrong_count=0,reviewed_at=NULL",
+               correct_count=0,hard_count=0,wrong_count=0,reviewed_at=NULL",
                 params![word_id],
             )
             .map_err(|e| e.to_string())?;
@@ -2183,6 +2291,35 @@ impl Database {
         Ok(())
     }
 
+    /// Count tokens that were spent today without a lookup of the user's behind them: what the
+    /// batch enrichment asks of the model. Today's lookups stay as they were.
+    pub fn record_tokens(&self, tokens: u32) -> Result<(), String> {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        self.conn
+            .execute(
+                "INSERT INTO usage_log (date, queries, tokens) VALUES (?1, 0, ?2)
+                 ON CONFLICT(date) DO UPDATE SET tokens = tokens + ?2",
+                params![today, tokens as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Estimated tokens spent today, by lookups and by the batch together.
+    pub fn tokens_today(&self) -> Result<u64, String> {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let tokens: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT tokens FROM usage_log WHERE date = ?1",
+                params![today],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(tokens.unwrap_or(0).max(0) as u64)
+    }
+
     pub fn record_local_event(&self, event: &str, extra: &Value) -> Result<(), String> {
         if event.trim().is_empty() {
             return Err("事件名不能为空".into());
@@ -2353,6 +2490,7 @@ impl Database {
             "filtered": event_sum("clipboard_filtered")?,
             "filteredByReason": filtered_by_reason,
             "streamFallback": event_sum("lookup_stream_fallback")?,
+            "backupUsed": event_sum("lookup_backup_used")?,
             "streamFirstFieldBuckets": stream_first,
             "reviewAnswered": event_sum("review_card_answered")?,
             "sessionsViewed": event_sum("reading_session_viewed")?,
@@ -2652,22 +2790,33 @@ impl Database {
                 *facts.saved.entry(day).or_insert(0) += 1;
             }
         }
+        // Review answers come from the event log, which also says how each was answered.
+        let mut answers: std::collections::BTreeMap<chrono::NaiveDate, insights::Answers> =
+            std::collections::BTreeMap::new();
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT date, COALESCE(SUM(count), 0) FROM local_events
-                 WHERE event = 'review_card_answered' GROUP BY date",
+                "SELECT date, extra, COALESCE(SUM(count), 0) FROM local_events
+                 WHERE event = 'review_card_answered' GROUP BY date, extra",
             )
             .map_err(sql_error)?;
         for row in stmt
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
             })
             .map_err(sql_error)?
         {
-            let (date, answered) = row.map_err(sql_error)?;
+            let (date, extra, answered) = row.map_err(sql_error)?;
             if let Ok(day) = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d") {
                 *facts.reviews.entry(day).or_insert(0) += answered;
+                answers
+                    .entry(day)
+                    .or_default()
+                    .add(insights::answer_of(&extra), answered);
             }
         }
 
@@ -2719,13 +2868,14 @@ impl Database {
                 boxes[(box_number - 1) as usize] = count;
             }
         }
-        let (correct, wrong): (i64, i64) = self
+        let (correct, hard, wrong): (i64, i64, i64) = self
             .conn
             .query_row(
-                "SELECT COALESCE(SUM(correct_count), 0), COALESCE(SUM(wrong_count), 0)
+                "SELECT COALESCE(SUM(correct_count), 0), COALESCE(SUM(hard_count), 0),
+                        COALESCE(SUM(wrong_count), 0)
                  FROM review_state",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .map_err(sql_error)?;
 
@@ -2756,13 +2906,29 @@ impl Database {
             "lemma",
             "count",
         )?;
-        let hard_words = ranked(
-            "SELECT w.lemma, r.wrong_count FROM review_state r JOIN words w ON w.id = r.word_id
-             WHERE r.wrong_count > 0 AND w.kind IN ('word', 'phrase')
-             ORDER BY r.wrong_count DESC, r.correct_count ASC, w.lemma ASC LIMIT 5",
-            "lemma",
-            "wrong",
-        )?;
+        // Forgetting a word weighs more than finding it hard: twice as much.
+        let hard_words = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT w.lemma, r.wrong_count, r.hard_count
+                     FROM review_state r JOIN words w ON w.id = r.word_id
+                     WHERE (r.wrong_count > 0 OR r.hard_count > 0) AND w.kind IN ('word', 'phrase')
+                     ORDER BY r.wrong_count * 2 + r.hard_count DESC, r.correct_count ASC, w.lemma ASC
+                     LIMIT 5",
+                )
+                .map_err(sql_error)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(serde_json::json!({
+                        "lemma": row.get::<_, String>(0)?,
+                        "wrong": row.get::<_, i64>(1)?,
+                        "hard": row.get::<_, i64>(2)?,
+                    }))
+                })
+                .map_err(sql_error)?;
+            rows.collect::<SqlResult<Vec<Value>>>().map_err(sql_error)?
+        };
 
         let word_count: i64 = self
             .conn
@@ -2793,8 +2959,13 @@ impl Database {
                     "total": boxes.iter().sum::<i64>(),
                     "boxCounts": boxes,
                     "correct": correct,
+                    "hard": hard,
                     "wrong": wrong,
                 }),
+            );
+            object.insert(
+                "reviewCalendar".into(),
+                insights::review_calendar(today, &answers, insights::CALENDAR_WEEKS),
             );
             object.insert("topSources".into(), Value::Array(top_sources));
             object.insert("oftenLookedUp".into(), Value::Array(often_looked_up));
@@ -2939,6 +3110,7 @@ fn validate_schema_contract_as_of(conn: &Connection, version: i64) -> Result<(),
                 "last_at",
             ],
         ),
+        (7, "review_state", &["hard_count"]),
     ];
 
     for (_, table, required_columns) in REQUIRED_COLUMNS
@@ -3960,6 +4132,61 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_for_another_lemma_is_not_saved_over_the_word_with_that_id() {
+        let db = new_db();
+        let running = db
+            .save_lookup_result(&lookup_entry("running", "word", "跑步"))
+            .unwrap();
+        let run = db
+            .save_lookup_result(&lookup_entry("run", "word", "跑"))
+            .unwrap();
+        let mut answer = lookup_entry("run", "word", "新释义");
+        answer["id"] = running["id"].clone();
+
+        let error = db.save_lookup_result(&answer).unwrap_err();
+
+        assert!(
+            error.contains("「run」") && error.contains("「running」"),
+            "{error}"
+        );
+        // Nothing changed: "running" is not renamed, and there is no second "run".
+        assert_eq!(db.get_all_words().unwrap().len(), 2);
+        assert_eq!(
+            db.find_word_by_lemma("running", None).unwrap().unwrap(),
+            running
+        );
+        assert_eq!(db.find_word_by_lemma("run", None).unwrap().unwrap(), run);
+
+        // Saved as the word it is about, the same answer is a refresh like any other.
+        answer["id"] = run["id"].clone();
+        let merged = db.save_lookup_result(&answer).unwrap();
+        assert_eq!(merged["id"], run["id"]);
+        assert_eq!(merged["translation"], "新释义");
+        assert_eq!(merged["lookups"], 2);
+        assert_eq!(db.get_all_words().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_answer_that_spells_the_lemma_differently_still_refreshes_the_word() {
+        let db = new_db();
+        let run = db
+            .save_lookup_result(&lookup_entry("Run", "word", "跑"))
+            .unwrap();
+        let mut answer = lookup_entry("  run ", "word", "又一次");
+        answer["id"] = run["id"].clone();
+
+        let merged = db.save_lookup_result(&answer).unwrap();
+
+        assert_eq!(merged["id"], run["id"]);
+        assert_eq!(merged["translation"], "又一次");
+        assert_eq!(
+            merged["lemma"], "Run",
+            "the word keeps the spelling it is saved under"
+        );
+        assert_eq!(db.get_all_words().unwrap().len(), 1);
+    }
+
+    #[test]
     fn lookups_of_different_kinds_stay_separate_words() {
         let db = new_db();
         db.save_lookup_result(&lookup_entry("run", "word", "跑"))
@@ -4266,6 +4493,316 @@ mod tests {
         assert_eq!(usage["today"], 2);
         assert_eq!(usage["month"], 2);
         assert_eq!(usage["tokens"], 120);
+    }
+
+    #[test]
+    fn the_batch_spends_tokens_without_making_lookups() {
+        let db = new_db();
+        assert_eq!(db.tokens_today().unwrap(), 0);
+
+        db.record_lookup(120).unwrap();
+        db.record_tokens(500).unwrap();
+        db.record_tokens(80).unwrap();
+
+        assert_eq!(db.tokens_today().unwrap(), 700);
+        let usage = db.get_usage().unwrap();
+        assert_eq!(usage["today"], 1, "the batch is not a lookup of the user");
+        assert_eq!(usage["tokens"], 700);
+    }
+
+    #[test]
+    fn the_batch_can_be_the_only_use_of_the_day() {
+        let db = new_db();
+        db.record_tokens(300).unwrap();
+
+        assert_eq!(db.tokens_today().unwrap(), 300);
+        assert_eq!(db.get_usage().unwrap()["today"], 0);
+    }
+
+    #[test]
+    fn only_todays_tokens_count_towards_the_limit_of_the_day() {
+        let db = new_db();
+        db.conn
+            .execute(
+                "INSERT INTO usage_log (date, queries, tokens) VALUES ('2000-01-15', 7, 7000)",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(db.tokens_today().unwrap(), 0);
+    }
+
+    fn variant(id: &str, edit: impl FnOnce(&mut Value)) -> Value {
+        let mut word = sample_word(id, "Reader", "2026-08-01T10:00:00+00:00");
+        edit(&mut word);
+        word
+    }
+
+    fn model_answer() -> Value {
+        serde_json::json!({
+            "lemma": "a-form-the-model-prefers",
+            "translation": "模型的释义",
+            "pos": "adj.",
+            "ipaUS": "/əˈfemərəl/",
+            "ipaUK": "/ɪˈfemərəl/",
+            "contextMeaning": "语境义",
+            "explanation": "lasting a very short time",
+            "senses": [{ "pos": "adj.", "translation": "短暂的", "gloss": "first" }],
+            "associations": [{ "title": "transient", "text": "近义" }],
+            "examples": [{ "en": "Fame is ephemeral.", "zh": "名声转瞬即逝。" }],
+            "collocations": [{ "phrase": "ephemeral beauty", "translation": "转瞬即逝的美" }],
+            "register": "formal",
+            "_model": "test-model"
+        })
+    }
+
+    fn ids_of_candidates(candidates: &[enrich::Candidate]) -> Vec<String> {
+        candidates
+            .iter()
+            .map(|candidate| candidate.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_bare_words_are_the_ones_the_rule_in_rust_calls_bare() {
+        let db = new_db();
+        let words = vec![
+            variant("bare-word", |_| {}),
+            variant("bare-phrase", |word| word["kind"] = "phrase".into()),
+            variant("unsaid-kind", |word| word["kind"] = "".into()),
+            variant("with-senses", |word| {
+                word["senses"] = serde_json::json!([{ "translation": "义" }])
+            }),
+            variant("with-examples", |word| {
+                word["examples"] = serde_json::json!([{ "en": "x", "zh": "y" }])
+            }),
+            variant("sentence", |word| word["kind"] = "sentence".into()),
+            variant("paragraph", |word| word["kind"] = "paragraph".into()),
+            variant("no-lists", |word| {
+                let fields = word.as_object_mut().unwrap();
+                fields.remove("senses");
+                fields.remove("examples");
+            }),
+            variant("odd-lists", |word| {
+                word["senses"] = "oops".into();
+                word["examples"] = Value::Null;
+            }),
+        ];
+        for word in &words {
+            db.save_word(word).unwrap();
+        }
+
+        let mut expected: Vec<String> = words
+            .iter()
+            .filter(|word| enrich::is_bare(word))
+            .map(|word| word["id"].as_str().unwrap().to_string())
+            .collect();
+        expected.sort();
+        let mut listed = ids_of_candidates(&db.bare_words(None).unwrap());
+        listed.sort();
+
+        assert_eq!(listed, expected, "the query and the rule disagree");
+        assert_eq!(db.count_bare_words().unwrap(), expected.len());
+        // Not a test of nothing against nothing.
+        assert_eq!(
+            expected,
+            [
+                "bare-phrase",
+                "bare-word",
+                "no-lists",
+                "odd-lists",
+                "unsaid-kind"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_bare_words_come_oldest_first_and_can_be_narrowed_down() {
+        let db = new_db();
+        for (id, saved_at) in [
+            ("c", "2026-08-03T10:00:00+00:00"),
+            ("b", "2026-08-01T10:00:00+00:00"),
+            ("a", "2026-08-01T10:00:00+00:00"),
+        ] {
+            db.save_word(&sample_word(id, "", saved_at)).unwrap();
+        }
+        let mut done = sample_word("d", "", "2026-07-01T10:00:00+00:00");
+        done["senses"] = serde_json::json!([{ "translation": "义" }]);
+        db.save_word(&done).unwrap();
+
+        let all = db.bare_words(None).unwrap();
+        assert_eq!(ids_of_candidates(&all), ["a", "b", "c"]);
+        assert_eq!(all[0].lemma, "a");
+
+        let some = db
+            .bare_words(Some(&["c".into(), "d".into(), "nobody".into()]))
+            .unwrap();
+        assert_eq!(ids_of_candidates(&some), ["c"]);
+        assert!(db.bare_words(Some(&[])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_damaged_document_does_not_fail_the_whole_list() {
+        let db = new_db();
+        db.save_word(&sample_word("good", "", "2026-08-01T10:00:00+00:00"))
+            .unwrap();
+        db.save_word(&sample_word("damaged", "", "2026-08-01T10:00:00+00:00"))
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE words SET data = 'not json at all' WHERE id = 'damaged'",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(ids_of_candidates(&db.bare_words(None).unwrap()), ["good"]);
+        assert_eq!(db.count_bare_words().unwrap(), 1);
+    }
+
+    #[test]
+    fn filling_a_bare_word_adds_what_it_lacks_and_leaves_what_the_user_owns() {
+        let db = new_db();
+        let mut word = sample_word("alpha", "Reader", "2026-08-01T10:00:00+00:00");
+        word["note"] = "我的笔记".into();
+        word["tags"] = serde_json::json!(["托福"]);
+        word["mastery"] = "learning".into();
+        word["lookups"] = 3.into();
+        db.save_word(&word).unwrap();
+        db.conn
+            .execute(
+                "UPDATE review_state SET box = 3 WHERE word_id = 'alpha'",
+                [],
+            )
+            .unwrap();
+
+        let filled = db.fill_in_word("alpha", &model_answer()).unwrap();
+        let enrich::Filled::Done(stored) = filled else {
+            panic!("expected the word to be filled, got {filled:?}");
+        };
+
+        // What was missing is there now.
+        assert_eq!(stored["senses"][0]["gloss"], "first");
+        assert_eq!(stored["examples"][0]["en"], "Fame is ephemeral.");
+        assert_eq!(stored["collocations"][0]["phrase"], "ephemeral beauty");
+        assert_eq!(stored["ipaUS"], "/əˈfemərəl/");
+        assert_eq!(stored["register"], "formal");
+        assert_eq!(stored["_model"], "test-model");
+        // What the user owns, and what the word already said, is not touched.
+        assert_eq!(stored["id"], "alpha");
+        assert_eq!(stored["lemma"], "alpha");
+        assert_eq!(stored["translation"], "alpha-中文");
+        assert_eq!(stored["pos"], "n.");
+        assert_eq!(stored["note"], "我的笔记");
+        assert_eq!(stored["tags"], serde_json::json!(["托福"]));
+        assert_eq!(stored["mastery"], "learning");
+        assert_eq!(stored["lookups"], 3);
+        assert_eq!(stored["savedAt"], "2026-08-01T10:00:00+00:00");
+        assert_eq!(stored["sourceApp"], "Reader");
+
+        // What came back is what is stored, and the rest of the database agrees with it.
+        let in_the_library = db.get_words_in_order(&["alpha".to_string()]).unwrap();
+        assert_eq!(in_the_library, [*stored]);
+        let box_number: i64 = db
+            .conn
+            .query_row(
+                "SELECT box FROM review_state WHERE word_id = 'alpha'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(box_number, 3, "review progress is the user's");
+        let tags: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM word_tags WHERE word_id = 'alpha'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tags, 1);
+        assert_eq!(db.count_bare_words().unwrap(), 0);
+        assert_eq!(db.get_all_words().unwrap().len(), 1, "no second entry");
+    }
+
+    #[test]
+    fn a_note_typed_while_the_model_was_answering_is_not_lost() {
+        let db = new_db();
+        let word = sample_word("alpha", "", "2026-08-01T10:00:00+00:00");
+        db.save_word(&word).unwrap();
+
+        // The batch looked at the word, asked the model, and in the meantime the user wrote a note.
+        let mut edited = word.clone();
+        edited["note"] = "写在这期间的笔记".into();
+        db.save_word(&edited).unwrap();
+        db.fill_in_word("alpha", &model_answer()).unwrap();
+
+        let stored = &db.get_words_in_order(&["alpha".to_string()]).unwrap()[0];
+        assert_eq!(stored["note"], "写在这期间的笔记");
+        assert_eq!(stored["senses"][0]["gloss"], "first");
+    }
+
+    #[test]
+    fn a_word_deleted_in_the_meantime_is_not_brought_back() {
+        let db = new_db();
+        db.save_word(&sample_word("alpha", "", "2026-08-01T10:00:00+00:00"))
+            .unwrap();
+        db.delete_words(&["alpha".to_string()]).unwrap();
+
+        let outcome = db.fill_in_word("alpha", &model_answer()).unwrap();
+
+        assert_eq!(outcome, enrich::Filled::Gone);
+        assert!(db.get_all_words().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_word_that_is_no_longer_bare_is_left_as_it_is() {
+        let db = new_db();
+        let mut word = sample_word("alpha", "", "2026-08-01T10:00:00+00:00");
+        word["senses"] = serde_json::json!([{ "translation": "我自己加的义项" }]);
+        db.save_word(&word).unwrap();
+        let mut sentence = sample_word("beta", "", "2026-08-01T10:00:00+00:00");
+        sentence["kind"] = "sentence".into();
+        db.save_word(&sentence).unwrap();
+
+        assert_eq!(
+            db.fill_in_word("alpha", &model_answer()).unwrap(),
+            enrich::Filled::NotBare
+        );
+        assert_eq!(
+            db.fill_in_word("beta", &model_answer()).unwrap(),
+            enrich::Filled::NotBare
+        );
+
+        let stored = db
+            .get_words_in_order(&["alpha".to_string(), "beta".to_string()])
+            .unwrap();
+        assert_eq!(stored, [word, sentence]);
+    }
+
+    #[test]
+    fn an_answer_with_nothing_to_add_is_an_error_and_changes_nothing() {
+        let db = new_db();
+        let word = sample_word("alpha", "", "2026-08-01T10:00:00+00:00");
+        db.save_word(&word).unwrap();
+
+        for nothing in [
+            serde_json::json!({ "lemma": "alpha", "senses": [], "examples": [] }),
+            serde_json::json!({}),
+            serde_json::json!("not even an object"),
+        ] {
+            let error = db.fill_in_word("alpha", &nothing).unwrap_err();
+            assert!(error.starts_with("[empty]"), "{error}");
+        }
+
+        assert_eq!(
+            db.get_words_in_order(&["alpha".to_string()]).unwrap(),
+            [word]
+        );
+        assert_eq!(
+            db.count_bare_words().unwrap(),
+            1,
+            "it is still there to be asked again"
+        );
     }
 
     fn history_db() -> Database {
@@ -4613,6 +5150,7 @@ mod tests {
                 "total": 3,
                 "boxCounts": [1, 1, 1],
                 "correct": 11,
+                "hard": 0,
                 "wrong": 4,
             })
         );
@@ -4635,9 +5173,102 @@ mod tests {
         assert_eq!(
             result["hardWords"],
             serde_json::json!([
-                {"lemma": "serendipity", "wrong": 3},
-                {"lemma": "ubiquitous", "wrong": 1},
+                {"lemma": "serendipity", "wrong": 3, "hard": 0},
+                {"lemma": "ubiquitous", "wrong": 1, "hard": 0},
             ])
+        );
+    }
+
+    #[test]
+    fn insights_tell_how_the_cards_were_answered() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
+        let ago = |n: u64| {
+            today
+                .checked_sub_days(chrono::Days::new(n))
+                .unwrap()
+                .format("%Y-%m-%d")
+                .to_string()
+        };
+
+        for (day, event, extra, count) in [
+            (ago(0), "review_card_answered", r#"{"result":"correct"}"#, 4),
+            (ago(0), "review_card_answered", r#"{"result":"hard"}"#, 2),
+            (ago(1), "review_card_answered", r#"{"result":"wrong"}"#, 1),
+            // An answer from before the kind of answer was recorded.
+            (ago(1), "review_card_answered", "{}", 3),
+            // Not an answer at all.
+            (ago(0), "lookup_cache_hit", "{}", 9),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO local_events (date, event, count, extra) VALUES (?1, ?2, ?3, ?4)",
+                    params![day, event, count, extra],
+                )
+                .unwrap();
+        }
+        // (id, lemma, kind, right, hard, wrong): the progress of each card over its life.
+        for (id, lemma, kind, correct, hard, wrong) in [
+            ("w1", "forgot", "word", 1, 0, 1),
+            ("w2", "tough", "word", 5, 3, 0),
+            ("w3", "slightly", "word", 2, 1, 0),
+            ("w4", "Time flies.", "sentence", 0, 9, 9),
+            ("w5", "easy", "word", 7, 0, 0),
+        ] {
+            let mut word = sample_word(id, "Reader", &local_noon(today));
+            word["lemma"] = Value::String(lemma.into());
+            word["kind"] = Value::String(kind.into());
+            db.save_word(&word).unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO review_state
+                         (word_id, box, due_at, correct_count, hard_count, wrong_count, created_at)
+                     VALUES (?1, 1, '2026-10-08', ?2, ?3, ?4, '2026-10-01')
+                     ON CONFLICT(word_id) DO UPDATE SET correct_count=excluded.correct_count,
+                         hard_count=excluded.hard_count, wrong_count=excluded.wrong_count",
+                    params![id, correct, hard, wrong],
+                )
+                .unwrap();
+        }
+
+        let result = db.learning_insights_at(30, today).unwrap();
+
+        assert_eq!(
+            result["review"],
+            serde_json::json!({
+                "dueToday": 0,
+                "total": 5,
+                "boxCounts": [5, 0, 0],
+                "correct": 15,
+                "hard": 13,
+                "wrong": 10,
+            })
+        );
+        assert_eq!(
+            result["hardWords"],
+            serde_json::json!([
+                {"lemma": "tough", "wrong": 0, "hard": 3},
+                {"lemma": "forgot", "wrong": 1, "hard": 0},
+                {"lemma": "slightly", "wrong": 0, "hard": 1},
+            ]),
+            "forgetting counts twice as much as finding hard; sentences and easy words are not listed"
+        );
+
+        let daily = result["daily"].as_array().unwrap();
+        assert_eq!(daily[29]["reviews"], 6);
+        assert_eq!(daily[28]["reviews"], 4, "the chart counts every answer");
+        let calendar = &result["reviewCalendar"];
+        assert_eq!(calendar["weeks"], 12);
+        let days = calendar["days"].as_array().unwrap();
+        assert_eq!(
+            days[days.len() - 1],
+            serde_json::json!({"date": "2026-10-07", "total": 6, "correct": 4, "hard": 2, "wrong": 0})
+        );
+        assert_eq!(
+            days[days.len() - 2],
+            serde_json::json!({"date": "2026-10-06", "total": 4, "correct": 0, "hard": 0, "wrong": 1}),
+            "an answer of no known kind is in the total only"
         );
     }
 
@@ -4874,12 +5505,17 @@ mod tests {
             .unwrap();
         let backup_name = backup_database(&db).unwrap();
 
-        // What an earlier version wrote: the same file, but from before the history table.
+        // What an earlier version wrote: the same file, but from before the history table
+        // and from before cards could be answered as hard.
         let backup_path = root.0.join("backups").join(&backup_name);
         {
             let old = Connection::open(&backup_path).unwrap();
-            old.execute_batch("DROP TABLE lookup_history; PRAGMA user_version = 5;")
-                .unwrap();
+            old.execute_batch(
+                "DROP TABLE lookup_history;
+                 ALTER TABLE review_state DROP COLUMN hard_count;
+                 PRAGMA user_version = 5;",
+            )
+            .unwrap();
         }
 
         db.save_word(&serde_json::json!({"id": "later", "lemma": "later", "kind": "word"}))
@@ -4903,6 +5539,60 @@ mod tests {
                 .any(|item| item["kind"] == "restoreSafety"),
             "what was there before is kept, in case the restore was a mistake"
         );
+    }
+
+    #[test]
+    fn a_backup_from_before_the_hard_answer_is_restored_with_its_progress_and_upgraded() {
+        let root = TestDir::new("restore-v6-schema");
+        let path = root.0.join(DB_FILENAME);
+        let mut db = Database::open(path.to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        db.save_word(&serde_json::json!({"id": "kept", "lemma": "kept", "kind": "word"}))
+            .unwrap();
+        db.submit_review("kept", Answer::Correct).unwrap();
+        let backup_name = backup_database(&db).unwrap();
+
+        // The version before this one wrote the same file without the hard count.
+        {
+            let old = Connection::open(root.0.join("backups").join(&backup_name)).unwrap();
+            old.execute_batch(
+                "ALTER TABLE review_state DROP COLUMN hard_count; PRAGMA user_version = 6;",
+            )
+            .unwrap();
+        }
+        db.submit_review("kept", Answer::Wrong).unwrap();
+
+        restore_backup(&mut db, &backup_name).unwrap();
+
+        assert_eq!(
+            crate::migrations::current_version(&db.conn).unwrap(),
+            crate::migrations::LATEST_SCHEMA_VERSION
+        );
+        // The progress made up to the backup is back (the wrong answer after it is gone), and
+        // the upgraded card can be answered the new way.
+        let state = db.submit_review("kept", Answer::Hard).unwrap();
+        assert_eq!(state["previousBox"], 2);
+        assert_eq!(state["correctCount"], 1);
+        assert_eq!(state["wrongCount"], 0);
+        assert_eq!(state["hardCount"], 1);
+    }
+
+    #[test]
+    fn a_backup_that_claims_to_be_current_must_have_the_hard_count() {
+        let root = TestDir::new("restore-v7-incomplete");
+        let path = root.0.join(DB_FILENAME);
+        let mut db = Database::open(path.to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        let backup_name = backup_database(&db).unwrap();
+        {
+            let broken = Connection::open(root.0.join("backups").join(&backup_name)).unwrap();
+            broken
+                .execute_batch("ALTER TABLE review_state DROP COLUMN hard_count;")
+                .unwrap();
+        }
+
+        let error = restore_backup(&mut db, &backup_name).unwrap_err();
+        assert!(error.contains("hard_count"), "{error}");
     }
 
     #[test]
@@ -5049,6 +5739,9 @@ mod tests {
         assert_eq!(settings["theme"], "dark");
         assert_eq!(settings["reviewLimit"], 20);
         assert_eq!(settings["sessionGapMinutes"], 30);
+        assert_eq!(settings["enrichDailyTokens"], enrich::DEFAULT_DAILY_TOKENS);
+        assert_eq!(settings["enrichPace"], "normal");
+        assert_eq!(settings["weeklyGoalDays"], 0);
         assert_eq!(settings["autoCheckUpdates"], true);
         assert_eq!(settings["activeDomainProfile"], "general");
         assert_eq!(settings["analysisStyle"], "standard");
@@ -5216,7 +5909,7 @@ mod tests {
 
         word["translation"] = Value::String("已编辑".into());
         db.save_word(&word).unwrap();
-        let state = db.submit_review("alpha", true).unwrap();
+        let state = db.submit_review("alpha", Answer::Correct).unwrap();
         assert_eq!(state["box"], 2);
         assert_eq!(state["lastResult"], "correct");
         db.conn
@@ -5225,7 +5918,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        let state = db.submit_review("alpha", false).unwrap();
+        let state = db.submit_review("alpha", Answer::Wrong).unwrap();
         assert_eq!(state["box"], 1);
         let mastery: String = db
             .conn
@@ -5234,6 +5927,141 @@ mod tests {
             })
             .unwrap();
         assert_eq!(mastery, "new");
+    }
+
+    #[test]
+    fn a_hard_answer_keeps_the_box_and_brings_the_card_back_tomorrow() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        db.save_word(&sample_word("alpha", "Reader", "2026-08-01T10:00:00+08:00"))
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE review_state SET due_at=date('now','localtime'), box=2 WHERE word_id='alpha'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.get_review_queue(Some(20)).unwrap().len(), 1);
+
+        let state = db.submit_review("alpha", Answer::Hard).unwrap();
+
+        assert_eq!(state["box"], 2, "it stays where it was");
+        assert_eq!(state["previousBox"], 2);
+        assert_eq!(state["lastResult"], "hard");
+        assert_eq!(
+            (
+                state["correctCount"].as_i64(),
+                state["hardCount"].as_i64(),
+                state["wrongCount"].as_i64()
+            ),
+            (Some(0), Some(1), Some(0))
+        );
+        let (due, tomorrow): (String, String) = db
+            .conn
+            .query_row(
+                "SELECT due_at, date('now','localtime','+1 day') FROM review_state WHERE word_id='alpha'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(due, tomorrow, "not after the three days of box 2");
+        assert!(
+            db.get_review_queue(Some(20)).unwrap().is_empty(),
+            "it is done for today"
+        );
+        let mastery: String = db
+            .conn
+            .query_row("SELECT mastery FROM words WHERE id='alpha'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(mastery, "learning", "it is neither forgotten nor mastered");
+    }
+
+    #[test]
+    fn the_three_answers_are_counted_apart_and_the_queue_hands_the_counts_on() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        db.save_word(&sample_word("alpha", "Reader", "2026-08-01T10:00:00+08:00"))
+            .unwrap();
+
+        let mut last = Value::Null;
+        for answer in [
+            Answer::Correct,
+            Answer::Correct,
+            Answer::Hard,
+            Answer::Wrong,
+            Answer::Hard,
+        ] {
+            last = db.submit_review("alpha", answer).unwrap();
+        }
+
+        // Up to box 3, a hard answer there, a wrong one back to box 1, a hard one there.
+        assert_eq!(last["box"], 1);
+        assert_eq!(last["lastResult"], "hard");
+        assert_eq!(
+            (
+                last["correctCount"].as_i64(),
+                last["hardCount"].as_i64(),
+                last["wrongCount"].as_i64()
+            ),
+            (Some(2), Some(2), Some(1))
+        );
+        db.conn
+            .execute(
+                "UPDATE review_state SET due_at=date('now','localtime') WHERE word_id='alpha'",
+                [],
+            )
+            .unwrap();
+        let queue = db.get_review_queue(Some(20)).unwrap();
+        assert_eq!(queue[0]["reviewState"]["hardCount"], 2);
+        assert_eq!(queue[0]["reviewState"]["lastResult"], "hard");
+    }
+
+    #[test]
+    fn a_card_whose_word_is_gone_cannot_be_answered_and_says_it_was_deleted() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        db.save_word(&sample_word("alpha", "Reader", "2026-08-01T10:00:00+08:00"))
+            .unwrap();
+        db.delete_words(&["alpha".to_string()]).unwrap();
+
+        // The review screen skips a card on seeing "删除"; any other message makes it stay.
+        for id in ["alpha", "nobody"] {
+            let error = db.submit_review(id, Answer::Hard).unwrap_err();
+            assert!(error.contains("已被删除"), "{error}");
+        }
+    }
+
+    #[test]
+    fn starting_a_card_over_forgets_its_hard_answers_too() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        db.save_word(&sample_word("alpha", "Reader", "2026-08-01T10:00:00+08:00"))
+            .unwrap();
+        db.submit_review("alpha", Answer::Hard).unwrap();
+        db.submit_review("alpha", Answer::Correct).unwrap();
+
+        db.reset_review_state("alpha").unwrap();
+
+        let (box_number, correct, hard, wrong, last): (i64, i64, i64, i64, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT box, correct_count, hard_count, wrong_count, last_result
+                 FROM review_state WHERE word_id='alpha'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!((box_number, correct, hard, wrong, last), (1, 0, 0, 0, None));
     }
 
     #[test]
@@ -5268,7 +6096,7 @@ mod tests {
             .filter_map(|word| word.get("id").and_then(Value::as_str))
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["old", "box-one", "box-two"]);
-        let state = db.submit_review("old", true).unwrap();
+        let state = db.submit_review("old", Answer::Correct).unwrap();
         assert_eq!(state["box"], 3);
 
         let mut paragraph = sample_word("paragraph-off", "Reader", "2026-08-01T12:00:00+08:00");

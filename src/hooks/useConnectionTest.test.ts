@@ -22,7 +22,16 @@ describe('useConnectionTest', () => {
     await act(() => result.current.test());
 
     expect(result.current.state).toEqual({ status: 'ok', latency: 87, model: 'gpt-x-2025' });
-    expect(bridge.testConnection).toHaveBeenCalledWith('https://api.example.com/v1', 'sk-test', 'gpt-x', 'openai');
+    expect(bridge.testConnection).toHaveBeenCalledWith('https://api.example.com/v1', 'sk-test', 'gpt-x', 'openai', false);
+  });
+
+  it('tests the backup service, and not the main one, when it is asked to', async () => {
+    vi.mocked(bridge.testConnection).mockResolvedValue({ ok: true, latency: 41, model: 'gpt-x' });
+    const { result } = renderHook(() => useConnectionTest(provider, true));
+
+    await act(() => result.current.test());
+
+    expect(bridge.testConnection).toHaveBeenCalledWith('https://api.example.com/v1', 'sk-test', 'gpt-x', 'openai', true);
   });
 
   it('shows the real reason a test failed, without the machine-readable code', async () => {

@@ -15,8 +15,11 @@ import { Toast, type ToastMessage } from '../components/ui/Toast';
 import type { Mastery } from '../types/lexnote';
 import { classNames } from '../utils/format';
 import { ReviewOverview } from '../components/review/ReviewOverview';
+import { EnrichmentPanel } from '../components/library/EnrichmentPanel';
 import { ReadingSessions } from '../components/library/ReadingSessions';
 import { HistoryTab } from '../components/library/HistoryTab';
+import { useEnrichment } from '../hooks/useEnrichment';
+import { isBare, isRunActive } from '../lib/enrichment';
 
 /** The list without `value` if it was in it, otherwise with it added. */
 function toggle<T>(list: T[], value: T): T[] {
@@ -42,6 +45,7 @@ export function Library() {
   const [ankiBusy, setAnkiBusy] = useState(false);
   const [sort, setSort] = useState<SortState>({ field: 'savedAt', dir: 'desc' });
   const toastId = useRef(0);
+  const enrichment = useEnrichment();
 
   useEffect(() => {
     const onFocus = () => refreshWords();
@@ -90,6 +94,14 @@ export function Library() {
   const active = useMemo(() => words.find((word) => word.id === activeId) ?? null, [words, activeId]);
   const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
   const selectedWords = useMemo(() => words.filter((word) => selectedSet.has(word.id)), [words, selectedSet]);
+  // Of the selected words, those that have only a meaning, which the batch enrichment can fill in.
+  const enrichableIds = useMemo(() => selectedWords.filter(isBare).map((word) => word.id), [selectedWords]);
+  const enrichBlocked =
+    enrichment.status && isRunActive(enrichment.status.progress.state)
+      ? '已经有一轮补全在进行，请先暂停或停止它'
+      : enrichment.busy
+        ? '正在提交…'
+        : undefined;
   // "All" means every word that is listed, however many others are selected out of sight.
   const allSelected = sorted.length > 0 && sorted.every((word) => selectedSet.has(word.id));
 
@@ -138,6 +150,7 @@ export function Library() {
 
         <div className="flex min-w-0 flex-1 flex-col">
           <ReviewOverview />
+          <EnrichmentPanel enrichment={enrichment} />
           <LibraryToolbar
             query={query}
             onQueryChange={setQuery}
@@ -171,6 +184,9 @@ export function Library() {
                 batchTag={batchTag}
                 ankiEnabled={Boolean(settings.anki?.enabled)}
                 ankiBusy={ankiBusy}
+                enrichableCount={enrichableIds.length}
+                enrichBlocked={enrichBlocked}
+                onEnrich={() => void enrichment.start(enrichableIds)}
                 onBatchTagChange={setBatchTag}
                 onApplyTag={() => {
                   const tag = batchTag.trim().toLowerCase();

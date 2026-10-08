@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { DEFAULT_PROVIDER, DEFAULT_TEMPLATES } from '../data/providers';
+import { DEFAULT_BACKUP_PROVIDER, DEFAULT_PROVIDER, DEFAULT_TEMPLATES } from '../data/providers';
 import type {
   AppSettings,
   CaptureMethod,
@@ -9,11 +9,13 @@ import type {
   PromptTemplate,
   SavedWord,
 } from '../types/lexnote';
+import { DEFAULT_ENRICH_PACE, DEFAULT_ENRICH_TOKENS } from '../lib/enrichment';
 import * as bridge from '../lib/tauri-bridge';
 import { upsertSavedWord } from '../lib/words';
 
 const DEFAULT_SETTINGS: AppSettings = {
   provider: DEFAULT_PROVIDER,
+  backupProvider: DEFAULT_BACKUP_PROVIDER,
   clipboardWatch: true,
   theme: 'system',
   cardScale: 'default',
@@ -43,6 +45,9 @@ const DEFAULT_SETTINGS: AppSettings = {
   reviewLimit: 20,
   includeLongFormReview: false,
   sessionGapMinutes: 30,
+  enrichDailyTokens: DEFAULT_ENRICH_TOKENS,
+  enrichPace: DEFAULT_ENRICH_PACE,
+  weeklyGoalDays: 0,
   activeDomainProfile: 'general',
   analysisStyle: 'standard',
   autoCheckUpdates: true,
@@ -62,31 +67,34 @@ const DEFAULT_SETTINGS: AppSettings = {
   },
 };
 
-type SettingsPatch = Omit<Partial<AppSettings>, 'provider'> & {
+type SettingsPatch = Omit<Partial<AppSettings>, 'provider' | 'backupProvider'> & {
   provider?: Partial<AppSettings['provider']>;
+  backupProvider?: Partial<AppSettings['backupProvider']>;
 };
 
 function applySettingsPatch(base: AppSettings, patch: SettingsPatch): AppSettings {
-  const { provider, ...rest } = patch;
+  const { provider, backupProvider, ...rest } = patch;
   return {
     ...base,
     ...rest,
     ...(provider ? { provider: { ...base.provider, ...provider } } : {}),
+    ...(backupProvider ? { backupProvider: { ...base.backupProvider, ...backupProvider } } : {}),
   };
+}
+
+/** What `patch` changes of `current`: a patch that is queued must not carry (and later overwrite) more. */
+function changedFields<T extends object>(current: T, patch: Partial<T>): Partial<T> {
+  const changed: Partial<T> = {};
+  for (const key of Object.keys(patch) as Array<keyof T>) {
+    if (patch[key] !== current[key]) changed[key] = patch[key];
+  }
+  return changed;
 }
 
 function normalizeSettingsPatch(base: AppSettings, patch: SettingsPatch): SettingsPatch {
   const normalized: SettingsPatch = { ...patch };
-  if (patch.provider) {
-    const providerPatch: Partial<AppSettings['provider']> = {};
-    for (const key of Object.keys(patch.provider) as Array<keyof AppSettings['provider']>) {
-      const value = patch.provider[key];
-      if (value !== base.provider[key]) {
-        (providerPatch as Record<string, unknown>)[key] = value;
-      }
-    }
-    normalized.provider = providerPatch;
-  }
+  if (patch.provider) normalized.provider = changedFields(base.provider, patch.provider);
+  if (patch.backupProvider) normalized.backupProvider = changedFields(base.backupProvider, patch.backupProvider);
   return normalized;
 }
 
@@ -225,6 +233,7 @@ export function LexNoteProvider({
           ...DEFAULT_SETTINGS,
           ...saved,
           provider: { ...DEFAULT_PROVIDER, ...saved.provider },
+          backupProvider: { ...DEFAULT_BACKUP_PROVIDER, ...saved.backupProvider },
         } as AppSettings;
         confirmedSettingsRef.current = merged;
         const optimistic = pendingSettingsRef.current.reduce(applySettingsPatch, merged);

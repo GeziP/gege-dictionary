@@ -1,4 +1,5 @@
 import type { Entry, SavedWord, SelectionKind } from '../types/lexnote';
+import { lemmaKey } from './history';
 
 /** Longest tag the backend accepts, counted in characters. */
 export const MAX_TAG_CHARS = 32;
@@ -40,16 +41,37 @@ export function reanalysisRequest(word: SavedWord): {
 }
 
 /**
+ * The form a new answer gives a word, when that is not the form the word is
+ * saved under: "running" was saved and the model says "run". Spacing and
+ * letter case do not make another form (the backend tells words apart the same
+ * way), and an answer that names nothing names no other form.
+ */
+export function otherLemma(
+  word: Pick<SavedWord, 'lemma'>,
+  entry: Pick<Entry, 'lemma'>,
+): string | null {
+  const named = (entry.lemma ?? '').trim();
+  if (!named || lemmaKey(named) === lemmaKey(word.lemma)) return null;
+  return named;
+}
+
+/**
  * The document to save after a saved word was analysed again: the new answer
  * for everything the model writes, on top of the stored word for everything
- * else (identity, progress, note, tags, where and when it was collected). The
- * backend merges by id as well; this keeps the same promise where there is no
- * backend to do it, and makes the intent readable at the call site.
+ * else (identity, the form it is saved under, progress, note, tags, where and
+ * when it was collected). The backend merges by id as well; this keeps the same
+ * promise where there is no backend to do it, and makes the intent readable at
+ * the call site.
+ *
+ * The word keeps its form even when the answer names another one: what to do
+ * with that is for the user to say (see `separateDraft`), not for a save to
+ * decide by renaming the word.
  */
 export function reanalysisDraft(word: SavedWord, entry: Entry): SavedWord {
   return {
     ...entry,
     id: word.id,
+    lemma: word.lemma,
     savedAt: word.savedAt,
     context: word.context,
     sourceApp: word.sourceApp,
@@ -79,4 +101,51 @@ export function rollbackDraft(current: SavedWord, before: SavedWord): SavedWord 
     ankiNoteId: current.ankiNoteId ?? before.ankiNoteId,
     reviewState: current.reviewState ?? before.reviewState,
   };
+}
+
+/** An id for a word that is not saved yet; the backend keeps whatever it is given. */
+export function newWordId(): string {
+  return `w-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * The document that saves a re-analysis as a word of its own, under the form
+ * the answer names: a new word, or the one the library has under that form
+ * already (the backend refreshes it and keeps what the user owns there, so
+ * nothing is made twice). It is collected where the word it came from was; the
+ * tags and the note of that word stay with it.
+ */
+export function separateDraft(
+  word: SavedWord,
+  entry: Entry,
+  existing: SavedWord | null,
+): SavedWord {
+  return {
+    ...entry,
+    id: existing?.id ?? newWordId(),
+    savedAt: new Date().toISOString(),
+    context: word.context,
+    sourceApp: word.sourceApp,
+    sourceTitle: word.sourceTitle,
+    tags: [],
+    mastery: 'new',
+    lookups: 1,
+    note: '',
+  };
+}
+
+/**
+ * Whether the user has done nothing with a word since it was saved as `saved`:
+ * no mastery, note or tag, no further lookup, no Anki card. Only then does
+ * deleting it, to take back the save that made it, lose nothing but the save.
+ */
+export function untouchedSince(saved: SavedWord, now: SavedWord): boolean {
+  return (
+    now.mastery === saved.mastery &&
+    now.note === saved.note &&
+    now.lookups === saved.lookups &&
+    now.ankiNoteId === saved.ankiNoteId &&
+    now.tags.length === saved.tags.length &&
+    now.tags.every((tag, index) => tag === saved.tags[index])
+  );
 }

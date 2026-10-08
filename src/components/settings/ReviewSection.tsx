@@ -8,7 +8,10 @@ export function ReviewSection() {
   const { settings, updateSettings } = useLexNote();
   return (
     <div className="space-y-4">
-      <SettingsSection title="每日回顾" description="三档轻量复习：答对后间隔 1 / 3 / 7 天，答错回到第一档。">
+      <SettingsSection
+        title="每日回顾"
+        description="三档轻量复习（各档间隔 1 / 3 / 7 天）：认识升一档，有点难留在原档、明天再见，不认识回到第一档、明天再见。"
+      >
         <label className="block text-xs text-ink-muted">
           每日上限
           <Select

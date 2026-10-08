@@ -1,13 +1,21 @@
 import { describe, expect, it } from 'vitest';
-import type { InsightsDay } from '../types/lexnote';
-import { blankInsights, insightsFixture } from './insights.fixture';
+import type { InsightsDay, ReviewCalendarDay } from '../types/lexnote';
+import { blankInsights, insightsFixture, reviewCalendarFixture } from './insights.fixture';
 import {
   accuracyPercent,
   busiestDay,
+  busiestReviewDay,
+  calendarWeeks,
   chartBars,
   dayLabel,
+  describeAnswers,
+  describeCalendar,
   describeCounts,
   describeDay,
+  describeHardWord,
+  describeReviewDay,
+  hardWordWeight,
+  heatLevel,
   isBlank,
   masterySegments,
   rankShare,
@@ -15,6 +23,13 @@ import {
 } from './insights';
 
 const day = (date: string, lookups = 0, saved = 0, reviews = 0): InsightsDay => ({ date, lookups, saved, reviews });
+const reviewed = (date: string, correct = 0, hard = 0, wrong = 0, unknown = 0): ReviewCalendarDay => ({
+  date,
+  total: correct + hard + wrong + unknown,
+  correct,
+  hard,
+  wrong,
+});
 
 describe('accuracyPercent', () => {
   it('is not a number until something has been answered', () => {
@@ -32,6 +47,90 @@ describe('accuracyPercent', () => {
     expect(accuracyPercent(0, 5)).toBe(0);
     expect(accuracyPercent(999, 1)).toBe(99); // 99.9 rounds to 100, which would hide the mistake
     expect(accuracyPercent(1, 999)).toBe(1); // 0.1 rounds to 0, which would hide the success
+  });
+
+  it('does not count a card that was found hard as a right answer', () => {
+    expect(accuracyPercent(6, 2, 2)).toBe(60);
+    expect(accuracyPercent(3, 0, 1)).toBe(75);
+    expect(accuracyPercent(0, 0, 4)).toBe(0);
+    expect(accuracyPercent(1, 0, 0)).toBe(100);
+    expect(accuracyPercent(999, 0, 1)).toBe(99); // it was not all right, and the number says so
+  });
+});
+
+describe('describing the answers', () => {
+  it('names right and wrong answers always, and hard ones only when there were some', () => {
+    expect(describeAnswers({ correct: 75, hard: 0, wrong: 25 })).toBe('答对 75 次，答错 25 次');
+    expect(describeAnswers({ correct: 75, hard: 10, wrong: 15 })).toBe('答对 75 次，有点难 10 次，答错 15 次');
+  });
+
+  it('names what makes a word hard, in the order of how much it weighs', () => {
+    expect(describeHardWord({ wrong: 4, hard: 0 })).toBe('答错 4 次');
+    expect(describeHardWord({ wrong: 0, hard: 3 })).toBe('有点难 3 次');
+    expect(describeHardWord({ wrong: 1, hard: 3 })).toBe('答错 1 次 · 有点难 3 次');
+  });
+
+  it('weighs forgetting a word twice as much as finding it hard, as the backend ranks them', () => {
+    expect(hardWordWeight({ wrong: 1, hard: 0 })).toBe(2);
+    expect(hardWordWeight({ wrong: 0, hard: 3 })).toBe(3);
+    expect(hardWordWeight({ wrong: 2, hard: 1 })).toBe(5);
+  });
+});
+
+describe('the review calendar', () => {
+  it('is dark in proportion to the busiest day, and never blank for a day with an answer', () => {
+    expect(heatLevel(0, 12)).toBe(0);
+    expect(heatLevel(12, 12)).toBe(4);
+    expect(heatLevel(6, 12)).toBe(2);
+    expect(heatLevel(7, 12)).toBe(3);
+    expect(heatLevel(1, 1000)).toBe(1);
+    expect(heatLevel(3, 0)).toBe(0);
+    expect(heatLevel(-1, 5)).toBe(0);
+  });
+
+  it('finds the busiest day', () => {
+    expect(busiestReviewDay([])).toBe(0);
+    expect(busiestReviewDay([reviewed('2026-10-05', 2), reviewed('2026-10-06', 3, 4, 1), reviewed('2026-10-07')])).toBe(8);
+  });
+
+  it('is laid out in weeks that run from Monday, the last one up to today', () => {
+    const weeks = calendarWeeks(reviewCalendarFixture());
+
+    expect(weeks).toHaveLength(12);
+    expect(weeks.slice(0, 11).every((week) => week.length === 7)).toBe(true);
+    expect(weeks[11].map((cell) => cell.day.date)).toEqual(['2026-10-05', '2026-10-06', '2026-10-07']);
+    // Each week begins on a Monday: 20 July 2026 was one.
+    expect(dayLabel(weeks[0][0].day.date)).toBe('7月20日 周一');
+    expect(dayLabel(weeks[11][0].day.date)).toBe('10月5日 周一');
+    expect(weeks.flat()).toHaveLength(80);
+  });
+
+  it('shades the days by how much was reviewed on them', () => {
+    const cells = calendarWeeks(reviewCalendarFixture()).flat();
+    const level = (date: string) => cells.find((cell) => cell.day.date === date)?.level;
+
+    expect(level('2026-10-01')).toBe(4); // 8 cards, the busiest day
+    expect(level('2026-10-06')).toBe(2); // 3 of 8
+    expect(level('2026-09-28')).toBe(1); // 2 of 8
+    expect(level('2026-10-02')).toBe(0);
+  });
+
+  it('has no weeks while it has no days', () => {
+    expect(calendarWeeks({ first: '2026-10-05', weeks: 12, days: [] })).toEqual([]);
+  });
+
+  it('says what happened on a day, and how the cards were answered', () => {
+    expect(describeReviewDay(reviewed('2026-10-07'))).toBe('10月7日 周三：没有复习');
+    expect(describeReviewDay(reviewed('2026-10-06', 9, 2, 1))).toBe('10月6日 周二：复习 12 张（答对 9，有点难 2，答错 1）');
+    expect(describeReviewDay(reviewed('2026-10-06', 3))).toBe('10月6日 周二：复习 3 张（答对 3）');
+    // Cards answered before the kind of answer was recorded are not made up into one.
+    expect(describeReviewDay(reviewed('2026-10-05', 1, 0, 0, 4))).toBe('10月5日 周一：复习 5 张（答对 1，未记录 4）');
+    expect(describeReviewDay(reviewed('2026-10-05', 0, 0, 0, 2))).toBe('10月5日 周一：复习 2 张（未记录 2）');
+  });
+
+  it('sums up the weeks it covers', () => {
+    expect(describeCalendar(reviewCalendarFixture())).toBe('近 12 周复习了 13 张，分布在 3 天');
+    expect(describeCalendar(reviewCalendarFixture({}))).toBe('近 12 周没有复习');
   });
 });
 
