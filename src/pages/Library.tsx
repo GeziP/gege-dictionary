@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence } from 'framer-motion';
 
 import { useLexNote } from '../contexts/LexNoteContext';
@@ -6,7 +6,8 @@ import { WindowFrame } from '../components/shell/WindowFrame';
 import { FilterPanel } from '../components/library/FilterPanel';
 import { LibraryToolbar, READER_MAX, READER_MIN } from '../components/library/LibraryToolbar';
 import { SelectionBar } from '../components/library/SelectionBar';
-import { WordTable, type SortState } from '../components/library/WordTable';
+import { WordTable } from '../components/library/WordTable';
+import { filterWords, sortWords, type SortState } from '../lib/library-list';
 import { WordDetail } from '../components/library/WordDetail';
 import { ExportDialog } from '../components/library/ExportDialog';
 import { ImportDialog } from '../components/library/ImportDialog';
@@ -15,8 +16,12 @@ import type { Mastery } from '../types/lexnote';
 import { classNames } from '../utils/format';
 import { ReviewOverview } from '../components/review/ReviewOverview';
 import { ReadingSessions } from '../components/library/ReadingSessions';
+import { HistoryTab } from '../components/library/HistoryTab';
 
-const MASTERY_ORDER: Record<string, number> = { new: 0, learning: 1, familiar: 2, mastered: 3 };
+/** The list without `value` if it was in it, otherwise with it added. */
+function toggle<T>(list: T[], value: T): T[] {
+  return list.includes(value) ? list.filter((item) => item !== value) : [...list, value];
+}
 
 export function Library() {
   const { words, removeWords, tagWords, batchSetMastery, refreshWords, settings, updateSettings } = useLexNote();
@@ -33,7 +38,7 @@ export function Library() {
   const [importOpen, setImportOpen] = useState(false);
   const [batchTag, setBatchTag] = useState('');
   const [toast, setToast] = useState<ToastMessage | null>(null);
-  const [viewMode, setViewMode] = useState<'words' | 'sessions'>('words');
+  const [viewMode, setViewMode] = useState<'words' | 'sessions' | 'history'>('words');
   const [ankiBusy, setAnkiBusy] = useState(false);
   const [sort, setSort] = useState<SortState>({ field: 'savedAt', dir: 'desc' });
   const toastId = useRef(0);
@@ -66,63 +71,50 @@ export function Library() {
     setToast({ id: toastId.current, text, tone, ...action });
   };
 
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    const cutoff = range === 'all' ? 0 : Date.now() - Number(range) * 86_400_000;
-    return words.filter((word) => {
-      if (q) {
-        const haystack = [
-        word.lemma,
-        word.translation,
-        word.contextMeaning,
-        word.explanation,
-        word.context,
-        ...word.examples.map((example) => `${example.en} ${example.zh}`)].
+  // The box itself follows the keys at once; the list catches up when the browser has a moment,
+  // so typing stays smooth in a library of thousands of words.
+  const deferredQuery = useDeferredValue(query);
+  const filtered = useMemo(
+    () =>
+      filterWords(words, {
+        query: deferredQuery,
+        tags: tagFilters,
+        sources: sourceFilters,
+        mastery: masteryFilters,
+        range,
+      }),
+    [words, deferredQuery, tagFilters, sourceFilters, masteryFilters, range],
+  );
+  const sorted = useMemo(() => sortWords(filtered, sort), [filtered, sort]);
 
-        join(' ').
-        toLowerCase();
-        if (!haystack.includes(q)) return false;
+  const active = useMemo(() => words.find((word) => word.id === activeId) ?? null, [words, activeId]);
+  const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+  const selectedWords = useMemo(() => words.filter((word) => selectedSet.has(word.id)), [words, selectedSet]);
+  // "All" means every word that is listed, however many others are selected out of sight.
+  const allSelected = sorted.length > 0 && sorted.every((word) => selectedSet.has(word.id));
+
+  const toggleSelect = useCallback((id: string) => setSelectedIds((prev) => toggle(prev, id)), []);
+  // The box in the table header is for the listed words only: it adds them to the choice, or,
+  // when they are all in it already, takes them out; what was chosen before the list was
+  // narrowed down is left as it is.
+  const toggleAll = useCallback(() => {
+    const listed = sorted.map((word) => word.id);
+    setSelectedIds((prev) => {
+      if (allSelected) {
+        const gone = new Set(listed);
+        return prev.filter((id) => !gone.has(id));
       }
-      if (tagFilters.length && !tagFilters.every((tag) => word.tags.includes(tag))) return false;
-      if (sourceFilters.length && !sourceFilters.includes(word.sourceApp)) return false;
-      if (masteryFilters.length && !masteryFilters.includes(word.mastery)) return false;
-      if (cutoff && new Date(word.savedAt).getTime() < cutoff) return false;
-      return true;
+      const have = new Set(prev);
+      return [...prev, ...listed.filter((id) => !have.has(id))];
     });
-  }, [words, query, tagFilters, sourceFilters, masteryFilters, range]);
-
-  const sorted = useMemo(() => {
-    const list = [...filtered];
-    const { field, dir } = sort;
-    const mul = dir === 'asc' ? 1 : -1;
-    list.sort((a, b) => {
-      switch (field) {
-        case 'lemma':
-          return mul * a.lemma.localeCompare(b.lemma, 'en', { sensitivity: 'base' });
-        case 'savedAt':
-          return mul * (new Date(a.savedAt).getTime() - new Date(b.savedAt).getTime());
-        case 'lookups':
-          return mul * (a.lookups - b.lookups);
-        case 'mastery':
-          return mul * ((MASTERY_ORDER[a.mastery] ?? 0) - (MASTERY_ORDER[b.mastery] ?? 0));
-        default:
-          return 0;
-      }
-    });
-    return list;
-  }, [filtered, sort]);
-
-  const active = words.find((word) => word.id === activeId) ?? null;
-  const selectedWords = words.filter((word) => selectedIds.includes(word.id));
-
-  const toggle = <T,>(list: T[], value: T) =>
-  list.includes(value) ? list.filter((item) => item !== value) : [...list, value];
+  }, [allSelected, sorted]);
 
   return (
     <WindowFrame title="生词库">
       <div className="flex h-10 shrink-0 items-center gap-1 border-b border-line bg-surface px-3">
         <button type="button" onClick={() => setViewMode('words')} className={classNames('h-full border-b-2 px-3 text-xs', viewMode === 'words' ? 'border-accent text-accent' : 'border-transparent text-ink-muted')}>词条</button>
         <button type="button" onClick={() => setViewMode('sessions')} className={classNames('h-full border-b-2 px-3 text-xs', viewMode === 'sessions' ? 'border-accent text-accent' : 'border-transparent text-ink-muted')}>会话</button>
+        <button type="button" onClick={() => setViewMode('history')} className={classNames('h-full border-b-2 px-3 text-xs', viewMode === 'history' ? 'border-accent text-accent' : 'border-transparent text-ink-muted')}>历史</button>
       </div>
       {viewMode === 'words' ? (
       <div className="relative flex min-h-0 flex-1">
@@ -162,14 +154,13 @@ export function Library() {
           <WordTable
             words={sorted}
             density={density}
-            selectedIds={selectedIds}
+            selectedIds={selectedSet}
+            allSelected={allSelected}
             activeId={activeId}
             sort={sort}
             onSortChange={setSort}
-            onToggleSelect={(id) => setSelectedIds((prev) => toggle(prev, id))}
-            onToggleAll={() =>
-            setSelectedIds(selectedIds.length === sorted.length ? [] : sorted.map((word) => word.id))
-            }
+            onToggleSelect={toggleSelect}
+            onToggleAll={toggleAll}
             onActivate={setActiveId} />
           
 
@@ -252,7 +243,7 @@ export function Library() {
 
         <Toast message={toast} />
       </div>
-      ) : <ReadingSessions />}
+      ) : viewMode === 'sessions' ? <ReadingSessions /> : <HistoryTab />}
     </WindowFrame>);
 
 }

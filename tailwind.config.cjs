@@ -1,3 +1,38 @@
+/**
+ * The theme colours are CSS variables (src/index.css), so that light and dark share one set
+ * of classes. Tailwind cannot add transparency to a variable by itself: a class such as
+ * `bg-danger/5` or `border-line/60` then produces no CSS at all, which left every tinted
+ * error banner in the app without its tint. Mixing the variable with `transparent` is the
+ * same thing as an alpha channel.
+ */
+const THEME_COLORS = [
+  'canvas',
+  'surface',
+  'raised',
+  'sunken',
+  'line',
+  'line-strong',
+  'ink',
+  'ink-muted',
+  'ink-subtle',
+  'accent',
+  'accent-hover',
+  'accent-soft',
+  'accent-line',
+  'accent-ink',
+  'positive',
+  'warn',
+  'danger',
+  'highlight',
+];
+
+const themeColor = (name) => ({ opacityValue }) => {
+  const alpha = Number.parseFloat(opacityValue);
+  // No modifier, or Tailwind's own `--tw-*-opacity` variable: the colour as it is.
+  if (!Number.isFinite(alpha)) return `var(--${name})`;
+  return `color-mix(in srgb, var(--${name}) ${Math.round(alpha * 10000) / 100}%, transparent)`;
+};
+
 /** @type {import('tailwindcss').Config} */
 module.exports = {
   darkMode: 'class',
@@ -7,26 +42,7 @@ module.exports = {
   ],
   theme: {
     extend: {
-      colors: {
-        canvas: 'var(--canvas)',
-        surface: 'var(--surface)',
-        raised: 'var(--raised)',
-        sunken: 'var(--sunken)',
-        line: 'var(--line)',
-        'line-strong': 'var(--line-strong)',
-        ink: 'var(--ink)',
-        'ink-muted': 'var(--ink-muted)',
-        'ink-subtle': 'var(--ink-subtle)',
-        accent: 'var(--accent)',
-        'accent-hover': 'var(--accent-hover)',
-        'accent-soft': 'var(--accent-soft)',
-        'accent-line': 'var(--accent-line)',
-        'accent-ink': 'var(--accent-ink)',
-        positive: 'var(--positive)',
-        warn: 'var(--warn)',
-        danger: 'var(--danger)',
-        highlight: 'var(--highlight)',
-      },
+      colors: Object.fromEntries(THEME_COLORS.map((name) => [name, themeColor(name)])),
       fontFamily: {
         sans: ['Inter', 'Segoe UI', 'system-ui', 'sans-serif'],
         serif: ['"Gentium Book Plus"', '"Charis SIL"', 'Georgia', 'serif'],

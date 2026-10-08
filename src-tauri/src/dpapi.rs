@@ -19,7 +19,7 @@ pub fn encrypt(plaintext: &str) -> Result<String, String> {
     }
 
     let data_bytes = plaintext.as_bytes();
-    let mut data_in = CRYPT_INTEGER_BLOB {
+    let data_in = CRYPT_INTEGER_BLOB {
         cbData: data_bytes.len() as u32,
         pbData: data_bytes.as_ptr() as *mut u8,
     };
@@ -32,7 +32,7 @@ pub fn encrypt(plaintext: &str) -> Result<String, String> {
 
     unsafe {
         let ok = CryptProtectData(
-            &mut data_in,
+            &data_in,
             PCWSTR(description.as_ptr()),
             None,
             None,
@@ -41,7 +41,7 @@ pub fn encrypt(plaintext: &str) -> Result<String, String> {
             &mut data_out,
         );
 
-        if !ok.is_ok() {
+        if ok.is_err() {
             return Err("DPAPI CryptProtectData failed".to_string());
         }
 
@@ -66,7 +66,7 @@ pub fn decrypt(ciphertext: &str) -> Result<String, String> {
     let encrypted_bytes =
         base64_decode(encoded).map_err(|e| format!("Base64 decode failed: {e}"))?;
 
-    let mut data_in = CRYPT_INTEGER_BLOB {
+    let data_in = CRYPT_INTEGER_BLOB {
         cbData: encrypted_bytes.len() as u32,
         pbData: encrypted_bytes.as_ptr() as *mut u8,
     };
@@ -77,7 +77,7 @@ pub fn decrypt(ciphertext: &str) -> Result<String, String> {
 
     unsafe {
         let ok = CryptUnprotectData(
-            &mut data_in,
+            &data_in,
             None,
             None,
             None,
@@ -86,7 +86,7 @@ pub fn decrypt(ciphertext: &str) -> Result<String, String> {
             &mut data_out,
         );
 
-        if !ok.is_ok() {
+        if ok.is_err() {
             return Err("DPAPI CryptUnprotectData failed — key may have been encrypted on a different user/machine".to_string());
         }
 
@@ -102,7 +102,7 @@ pub fn decrypt(ciphertext: &str) -> Result<String, String> {
 
 fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };

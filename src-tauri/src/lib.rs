@@ -5,16 +5,17 @@ mod db;
 #[cfg(windows)]
 mod dpapi;
 mod glossary;
+mod insights;
 mod llm;
 mod lookup;
 mod migrations;
 mod ocr;
 mod tts;
+mod watch_switch;
 mod word_import;
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{
@@ -24,12 +25,38 @@ use tauri::{
     AppHandle, Manager,
 };
 
+/// Puts the position of the "划词即查" switch (`true` is on) on the tray menu's check mark.
+type WatchMarker = Arc<dyn Fn(bool) + Send + Sync>;
+
 pub(crate) struct AppState {
     pub db: Mutex<db::Database>,
     pub last_capture: Mutex<Option<serde_json::Value>>,
-    pub clipboard_enabled: Arc<AtomicBool>,
+    /// "划词即查" on or off, and the pause that can be running on it.
+    pub watch: watch_switch::WatchSwitch,
+    /// Set once the tray exists. It is a closure, not the menu item itself: the item carries
+    /// the whole Tauri runtime with it, which would make every test binary load the system
+    /// dialogs (and fail to start without the manifest an installed app has).
+    pub show_watch_mark: Mutex<Option<WatchMarker>>,
     pub last_looked_up: Mutex<Option<clipboard_watcher::ClipboardFingerprint>>,
     pub startup_warnings: Mutex<Vec<db::StartupWarning>>,
+}
+
+impl AppState {
+    /// Makes the tray menu's check mark say where the "划词即查" switch is. Clicking the item
+    /// flips the mark by itself, but nothing else does (a pause, the settings page), and
+    /// `AppHandle::menu` is the app-wide menu, not the tray's.
+    pub(crate) fn show_watch_state(&self) {
+        // Cloned out of the lock first: setting the mark waits for the UI thread, which may
+        // itself be waiting for this lock.
+        let show = self
+            .show_watch_mark
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(show) = show {
+            show(self.watch.is_on());
+        }
+    }
 }
 
 fn default_data_dir_from(app_data: Option<PathBuf>, known_data_dir: Option<PathBuf>) -> PathBuf {
@@ -77,6 +104,14 @@ pub(crate) fn cache_ttl_days(settings: &serde_json::Value) -> i64 {
         .and_then(|v| v.as_i64())
         .filter(|days| matches!(*days, 0 | 7 | 30 | 90))
         .unwrap_or(30)
+}
+
+/// Whether answered lookups are remembered in the history: on, unless the user turned it off.
+pub(crate) fn history_enabled(settings: &serde_json::Value) -> bool {
+    settings
+        .get("historyEnabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
 }
 
 fn ocr_settings(settings: &serde_json::Value) -> (bool, String) {
@@ -198,7 +233,11 @@ fn migrate_api_key_storage(database: &db::Database) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn record_event(state: &tauri::State<'_, AppState>, event: &str, extra: serde_json::Value) {
+pub(crate) fn record_event(
+    state: &tauri::State<'_, AppState>,
+    event: &str,
+    extra: serde_json::Value,
+) {
     if let Ok(db) = state.db.lock() {
         let _ = db.record_local_event(event, &extra);
     }
@@ -252,13 +291,50 @@ async fn search_words(
     )
 }
 
+/// Saves the outcome of a lookup. A word that is already in the library is
+/// merged with it (the user's mastery, note, tags and Anki link survive) rather
+/// than overwritten, and the document as stored is returned.
 #[tauri::command]
 async fn save_word(
+    state: tauri::State<'_, AppState>,
+    word: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.save_lookup_result(&word)
+}
+
+/// Puts a word back exactly as given. Undo and rollback need a plain overwrite
+/// to return to the state from before a merge; `save_word` would merge again.
+#[tauri::command]
+async fn restore_word(
     state: tauri::State<'_, AppState>,
     word: serde_json::Value,
 ) -> Result<(), String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.save_word(&word)
+}
+
+/// The saved word for a lemma (case/whitespace-insensitive), if any. Lets the
+/// lookup window ask about one word instead of loading the whole library.
+#[tauri::command]
+async fn find_word_by_lemma(
+    state: tauri::State<'_, AppState>,
+    lemma: String,
+    kind: Option<String>,
+) -> Result<Option<serde_json::Value>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.find_word_by_lemma(&lemma, kind.as_deref())
+}
+
+/// One transactional change (mastery, tags to add/remove) for many words.
+#[tauri::command]
+async fn batch_update_words(
+    state: tauri::State<'_, AppState>,
+    ids: Vec<String>,
+    patch: db::BatchWordPatch,
+) -> Result<db::BatchUpdateReport, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.batch_update_words(&ids, &patch)
 }
 
 #[tauri::command]
@@ -302,6 +378,16 @@ async fn submit_review(
         serde_json::json!({ "result": if correct { "correct" } else { "wrong" } }),
     );
     Ok(result)
+}
+
+/// Streak, activity chart, mastery and review figures, and a few short rankings.
+#[tauri::command]
+async fn get_learning_insights(
+    state: tauri::State<'_, AppState>,
+    days: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.learning_insights(days.unwrap_or(30))
 }
 
 #[tauri::command]
@@ -491,7 +577,9 @@ async fn save_settings(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
         {
-            if lookup::is_placeholder_api_key(&key_val) || (key_val.is_empty() && !stored_key.is_empty()) {
+            if lookup::is_placeholder_api_key(&key_val)
+                || (key_val.is_empty() && !stored_key.is_empty())
+            {
                 eprintln!("[save_settings] placeholder/empty apiKey; keeping stored ciphertext");
                 provider.insert("apiKey".to_string(), serde_json::Value::String(stored_key));
             } else {
@@ -649,20 +737,26 @@ async fn get_usage(state: tauri::State<'_, AppState>) -> Result<serde_json::Valu
     db.get_usage()
 }
 
+/// Read `text` aloud. Resolves when playback finishes (or is superseded or
+/// stopped), so the UI can reflect the real speaking state.
 #[tauri::command]
-async fn increment_usage(state: tauri::State<'_, AppState>, tokens: u32) -> Result<(), String> {
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.increment_usage(tokens)
+async fn speak_text(text: String, voice: String, rate: f64) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || tts::speak_blocking(&text, &voice, rate))
+        .await
+        .map_err(|e| format!("朗读任务失败: {e}"))?
 }
 
 #[tauri::command]
-async fn speak_text(text: String, voice: String, rate: f64) -> Result<(), String> {
-    tts::speak(&text, &voice, rate)
+async fn stop_speaking() -> Result<(), String> {
+    tts::stop();
+    Ok(())
 }
 
 #[tauri::command]
 async fn list_voices() -> Result<Vec<String>, String> {
-    tts::list_voices()
+    tokio::task::spawn_blocking(tts::list_voices)
+        .await
+        .map_err(|e| format!("语音列表任务失败: {e}"))?
 }
 
 #[tauri::command]
@@ -739,6 +833,59 @@ async fn get_startup_warnings(
 async fn clear_cache(state: tauri::State<'_, AppState>) -> Result<u64, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.clear_cache()
+}
+
+/// The lookup history, newest first.
+#[tauri::command]
+async fn get_lookup_history(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.list_history()
+}
+
+#[tauri::command]
+async fn delete_lookup_history(
+    state: tauri::State<'_, AppState>,
+    ids: Vec<i64>,
+) -> Result<u64, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.delete_history(&ids)
+}
+
+#[tauri::command]
+async fn clear_lookup_history(state: tauri::State<'_, AppState>) -> Result<u64, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    db.clear_history()
+}
+
+/// Open the lookup window on a history entry. It asks exactly what was asked the first time,
+/// so an answer that is still cached appears at once and costs nothing.
+#[tauri::command]
+async fn reopen_lookup_from_history(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: i64,
+) -> Result<(), String> {
+    let question = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        db.history_lookup(id)?
+    }
+    .ok_or("这条历史记录已经不存在了")?;
+    let kind = question
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("word")
+        .to_string();
+    let mut capture = question;
+    if let Some(object) = capture.as_object_mut() {
+        object.insert("method".into(), serde_json::json!("history"));
+    }
+    if let Ok(mut last) = state.last_capture.lock() {
+        *last = Some(capture);
+    }
+    clipboard_watcher::open_or_reuse_lookup_public(&app, kind == "paragraph");
+    Ok(())
 }
 
 #[tauri::command]
@@ -835,7 +982,10 @@ async fn get_last_capture(state: tauri::State<'_, AppState>) -> Result<serde_jso
     } else {
         let sel = val.get("selection").and_then(|v| v.as_str()).unwrap_or("");
         let kind = val.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-        eprintln!("[get_last_capture] returned {}", lookup::selection_meta(sel, kind));
+        eprintln!(
+            "[get_last_capture] returned {}",
+            lookup::selection_meta(sel, kind)
+        );
     }
     Ok(val)
 }
@@ -874,15 +1024,14 @@ async fn save_file_dialog(
 
 #[tauri::command]
 async fn toggle_clipboard_watch(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    let prev = state.clipboard_enabled.load(Ordering::Relaxed);
-    let next = !prev;
-    state.clipboard_enabled.store(next, Ordering::Relaxed);
-    Ok(next)
+    let on = state.watch.toggle();
+    state.show_watch_state();
+    Ok(on)
 }
 
 #[tauri::command]
 async fn get_clipboard_watch_status(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    Ok(state.clipboard_enabled.load(Ordering::Relaxed))
+    Ok(state.watch.is_on())
 }
 
 #[tauri::command]
@@ -1111,15 +1260,37 @@ async fn send_words_to_anki(
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let settings = db.get_settings()?;
         let config = anki::AnkiConfig::from_settings(&settings);
-        let words = db.get_words_by_ids(&ids)?;
-        let items = ids
+        // Pair every word with its *own* id. The words found need not line up
+        // with `ids` (unknown ids are skipped and the library sorts by date),
+        // and the note ids Anki reports are saved under whichever id sits in
+        // the pair, so pairing by position wrote them onto the wrong words.
+        let items = db
+            .get_words_in_order(&ids)?
             .into_iter()
-            .zip(words.into_iter())
+            .filter_map(|word| {
+                let id = word.get("id")?.as_str()?.to_string();
+                Some((id, word))
+            })
             .collect::<Vec<(String, serde_json::Value)>>();
         (config, items)
     };
-    let report = anki::send_words(&config, &items).await?;
+    if items.is_empty() {
+        return Err("没有可发送的词条：所选词条不存在或已被删除".into());
+    }
+    let mut report = anki::send_words(&config, &items).await?;
     if let Ok(db) = state.db.lock() {
+        // Remember which note each word became, so sending it again is
+        // recognised as a duplicate. One transaction for the whole batch, and
+        // a failure is reported instead of silently dropped.
+        let pairs = anki_note_pairs(&report);
+        if !pairs.is_empty() {
+            if let Err(error) = db.set_anki_note_ids(&pairs) {
+                push_report_error(
+                    &mut report,
+                    format!("已发送到 Anki，但未能记录笔记 ID，再次发送可能产生重复: {error}"),
+                );
+            }
+        }
         let added = report.get("added").and_then(|v| v.as_u64()).unwrap_or(0);
         if added > 0 {
             let _ = db.record_local_event("anki_send_ok", &serde_json::json!({ "count": added }));
@@ -1132,42 +1303,60 @@ async fn send_words_to_anki(
                 );
             }
         }
-        // Persist Anki note ids onto local words for re-send dedup.
-        if let Some(results) = report.get("results").and_then(|v| v.as_array()) {
-            for item in results {
-                let (Some(word_id), Some(note_id)) = (
-                    item.get("wordId").and_then(|v| v.as_str()),
-                    item.get("noteId").and_then(|v| v.as_i64()),
-                ) else {
-                    continue;
-                };
-                if let Ok(list) = db.get_words_by_ids(&[word_id.to_string()]) {
-                    if let Some(mut word) = list.into_iter().next() {
-                        if let Some(obj) = word.as_object_mut() {
-                            obj.insert("ankiNoteId".into(), serde_json::json!(note_id));
-                        }
-                        let _ = db.save_word(&word);
-                    }
-                }
-            }
-        }
     }
     Ok(report)
 }
 
-fn setup_tray(
-    app: &tauri::App,
-    clipboard_enabled: Arc<AtomicBool>,
-    ocr_enabled: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+/// The `(wordId, noteId)` pairs of an Anki send report; entries Anki gave no
+/// note id for (failures) are left out.
+fn anki_note_pairs(report: &serde_json::Value) -> Vec<(String, i64)> {
+    report
+        .get("results")
+        .and_then(|results| results.as_array())
+        .map(|results| {
+            results
+                .iter()
+                .filter_map(|item| {
+                    Some((
+                        item.get("wordId")?.as_str()?.to_string(),
+                        item.get("noteId")?.as_i64()?,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn push_report_error(report: &mut serde_json::Value, message: String) {
+    if let Some(object) = report.as_object_mut() {
+        let errors = object
+            .entry("errors")
+            .or_insert_with(|| serde_json::json!([]));
+        if let Some(list) = errors.as_array_mut() {
+            list.push(serde_json::Value::String(message));
+        }
+    }
+}
+
+/// How long "暂停 30 分钟" in the tray menu pauses the clipboard watcher.
+const PAUSE_MINUTES: u64 = 30;
+
+fn setup_tray(app: &tauri::App, ocr_enabled: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let state = app.state::<AppState>();
     let watch_item = CheckMenuItem::with_id(
         app,
         "watch",
         "划词即查",
         true,
-        clipboard_enabled.load(Ordering::Relaxed),
+        state.watch.is_on(),
         None::<&str>,
     )?;
+    if let Ok(mut slot) = state.show_watch_mark.lock() {
+        let mark = watch_item.clone();
+        *slot = Some(Arc::new(move |on| {
+            let _ = mark.set_checked(on);
+        }));
+    }
     let pause30_item = MenuItem::with_id(app, "pause30", "暂停 30 分钟", true, None::<&str>)?;
     let lookup_item =
         MenuItem::with_id(app, "lookup_clip", "查词（读取剪贴板）", true, None::<&str>)?;
@@ -1193,46 +1382,42 @@ fn setup_tray(
     let icon_bytes = include_bytes!("../icons/icon.png");
     let icon = Image::from_bytes(icon_bytes)?;
 
-    let cb_flag = clipboard_enabled.clone();
     let _tray = TrayIconBuilder::new()
         .icon(icon)
         .menu(&menu)
         .tooltip("鸽鸽词典 — 复制英文即查词")
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "watch" => {
-                let prev = cb_flag.load(Ordering::Relaxed);
-                let next = !prev;
-                cb_flag.store(next, Ordering::Relaxed);
-                if let Some(item) = app.menu().and_then(|m| m.get("watch")) {
-                    let check = item.as_check_menuitem_unchecked();
-                    let _ = check.set_checked(next);
-                }
                 let state = app.state::<AppState>();
+                let on = state.watch.toggle();
+                // The click has flipped the check mark already; this makes it say what the
+                // switch says, which differs while a pause is running.
+                state.show_watch_state();
                 if let Ok(db) = state.db.lock() {
                     if let Ok(mut settings) = db.get_settings() {
                         if let Some(root) = settings.as_object_mut() {
-                            root.insert("clipboardWatch".into(), serde_json::Value::Bool(next));
+                            root.insert("clipboardWatch".into(), serde_json::Value::Bool(on));
                         }
                         let _ = db.save_settings(&settings);
                     }
                 };
             }
             "pause30" => {
-                cb_flag.store(false, Ordering::Relaxed);
-                if let Some(item) = app.menu().and_then(|m| m.get("watch")) {
-                    let check = item.as_check_menuitem_unchecked();
-                    let _ = check.set_checked(false);
+                let state = app.state::<AppState>();
+                // A pause is not remembered across restarts, and nothing is paused when the
+                // user has turned the watcher off.
+                if let Some(mark) = state.watch.pause() {
+                    state.show_watch_state();
+                    let app_handle = app.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(PAUSE_MINUTES * 60));
+                        let state = app_handle.state::<AppState>();
+                        // Only if the user has not touched the switch (or paused again) since.
+                        if state.watch.end_pause(mark) {
+                            state.show_watch_state();
+                        }
+                    });
                 }
-                let flag = cb_flag.clone();
-                let app_handle = app.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_secs(30 * 60));
-                    flag.store(true, Ordering::Relaxed);
-                    if let Some(item) = app_handle.menu().and_then(|m| m.get("watch")) {
-                        let check = item.as_check_menuitem_unchecked();
-                        let _ = check.set_checked(true);
-                    }
-                });
             }
             "lookup_clip" => {
                 let state = app.state::<AppState>();
@@ -1351,8 +1536,9 @@ fn resolve_startup_data_dir(
         let choice = rfd::MessageDialog::new()
             .set_title("鸽鸽词典数据目录不可用")
             .set_description(format!(
-                "已配置的数据目录不存在或无法访问：{}\n\n选择“是”重试，“否”重新定位已有 gege.db，“取消”退出或重置到默认目录。",
-                format!("{} {}", configured_dir.display(), configured_error)
+                "已配置的数据目录不存在或无法访问：{} {}\n\n选择“是”重试，“否”重新定位已有 gege.db，“取消”退出或重置到默认目录。",
+                configured_dir.display(),
+                configured_error
             ))
             .set_buttons(rfd::MessageButtons::YesNoCancel)
             .show();
@@ -1574,7 +1760,6 @@ pub fn run() {
         .ok()
         .and_then(|settings| settings.get("clipboardWatch").and_then(|v| v.as_bool()))
         .unwrap_or(true);
-    let clipboard_enabled = Arc::new(AtomicBool::new(clipboard_watch_enabled));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
@@ -1586,7 +1771,8 @@ pub fn run() {
         .manage(AppState {
             db: Mutex::new(database),
             last_capture: Mutex::new(None),
-            clipboard_enabled: clipboard_enabled.clone(),
+            watch: watch_switch::WatchSwitch::new(clipboard_watch_enabled),
+            show_watch_mark: Mutex::new(None),
             last_looked_up: Mutex::new(None),
             startup_warnings: Mutex::new(startup_warnings),
         })
@@ -1594,11 +1780,19 @@ pub fn run() {
             get_all_words,
             search_words,
             save_word,
+            restore_word,
+            get_lookup_history,
+            delete_lookup_history,
+            clear_lookup_history,
+            reopen_lookup_from_history,
+            find_word_by_lemma,
+            batch_update_words,
             update_word,
             delete_words,
             get_review_queue,
             submit_review,
             get_review_stats,
+            get_learning_insights,
             reset_review_state,
             add_words_to_review,
             get_reading_sessions,
@@ -1620,13 +1814,13 @@ pub fn run() {
             export_glossary,
             preview_glossary_matches,
             get_usage,
-            increment_usage,
             get_local_metrics,
             clear_local_metrics,
             lookup::lookup_word,
             lookup::lookup_word_stream,
             lookup::test_connection,
             speak_text,
+            stop_speaking,
             list_voices,
             export_words_data,
             export_database_snapshot,
@@ -1657,7 +1851,6 @@ pub fn run() {
             apply_ocr_hotkey_from_settings,
         ])
         .setup(move |app| {
-            let cb = clipboard_enabled.clone();
             let ocr_enabled = app
                 .state::<AppState>()
                 .db
@@ -1666,7 +1859,7 @@ pub fn run() {
                 .and_then(|db| db.get_settings().ok())
                 .map(|settings| ocr_settings(&settings).0)
                 .unwrap_or(true);
-            setup_tray(app, cb.clone(), ocr_enabled)?;
+            setup_tray(app, ocr_enabled)?;
             let _ = apply_ocr_hotkey(app.handle());
             let minimized = std::env::args().any(|arg| arg == "--minimized");
             if let Some(window) = app.get_webview_window("main") {
@@ -1712,7 +1905,10 @@ pub fn run() {
                     check_auto_backup(&backup_handle);
                 }
             });
-            clipboard_watcher::start(app.app_handle().clone(), cb);
+            clipboard_watcher::start(
+                app.app_handle().clone(),
+                app.state::<AppState>().watch.flag(),
+            );
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -1750,6 +1946,52 @@ mod tests {
         );
         PRAGMA user_version = 0;
     "#;
+
+    #[test]
+    fn history_is_on_unless_the_user_turned_it_off() {
+        assert!(
+            history_enabled(&serde_json::json!({})),
+            "older settings have no key"
+        );
+        assert!(history_enabled(
+            &serde_json::json!({ "historyEnabled": true })
+        ));
+        assert!(!history_enabled(
+            &serde_json::json!({ "historyEnabled": false })
+        ));
+        assert!(
+            history_enabled(&serde_json::json!({ "historyEnabled": "no" })),
+            "only a real boolean switches it off"
+        );
+    }
+
+    #[test]
+    fn anki_note_pairs_keep_only_results_that_have_a_note_id() {
+        let report = serde_json::json!({
+            "added": 2,
+            "errors": [],
+            "results": [
+                { "wordId": "a", "noteId": 11, "lemma": "a", "status": "added" },
+                { "wordId": "b", "noteId": null, "lemma": "b", "status": "failed" },
+                { "noteId": 33 },
+                { "wordId": "d", "noteId": 44 }
+            ]
+        });
+        assert_eq!(
+            anki_note_pairs(&report),
+            vec![("a".to_string(), 11), ("d".to_string(), 44)]
+        );
+        assert!(anki_note_pairs(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn report_errors_are_appended_even_when_the_report_had_none() {
+        let mut report = serde_json::json!({ "added": 1 });
+        push_report_error(&mut report, "first".into());
+        push_report_error(&mut report, "second".into());
+        assert_eq!(report["errors"], serde_json::json!(["first", "second"]));
+        assert_eq!(report["added"], 1);
+    }
 
     #[test]
     fn cache_normalization_preserves_sentence_case() {

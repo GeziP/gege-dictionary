@@ -23,8 +23,10 @@ vi.mock('../../lib/tauri-bridge', () => ({
     dataDir: 'C:\\Data',
     cacheCount: 0,
     cacheSizeBytes: 0,
+    historyCount: 4,
     tagCount: 0,
   }),
+  clearLookupHistory: vi.fn().mockResolvedValue(4),
   listBackups: vi.fn().mockResolvedValue([]),
   getStartupWarnings: vi.fn().mockResolvedValue([]),
   exportDatabaseSnapshot: vi.fn(),
@@ -109,5 +111,70 @@ describe('DataSection export', () => {
     expect(bridge.getSettings).toHaveBeenCalledTimes(2);
     expect(bridge.getTemplates).toHaveBeenCalledTimes(2);
     expect(bridge.getUsage).toHaveBeenCalledTimes(2);
+  });
+
+  describe('lookup history', () => {
+    const stats = (historyCount: number) => ({
+      wordCount: 1,
+      sizeBytes: 4096,
+      dataDir: 'C:\\Data',
+      cacheCount: 0,
+      cacheSizeBytes: 0,
+      historyCount,
+      tagCount: 0,
+    });
+
+    it('is recorded unless the user switches it off, and the choice is saved', async () => {
+      renderSection();
+      const recording = await screen.findByRole('switch', { name: '记录查词历史' });
+      expect(recording).toHaveAttribute('aria-checked', 'true');
+
+      await userEvent.click(recording);
+
+      expect(recording).toHaveAttribute('aria-checked', 'false');
+      await waitFor(() =>
+        expect(bridge.saveSettings).toHaveBeenCalledWith(expect.objectContaining({ historyEnabled: false })),
+      );
+    });
+
+    it('shows how many lookups are remembered and clears them only after asking', async () => {
+      const ask = vi.fn(() => false);
+      vi.stubGlobal('confirm', ask);
+      renderSection();
+      expect(await screen.findByText('当前 4 条')).toBeInTheDocument();
+
+      await userEvent.click(screen.getByRole('button', { name: '清空历史' }));
+      expect(ask).toHaveBeenCalledWith(expect.stringContaining('4 条'));
+      expect(bridge.clearLookupHistory).not.toHaveBeenCalled();
+
+      ask.mockReturnValue(true);
+      vi.mocked(bridge.getDbStats).mockResolvedValueOnce(stats(0));
+      await userEvent.click(screen.getByRole('button', { name: '清空历史' }));
+
+      await waitFor(() => expect(bridge.clearLookupHistory).toHaveBeenCalledTimes(1));
+      expect(await screen.findByText('已清空 4 条查词历史')).toBeInTheDocument();
+      expect(await screen.findByText('当前 0 条')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '清空历史' })).toBeDisabled();
+    });
+
+    it('says so when clearing fails, and keeps the count', async () => {
+      vi.stubGlobal('confirm', vi.fn(() => true));
+      vi.mocked(bridge.clearLookupHistory).mockRejectedValueOnce('数据库被占用');
+      renderSection();
+      await screen.findByText('当前 4 条');
+
+      await userEvent.click(screen.getByRole('button', { name: '清空历史' }));
+
+      expect(await screen.findByText(/清空查词历史失败.*数据库被占用/)).toBeInTheDocument();
+      expect(screen.getByText('当前 4 条')).toBeInTheDocument();
+    });
+
+    it('has nothing to clear when there is no history', async () => {
+      vi.mocked(bridge.getDbStats).mockResolvedValueOnce(stats(0));
+      renderSection();
+
+      expect(await screen.findByText('当前 0 条')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '清空历史' })).toBeDisabled();
+    });
   });
 });

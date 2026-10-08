@@ -4,6 +4,8 @@ import type {
   GlossaryImportReport,
   GlossaryPage,
   GlossaryTerm,
+  LearningInsights,
+  LookupHistoryItem,
   PromptTemplate,
   ReadingSession,
   ReviewState,
@@ -49,8 +51,46 @@ export async function searchWords(
   return invoke<SavedWord[]>('search_words', { query, tag, source, mastery });
 }
 
-export async function saveWord(word: SavedWord): Promise<void> {
-  return invoke('save_word', { word });
+/**
+ * Saves the outcome of a lookup. A word that is already in the library is
+ * merged with it by the backend (mastery, note, tags and the Anki link are
+ * kept), so the document that was stored comes back and must be used instead
+ * of the one that was sent.
+ */
+export async function saveWord(word: SavedWord): Promise<SavedWord> {
+  return invoke<SavedWord>('save_word', { word });
+}
+
+/** The saved word for a lemma (case and whitespace insensitive), or null. */
+export async function findWordByLemma(lemma: string, kind?: string): Promise<SavedWord | null> {
+  return invoke<SavedWord | null>('find_word_by_lemma', { lemma, kind });
+}
+
+export interface BatchWordPatch {
+  mastery?: SavedWord['mastery'];
+  addTags?: string[];
+  removeTags?: string[];
+}
+
+export interface BatchUpdateReport {
+  updated: number;
+  missing: number;
+}
+
+/** One transactional change (mastery and/or tags to add or remove) for many words. */
+export async function batchUpdateWords(
+  ids: string[],
+  patch: BatchWordPatch,
+): Promise<BatchUpdateReport> {
+  return invoke<BatchUpdateReport>('batch_update_words', { ids, patch });
+}
+
+/**
+ * Puts a word back exactly as given (undo / rollback). Unlike `saveWord` this
+ * is a plain overwrite, so it can restore the state from before a merge.
+ */
+export async function restoreWord(word: SavedWord): Promise<void> {
+  return invoke('restore_word', { word });
 }
 
 export async function updateWord(id: string, patch: Partial<SavedWord>): Promise<void> {
@@ -71,6 +111,11 @@ export async function submitReview(wordId: string, correct: boolean): Promise<Re
 
 export async function getReviewStats(): Promise<ReviewStats> {
   return invoke<ReviewStats>('get_review_stats');
+}
+
+/** Streak, activity chart, mastery and review figures for the last `days` days (7 to 90). */
+export async function getLearningInsights(days: number): Promise<LearningInsights> {
+  return invoke<LearningInsights>('get_learning_insights', { days });
 }
 
 export async function resetReviewState(wordId: string): Promise<void> {
@@ -205,10 +250,6 @@ export async function previewGlossaryMatches(
 
 export async function getUsage(): Promise<{ today: number; month: number; tokens: number }> {
   return invoke('get_usage');
-}
-
-export async function incrementUsage(tokens: number): Promise<void> {
-  return invoke('increment_usage', { tokens });
 }
 
 export async function lookupWord(
@@ -363,8 +404,14 @@ export async function testConnection(
   return invoke('test_connection', { baseUrl, apiKey, model, protocol: protocol || 'openai' });
 }
 
+/** Resolves when playback has finished, was superseded, or was stopped. */
 export async function speakText(text: string, voice: string, rate: number): Promise<void> {
   return invoke('speak_text', { text, voice, rate });
+}
+
+export async function stopSpeaking(): Promise<void> {
+  if (!IS_TAURI) return;
+  return invoke('stop_speaking');
 }
 
 export async function listVoices(): Promise<string[]> {
@@ -383,6 +430,7 @@ export async function getDbStats(): Promise<{
   tagCount: number;
   cacheCount: number;
   cacheSizeBytes: number;
+  historyCount: number;
   sizeBytes: number;
   dataDir: string;
 }> {
@@ -391,6 +439,29 @@ export async function getDbStats(): Promise<{
 
 export async function clearCache(): Promise<number> {
   return invoke<number>('clear_cache');
+}
+
+/** The remembered lookups, newest first (at most 500). */
+export async function getLookupHistory(): Promise<LookupHistoryItem[]> {
+  return invoke<LookupHistoryItem[]>('get_lookup_history');
+}
+
+/** Forgets the given history entries; resolves to how many were removed. */
+export async function deleteLookupHistory(ids: number[]): Promise<number> {
+  return invoke<number>('delete_lookup_history', { ids });
+}
+
+/** Forgets the whole history (saved words are not touched); resolves to how many were removed. */
+export async function clearLookupHistory(): Promise<number> {
+  return invoke<number>('clear_lookup_history');
+}
+
+/**
+ * Opens the lookup window on a remembered lookup. It asks exactly what was asked
+ * the first time, so an answer that is still cached appears at once and costs nothing.
+ */
+export async function reopenLookupFromHistory(id: number): Promise<void> {
+  return invoke('reopen_lookup_from_history', { id });
 }
 
 export async function backupDatabase(): Promise<string> {
@@ -539,6 +610,8 @@ export async function createLookupWindow(
 
 export async function closeLookupWindow(): Promise<void> {
   if (!IS_TAURI) return;
+  // The speech engine is a separate process; don't let it talk over a hidden window.
+  void stopSpeaking().catch(() => undefined);
   try {
     const mod = await import('@tauri-apps/api/webviewWindow');
     const win = await mod.WebviewWindow.getByLabel('lookup');

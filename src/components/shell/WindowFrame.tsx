@@ -2,6 +2,7 @@ import React from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
 import {
   BookMarkedIcon,
+  ChartColumnIcon,
   LibraryBigIcon,
   MinusIcon,
   MonitorIcon,
@@ -21,6 +22,7 @@ import { bundledVersion } from '../../lib/version';
 const NAV = [
   { to: '/library', label: '生词库', icon: LibraryBigIcon },
   { to: '/review', label: '今日回顾', icon: BrainIcon },
+  { to: '/insights', label: '学习洞察', icon: ChartColumnIcon },
   { to: '/settings', label: '设置', icon: SettingsIcon },
 ];
 

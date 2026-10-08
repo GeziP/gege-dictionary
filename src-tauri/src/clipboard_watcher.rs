@@ -48,39 +48,6 @@ fn initial_clipboard_fingerprint(sequence: u32, text: String) -> ClipboardFinger
     ClipboardFingerprint { sequence, text }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn same_clipboard_sequence_is_deduplicated_but_recopy_is_allowed() {
-        let previous = ClipboardFingerprint {
-            sequence: 7,
-            text: "same text".into(),
-        };
-        assert!(should_skip_lookup(Some(&previous), 7, "same text"));
-        assert!(!should_skip_lookup(Some(&previous), 8, "same text"));
-        assert!(!should_skip_lookup(Some(&previous), 7, "new text"));
-    }
-
-    #[test]
-    fn startup_fingerprint_skips_existing_clipboard_content() {
-        let initial = initial_clipboard_fingerprint(12, "already copied".into());
-        assert!(should_skip_lookup(Some(&initial), 12, "already copied"));
-    }
-
-    #[test]
-    fn merge_nearby_context_prefers_longer_overlap() {
-        assert_eq!(merge_nearby_context("", "hello"), "hello");
-        assert_eq!(merge_nearby_context("hello world", "world"), "hello world");
-        assert_eq!(merge_nearby_context("world", "hello world"), "hello world");
-        assert_eq!(merge_nearby_context("foo", "bar"), "bar");
-        let long = "a".repeat(600);
-        let also_long = "a".repeat(600);
-        assert_eq!(merge_nearby_context(&long, &also_long).chars().count(), 500);
-    }
-}
-
 fn clipboard_sequence_number() -> u32 {
     #[link(name = "user32")]
     extern "system" {
@@ -661,4 +628,37 @@ pub fn lookup_clipboard(
     }
 
     open_or_reuse_lookup(app_handle, kind == "paragraph");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_clipboard_sequence_is_deduplicated_but_recopy_is_allowed() {
+        let previous = ClipboardFingerprint {
+            sequence: 7,
+            text: "same text".into(),
+        };
+        assert!(should_skip_lookup(Some(&previous), 7, "same text"));
+        assert!(!should_skip_lookup(Some(&previous), 8, "same text"));
+        assert!(!should_skip_lookup(Some(&previous), 7, "new text"));
+    }
+
+    #[test]
+    fn startup_fingerprint_skips_existing_clipboard_content() {
+        let initial = initial_clipboard_fingerprint(12, "already copied".into());
+        assert!(should_skip_lookup(Some(&initial), 12, "already copied"));
+    }
+
+    #[test]
+    fn merge_nearby_context_prefers_longer_overlap() {
+        assert_eq!(merge_nearby_context("", "hello"), "hello");
+        assert_eq!(merge_nearby_context("hello world", "world"), "hello world");
+        assert_eq!(merge_nearby_context("world", "hello world"), "hello world");
+        assert_eq!(merge_nearby_context("foo", "bar"), "bar");
+        let long = "a".repeat(600);
+        let also_long = "a".repeat(600);
+        assert_eq!(merge_nearby_context(&long, &also_long).chars().count(), 500);
+    }
 }

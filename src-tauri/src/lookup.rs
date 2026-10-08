@@ -1,4 +1,4 @@
-use crate::db;
+use crate::db::{Database, HistoryRecord};
 #[cfg(windows)]
 use crate::dpapi;
 use crate::glossary;
@@ -11,8 +11,7 @@ use tauri::Emitter;
 pub(crate) const API_KEY_PLACEHOLDER: &str = "••••••••";
 
 pub(crate) fn is_placeholder_api_key(value: &str) -> bool {
-    value == API_KEY_PLACEHOLDER
-        || value.chars().all(|c| c == '•' || c == '*') && value.len() >= 4
+    value == API_KEY_PLACEHOLDER || value.chars().all(|c| c == '•' || c == '*') && value.len() >= 4
 }
 
 pub(crate) fn lookup_cache_key(
@@ -40,26 +39,14 @@ pub(crate) fn should_fallback_stream(saw_content: bool) -> bool {
     !saw_content
 }
 
-/// Prefix LLM errors with a stable machine-readable code for empty-state UI.
+/// Make sure a lookup error reaches the UI carrying a code. Errors from `llm.rs` already
+/// have the one chosen from the real cause (HTTP status, kind of transport error, ...);
+/// anything else is `unknown` - the wording of a message is never enough to invent a code.
 pub(crate) fn classify_lookup_error(err: &str) -> String {
-    let lower = err.to_lowercase();
-    if lower.contains("401")
-        || lower.contains("unauthorized")
-        || lower.contains("invalid api key")
-        || lower.contains("authentication")
-    {
-        format!("[auth] {err}")
-    } else if lower.contains("timed out") || lower.contains("timeout") {
-        format!("[timeout] {err}")
-    } else if lower.contains("connection")
-        || lower.contains("dns")
-        || lower.contains("connect")
-        || lower.contains("network")
-        || lower.contains("socket")
-    {
-        format!("[network] {err}")
+    if llm::error_code(err).is_some() {
+        err.trim_start().to_string()
     } else {
-        format!("[network] {err}")
+        llm::coded("unknown", err)
     }
 }
 
@@ -75,13 +62,37 @@ struct PreparedLookup {
     template_name: String,
     cache_key: String,
     cache_hit: Option<serde_json::Value>,
+    /// Whether answered lookups are remembered in the history (a setting the user can turn off).
+    record_history: bool,
+}
+
+impl PreparedLookup {
+    /// The call to the model that this lookup makes; the prompt is built from the selection.
+    fn model_call(&self) -> llm::ModelCall<'_> {
+        llm::ModelCall {
+            base_url: &self.base_url,
+            api_key: &self.api_key,
+            model: &self.model,
+            protocol: &self.protocol,
+            temperature: self.temperature,
+            max_tokens: self.max_tokens,
+            timeout_secs: self.timeout_secs,
+        }
+    }
+}
+
+/// The question a lookup answers: what was selected, around what, and as which kind.
+#[derive(Clone, Copy)]
+struct LookupRequest<'a> {
+    selection: &'a str,
+    context: &'a str,
+    kind: &'a str,
 }
 
 fn decrypt_provider_api_key(raw_key: &str, log_prefix: &str) -> String {
     eprintln!(
-        "[{log_prefix}] raw_key starts_with dpapi={}, len={}",
-        raw_key.starts_with("dpapi:"),
-        raw_key.len()
+        "[{log_prefix}] stored key is DPAPI-encrypted={}",
+        raw_key.starts_with("dpapi:")
     );
     #[cfg(windows)]
     {
@@ -109,19 +120,114 @@ pub(crate) fn annotate_lookup_entry(entry: &mut serde_json::Value, template_name
     }
 }
 
-fn store_lookup_cache(
-    state: &tauri::State<'_, AppState>,
-    cache_key: &str,
-    model: &str,
-    entry: &serde_json::Value,
-) {
-    let db_path = match state.db.lock() {
-        Ok(db) => db.path().to_string(),
-        Err(_) => return,
+/// How a lookup was answered, which decides what it cost.
+#[derive(Clone, Copy)]
+enum Answer<'a> {
+    /// Served from the local cache: still a lookup the user made, but it cost nothing.
+    Cache,
+    /// The model replied `raw` to `prompt`.
+    Model { prompt: &'a str, raw: &'a str },
+}
+
+/// Where a lookup's text was captured, as far as that is known.
+#[derive(Default)]
+struct CaptureSource {
+    app: String,
+    title: String,
+}
+
+/// The source of the last capture, but only when that capture is the very text being looked up:
+/// a stale capture of something else must not be credited with this lookup.
+fn capture_source(state: &AppState, selection: &str) -> CaptureSource {
+    let Ok(capture) = state.last_capture.lock() else {
+        return CaptureSource::default();
     };
-    if let Ok(db) = db::Database::open(&db_path) {
-        let _ = db.set_cache(cache_key, model, entry);
+    let Some(capture) = capture.as_ref() else {
+        return CaptureSource::default();
+    };
+    let text = |key: &str| {
+        capture
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    if text("selection").trim() != selection.trim() {
+        return CaptureSource::default();
     }
+    CaptureSource {
+        app: text("sourceApp").to_string(),
+        title: text("sourceTitle").to_string(),
+    }
+}
+
+/// Put an answered lookup in the history. A failure is logged and otherwise ignored: the
+/// history is a convenience and must never turn a successful lookup into an error.
+fn remember_lookup(
+    db: &Database,
+    request: LookupRequest<'_>,
+    entry: &serde_json::Value,
+    source: &CaptureSource,
+) {
+    let text = |key: &str| {
+        entry
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    let record = HistoryRecord {
+        selection: request.selection,
+        context: request.context,
+        kind: request.kind,
+        lemma: text("lemma"),
+        translation: text("translation"),
+        source_app: &source.app,
+        source_title: &source.title,
+    };
+    if let Err(e) = db.record_history(&record) {
+        eprintln!("[lookup] could not record history: {e}");
+    }
+}
+
+/// The one place a successful lookup is wrapped up, whichever of the five ways it succeeded.
+/// A fresh answer is tagged with its template and cached; every answer counts towards usage
+/// and, unless the user turned that off, goes into the history.
+fn finish_lookup(
+    state: &tauri::State<'_, AppState>,
+    prepared: &PreparedLookup,
+    request: LookupRequest<'_>,
+    mut entry: serde_json::Value,
+    answer: Answer<'_>,
+) -> serde_json::Value {
+    let tokens = match answer {
+        Answer::Cache => 0,
+        Answer::Model { prompt, raw } => {
+            annotate_lookup_entry(&mut entry, &prepared.template_name);
+            llm::estimate_lookup_tokens(prompt, raw)
+        }
+    };
+    // Read before the database is locked, so the two locks are never held at the same time.
+    let source = if prepared.record_history {
+        capture_source(state, request.selection)
+    } else {
+        CaptureSource::default()
+    };
+    match state.db.lock() {
+        Ok(db) => {
+            if matches!(answer, Answer::Model { .. }) {
+                if let Err(e) = db.set_cache(&prepared.cache_key, &prepared.model, &entry) {
+                    eprintln!("[lookup] could not cache the answer: {e}");
+                }
+            }
+            if let Err(e) = db.record_lookup(tokens) {
+                eprintln!("[lookup] could not record usage: {e}");
+            }
+            if prepared.record_history {
+                remember_lookup(&db, request, &entry, &source);
+            }
+        }
+        Err(_) => eprintln!("[lookup] database lock poisoned; answer neither cached nor counted"),
+    }
+    entry
 }
 
 pub(crate) fn selection_meta(selection: &str, kind: &str) -> String {
@@ -130,6 +236,20 @@ pub(crate) fn selection_meta(selection: &str, kind: &str) -> String {
     let digest = hasher.finalize();
     let head = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
     format!("len={} kind={kind} head_hash={head:08x}", selection.len())
+}
+
+/// What the settings and the templates say about answering one lookup, read under one lock.
+struct LookupPlan {
+    base_url: String,
+    api_key: String,
+    model: String,
+    protocol: String,
+    temperature: f64,
+    max_tokens: u32,
+    timeout_secs: u64,
+    template_body: String,
+    template_name: String,
+    cache_ttl: i64,
 }
 
 /// Shared preflight for non-streaming and streaming lookup commands.
@@ -142,7 +262,8 @@ fn prepare_lookup(
     force_refresh: bool,
     log_prefix: &str,
 ) -> Result<PreparedLookup, String> {
-    let (
+    let record_history;
+    let LookupPlan {
         base_url,
         api_key,
         model,
@@ -153,12 +274,13 @@ fn prepare_lookup(
         template_body,
         template_name,
         cache_ttl,
-    ) = {
+    } = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let settings = db.get_settings()?;
+        record_history = crate::history_enabled(&settings);
         let provider = settings
             .get("provider")
-            .ok_or("No provider configured")?
+            .ok_or_else(|| llm::coded("no_key", "尚未配置模型服务，请到设置页填写"))?
             .clone();
         let templates = db.get_templates()?;
         let scope = match kind {
@@ -250,36 +372,36 @@ fn prepare_lookup(
             .to_string();
         let api_key_decrypted = decrypt_provider_api_key(&raw_key, log_prefix);
 
-        (
-            base_url_value,
-            api_key_decrypted,
-            provider
+        LookupPlan {
+            base_url: base_url_value,
+            api_key: api_key_decrypted,
+            model: provider
                 .get("model")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
-            provider
+            protocol: provider
                 .get("protocol")
                 .and_then(|v| v.as_str())
                 .unwrap_or("openai")
                 .to_string(),
-            provider
+            temperature: provider
                 .get("temperature")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.3),
-            mt,
-            ts,
-            tpl_body,
-            format!("{} [{}]", tpl_name, tpl_scope),
-            crate::cache_ttl_days(&settings),
-        )
+            max_tokens: mt,
+            timeout_secs: ts,
+            template_body: tpl_body,
+            template_name: format!("{} [{}]", tpl_name, tpl_scope),
+            cache_ttl: crate::cache_ttl_days(&settings),
+        }
     };
 
     if api_key.trim().is_empty() {
-        return Err("[no_key] 尚未配置 API Key，请到设置页填写".to_string());
+        return Err(llm::coded("no_key", "尚未配置 API Key，请到设置页填写"));
     }
     if api_key.starts_with("dpapi:") {
-        return Err("[no_key] API Key 解密失败，请到设置页重新输入".to_string());
+        return Err(llm::coded("no_key", "API Key 解密失败，请到设置页重新输入"));
     }
 
     let cache_key = lookup_cache_key(selection, context, kind, &model, &template_body);
@@ -318,6 +440,7 @@ fn prepare_lookup(
         template_name,
         cache_key,
         cache_hit,
+        record_history,
     })
 }
 
@@ -339,18 +462,19 @@ pub(crate) fn resolve_api_key_for_request(
             .unwrap_or("")
             .to_string();
         if stored.is_empty() {
-            return Err("尚未配置 API Key".into());
+            return Err(llm::coded("no_key", "尚未配置 API Key"));
         }
         if dpapi::is_encrypted(&stored) {
-            return dpapi::decrypt(&stored);
+            return dpapi::decrypt(&stored)
+                .map_err(|e| llm::coded("no_key", format!("API Key 解密失败，请重新输入（{e}）")));
         }
-        return Ok(stored);
+        Ok(stored)
     }
     #[cfg(not(windows))]
     {
         let _ = state;
         if api_key.is_empty() || is_placeholder_api_key(api_key) {
-            return Err("尚未配置 API Key".into());
+            return Err(llm::coded("no_key", "尚未配置 API Key"));
         }
         Ok(api_key.to_string())
     }
@@ -368,7 +492,7 @@ pub async fn lookup_word(
     kind: String,
     force_refresh: bool,
 ) -> Result<serde_json::Value, String> {
-    let prepared = prepare_lookup(
+    let mut prepared = prepare_lookup(
         &state,
         &selection,
         &context,
@@ -376,10 +500,21 @@ pub async fn lookup_word(
         force_refresh,
         "lookup_word",
     )?;
+    let request = LookupRequest {
+        selection: &selection,
+        context: &context,
+        kind: &kind,
+    };
 
-    if let Some(cached) = prepared.cache_hit {
+    if let Some(cached) = prepared.cache_hit.take() {
         eprintln!("[lookup_word] cache HIT");
-        return Ok(cached);
+        return Ok(finish_lookup(
+            &state,
+            &prepared,
+            request,
+            cached,
+            Answer::Cache,
+        ));
     }
 
     eprintln!(
@@ -392,16 +527,9 @@ pub async fn lookup_word(
     );
 
     let full_text = llm::stream_lookup(
-        &prepared.base_url,
-        &prepared.api_key,
-        &prepared.model,
-        &prepared.protocol,
-        prepared.temperature,
-        prepared.max_tokens,
-        prepared.timeout_secs,
+        prepared.model_call(),
         &selection,
         &context,
-        &kind,
         &prepared.template_body,
     )
     .await
@@ -413,15 +541,18 @@ pub async fn lookup_word(
 
     eprintln!("[lookup_word] LLM OK, len={}", full_text.len());
 
-    let mut entry = llm::parse_entry(&full_text, &selection, &kind).map_err(|e| {
+    let entry = llm::parse_entry(&full_text, &selection, &kind).map_err(|e| {
         eprintln!("[lookup_word] parse FAIL: {e}");
-        format!("JSON 解析失败: {e}")
+        classify_lookup_error(&e)
     })?;
-    annotate_lookup_entry(&mut entry, &prepared.template_name);
-    store_lookup_cache(&state, &prepared.cache_key, &prepared.model, &entry);
 
+    let prompt = llm::build_prompt(&prepared.template_body, &selection, &context);
+    let answer = Answer::Model {
+        prompt: &prompt,
+        raw: &full_text,
+    };
     eprintln!("[lookup_word] done, returning entry");
-    Ok(entry)
+    Ok(finish_lookup(&state, &prepared, request, entry, answer))
 }
 
 #[tauri::command]
@@ -434,7 +565,7 @@ pub async fn lookup_word_stream(
     request_id: String,
     force_refresh: bool,
 ) -> Result<(), String> {
-    let prepared = prepare_lookup(
+    let mut prepared = prepare_lookup(
         &state,
         &selection,
         &context,
@@ -442,25 +573,27 @@ pub async fn lookup_word_stream(
         force_refresh,
         "lookup_stream",
     )?;
+    let request = LookupRequest {
+        selection: &selection,
+        context: &context,
+        kind: &kind,
+    };
 
-    if let Some(cached) = prepared.cache_hit {
+    if let Some(cached) = prepared.cache_hit.take() {
         eprintln!("[lookup_stream] cache HIT");
+        let entry = finish_lookup(&state, &prepared, request, cached, Answer::Cache);
         let _ = app.emit(
             "lookup://done",
             serde_json::json!({
                 "requestId": request_id,
-                "entry": cached,
+                "entry": entry,
                 "fromCache": true,
             }),
         );
         return Ok(());
     }
 
-    eprintln!(
-        "[lookup_stream] starting SSE, key_len={}, url={}",
-        prepared.api_key.len(),
-        prepared.base_url
-    );
+    eprintln!("[lookup_stream] starting SSE, url={}", prepared.base_url);
 
     let rid = request_id.clone();
     let app_clone = app.clone();
@@ -470,19 +603,12 @@ pub async fn lookup_word_stream(
     let mut first_field_logged = false;
     let app_for_metrics = app.clone();
     let kind_for_metrics = kind.clone();
-    let template_name = prepared.template_name.clone();
+    let prompt = llm::build_prompt(&prepared.template_body, &selection, &context);
 
     let result = llm::stream_lookup_sse(
-        &prepared.base_url,
-        &prepared.api_key,
-        &prepared.model,
-        &prepared.protocol,
-        prepared.temperature,
-        prepared.max_tokens,
-        prepared.timeout_secs,
+        prepared.model_call(),
         &selection,
         &context,
-        &kind,
         &prepared.template_body,
         |delta| {
             if !delta.is_empty() {
@@ -524,9 +650,12 @@ pub async fn lookup_word_stream(
 
     match result {
         Ok(full_text) => match llm::parse_entry(&full_text, &selection, &kind) {
-            Ok(mut entry) => {
-                annotate_lookup_entry(&mut entry, &template_name);
-                store_lookup_cache(&state, &prepared.cache_key, &prepared.model, &entry);
+            Ok(entry) => {
+                let answer = Answer::Model {
+                    prompt: &prompt,
+                    raw: &full_text,
+                };
+                let entry = finish_lookup(&state, &prepared, request, entry, answer);
                 let _ = app.emit(
                     "lookup://done",
                     serde_json::json!({
@@ -539,7 +668,7 @@ pub async fn lookup_word_stream(
                 Ok(())
             }
             Err(e) => {
-                let err_msg = format!("JSON 解析失败: {e}");
+                let err_msg = classify_lookup_error(&e);
                 let _ = app.emit(
                     "lookup://error",
                     serde_json::json!({
@@ -558,29 +687,20 @@ pub async fn lookup_word_stream(
                 eprintln!("[lookup_stream] falling back to one non-streaming request");
                 crate::record_event_handle(&app, "lookup_stream_fallback", serde_json::json!({}));
                 match llm::stream_lookup(
-                    &prepared.base_url,
-                    &prepared.api_key,
-                    &prepared.model,
-                    &prepared.protocol,
-                    prepared.temperature,
-                    prepared.max_tokens,
-                    prepared.timeout_secs,
+                    prepared.model_call(),
                     &selection,
                     &context,
-                    &kind,
                     &prepared.template_body,
                 )
                 .await
                 {
                     Ok(full_text) => match llm::parse_entry(&full_text, &selection, &kind) {
-                        Ok(mut entry) => {
-                            annotate_lookup_entry(&mut entry, &template_name);
-                            store_lookup_cache(
-                                &state,
-                                &prepared.cache_key,
-                                &prepared.model,
-                                &entry,
-                            );
+                        Ok(entry) => {
+                            let answer = Answer::Model {
+                                prompt: &prompt,
+                                raw: &full_text,
+                            };
+                            let entry = finish_lookup(&state, &prepared, request, entry, answer);
                             let _ = app.emit(
                                 "lookup://done",
                                 serde_json::json!({
@@ -636,6 +756,7 @@ pub async fn test_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db;
 
     #[test]
     fn annotate_lookup_entry_sets_template_name() {
@@ -646,11 +767,22 @@ mod tests {
     }
 
     #[test]
-    fn classify_lookup_error_prefixes_stable_codes() {
-        assert!(classify_lookup_error("401 Unauthorized").starts_with("[auth]"));
-        assert!(classify_lookup_error("request timed out").starts_with("[timeout]"));
-        assert!(classify_lookup_error("connection refused").starts_with("[network]"));
-        assert!(classify_lookup_error("something else").starts_with("[network]"));
+    fn classify_lookup_error_keeps_a_real_code_and_never_guesses_one() {
+        // A code chosen at the source passes through untouched...
+        for code in llm::ERROR_CODES {
+            let err = llm::coded(code, "x");
+            assert_eq!(classify_lookup_error(&err), err);
+        }
+        // ...and the wording of a message is never enough to invent one.
+        for text in [
+            "401 Unauthorized",
+            "request timed out",
+            "connection refused",
+            "请求超时",
+            "something else",
+        ] {
+            assert_eq!(classify_lookup_error(text), format!("[unknown] {text}"));
+        }
     }
 
     #[test]
@@ -708,5 +840,67 @@ mod tests {
 
         assert!(db.get_cache("missing", 30).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn state_with_capture(capture: Option<serde_json::Value>) -> AppState {
+        AppState {
+            db: std::sync::Mutex::new(db::Database::open_memory().unwrap()),
+            last_capture: std::sync::Mutex::new(capture),
+            watch: crate::watch_switch::WatchSwitch::new(true),
+            show_watch_mark: std::sync::Mutex::new(None),
+            last_looked_up: std::sync::Mutex::new(None),
+            startup_warnings: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn the_source_is_only_credited_when_the_capture_is_the_text_looked_up() {
+        let capture = serde_json::json!({
+            "selection": " running ",
+            "sourceApp": "chrome.exe",
+            "sourceTitle": "News",
+        });
+        let state = state_with_capture(Some(capture));
+
+        let source = capture_source(&state, "running");
+        assert_eq!(
+            (source.app.as_str(), source.title.as_str()),
+            ("chrome.exe", "News")
+        );
+
+        let stale = capture_source(&state, "something else");
+        assert!(stale.app.is_empty() && stale.title.is_empty());
+        assert!(capture_source(&state_with_capture(None), "running")
+            .app
+            .is_empty());
+    }
+
+    #[test]
+    fn an_answered_lookup_is_remembered_with_what_the_answer_says() {
+        let db = db::Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        let entry = serde_json::json!({ "lemma": "run", "translation": "跑" });
+        let request = LookupRequest {
+            selection: "running",
+            context: "He was running late.",
+            kind: "word",
+        };
+        let source = CaptureSource {
+            app: "chrome.exe".into(),
+            title: "News".into(),
+        };
+        remember_lookup(&db, request, &entry, &source);
+
+        let list = db.list_history().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["selection"], "running");
+        assert_eq!(list[0]["lemma"], "run");
+        assert_eq!(list[0]["translation"], "跑");
+        assert_eq!(list[0]["sourceApp"], "chrome.exe");
+        let question = db
+            .history_lookup(list[0]["id"].as_i64().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(question["context"], "He was running late.");
     }
 }

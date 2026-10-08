@@ -5,7 +5,7 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -205,6 +205,242 @@ fn normalize_import_lemma(value: &str) -> String {
         .to_lowercase()
 }
 
+/// `words.anki_note_id` mirrors the `ankiNoteId` key of the JSON document so an
+/// "already sent to Anki" check can use the index instead of parsing every
+/// row. Anki ids are 64-bit, hence the TEXT column.
+fn anki_note_id_column(word: &Value) -> Option<String> {
+    match word.get("ankiNoteId") {
+        Some(Value::Number(number)) => Some(number.to_string()),
+        Some(Value::String(text)) if !text.trim().is_empty() => Some(text.trim().to_string()),
+        _ => None,
+    }
+}
+
+fn str_field<'a>(word: &'a Value, key: &str) -> &'a str {
+    word.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// Trimmed, de-duplicated (order preserving) tags of a word document.
+fn tags_of(word: &Value) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::new();
+    for tag in word
+        .get("tags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        let tag = tag.trim();
+        if !tag.is_empty() && !tags.iter().any(|existing| existing == tag) {
+            tags.push(tag.to_string());
+        }
+    }
+    tags
+}
+
+fn tags_value(tags: Vec<String>) -> Value {
+    Value::Array(tags.into_iter().map(Value::String).collect())
+}
+
+fn word_json_by_id(conn: &Connection, id: &str) -> Result<Option<Value>, String> {
+    let raw: Option<String> = conn
+        .query_row("SELECT data FROM words WHERE id = ?1", params![id], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
+    raw.map(|raw| serde_json::from_str(&raw).map_err(|e| format!("词条数据损坏 ({id}): {e}")))
+        .transpose()
+}
+
+/// Find the saved word a lookup refers to: the same normalised lemma and, when
+/// given, the same kind. If legacy data already holds duplicates the earliest
+/// saved one wins, because it is the one carrying the user's history.
+fn find_word_with_connection(
+    conn: &Connection,
+    lemma: &str,
+    kind: Option<&str>,
+) -> Result<Option<Value>, String> {
+    let key = normalize_import_lemma(lemma);
+    if key.is_empty() {
+        return Ok(None);
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, lemma, COALESCE(kind, 'word') FROM words ORDER BY saved_at ASC, id ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let id: String = row.get(0).map_err(|e| e.to_string())?;
+        let row_lemma: String = row.get(1).map_err(|e| e.to_string())?;
+        let row_kind: String = row.get(2).map_err(|e| e.to_string())?;
+        let same_kind = match kind {
+            Some(wanted) => wanted == row_kind,
+            None => true,
+        };
+        if same_kind && normalize_import_lemma(&row_lemma) == key {
+            return word_json_by_id(conn, &id);
+        }
+    }
+    Ok(None)
+}
+
+/// Combine a freshly looked-up entry with the word the user already saved. The
+/// lookup refreshes the *content*; everything the user owns (identity,
+/// progress, note, tags, Anki link) and where/when the word was first
+/// collected stays with the stored word, and the lookup counter goes up by one.
+///
+/// The first source is kept because reading sessions group words by
+/// `sourceApp` and `savedAt`; letting a later lookup change either would make
+/// words hop between sessions.
+fn merged_lookup_word(existing: &Value, incoming: &Value) -> Value {
+    let existing_fields = existing.as_object().cloned().unwrap_or_default();
+    let mut merged = incoming.as_object().cloned().unwrap_or_default();
+
+    for key in ["id", "mastery", "savedAt", "ankiNoteId"] {
+        if let Some(value) = existing_fields.get(key).filter(|value| !value.is_null()) {
+            merged.insert(key.to_string(), value.clone());
+        }
+    }
+    for key in ["sourceApp", "sourceTitle"] {
+        if !str_field(existing, key).trim().is_empty() {
+            merged.insert(
+                key.to_string(),
+                Value::String(str_field(existing, key).to_string()),
+            );
+        }
+    }
+    let same_lemma = normalize_import_lemma(str_field(existing, "lemma"))
+        == normalize_import_lemma(str_field(incoming, "lemma"));
+    if same_lemma {
+        merged.insert(
+            "lemma".into(),
+            Value::String(str_field(existing, "lemma").to_string()),
+        );
+    }
+    if !str_field(existing, "note").trim().is_empty() {
+        merged.insert(
+            "note".into(),
+            Value::String(str_field(existing, "note").to_string()),
+        );
+    }
+    let mut tags = tags_of(existing);
+    for tag in tags_of(incoming) {
+        if !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
+    merged.insert("tags".into(), tags_value(tags));
+    let previous = existing.get("lookups").and_then(Value::as_u64).unwrap_or(1);
+    merged.insert("lookups".into(), Value::from(previous.saturating_add(1)));
+    // Keep any other stored field the incoming payload does not know about.
+    for (key, value) in existing_fields {
+        merged.entry(key).or_insert(value);
+    }
+    Value::Object(merged)
+}
+
+fn ensure_text(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    default: impl FnOnce() -> String,
+) {
+    let present = object
+        .get(key)
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.trim().is_empty());
+    if !present {
+        object.insert(key.to_string(), Value::String(default()));
+    }
+}
+
+/// A looked-up entry that is not saved yet, with every field the rest of the
+/// app relies on filled in.
+fn new_lookup_word(incoming: &Value) -> Value {
+    let tags = tags_of(incoming);
+    let mut word = incoming.as_object().cloned().unwrap_or_default();
+    ensure_text(&mut word, "id", || uuid::Uuid::new_v4().to_string());
+    ensure_text(&mut word, "savedAt", || chrono::Utc::now().to_rfc3339());
+    ensure_text(&mut word, "mastery", || "new".to_string());
+    ensure_text(&mut word, "kind", || "word".to_string());
+    if !word.get("note").is_some_and(Value::is_string) {
+        word.insert("note".into(), Value::String(String::new()));
+    }
+    let lookups = word
+        .get("lookups")
+        .and_then(Value::as_u64)
+        .filter(|count| *count > 0)
+        .unwrap_or(1);
+    word.insert("lookups".into(), Value::from(lookups));
+    word.insert("tags".into(), tags_value(tags));
+    Value::Object(word)
+}
+
+const MASTERY_LEVELS: [&str; 4] = ["new", "learning", "familiar", "mastered"];
+const MAX_TAGS_PER_BATCH: usize = 20;
+const MAX_TAG_CHARS: usize = 32;
+
+/// A change applied to many words at once. Tags are added or removed, never
+/// replaced, so every word keeps whatever else the user attached to it.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct BatchWordPatch {
+    pub mastery: Option<String>,
+    pub add_tags: Vec<String>,
+    pub remove_tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct BatchUpdateReport {
+    pub updated: u32,
+    pub missing: u32,
+}
+
+struct ValidatedPatch<'a> {
+    mastery: Option<&'a str>,
+    add_tags: Vec<String>,
+    remove_tags: Vec<String>,
+}
+
+fn clean_tag_list(tags: &[String]) -> Result<Vec<String>, String> {
+    let mut cleaned: Vec<String> = Vec::new();
+    for tag in tags {
+        let tag = tag.trim();
+        if tag.is_empty() || cleaned.iter().any(|existing| existing == tag) {
+            continue;
+        }
+        if tag.chars().count() > MAX_TAG_CHARS {
+            return Err(format!("标签过长（最多 {MAX_TAG_CHARS} 个字符）: {tag}"));
+        }
+        cleaned.push(tag.to_string());
+    }
+    if cleaned.len() > MAX_TAGS_PER_BATCH {
+        return Err(format!("一次最多处理 {MAX_TAGS_PER_BATCH} 个标签"));
+    }
+    Ok(cleaned)
+}
+
+impl BatchWordPatch {
+    fn validated(&self) -> Result<ValidatedPatch<'_>, String> {
+        let mastery = match self.mastery.as_deref() {
+            Some(level) if MASTERY_LEVELS.contains(&level) => Some(level),
+            Some(level) => return Err(format!("无效的掌握度: {level}")),
+            None => None,
+        };
+        let add_tags = clean_tag_list(&self.add_tags)?;
+        let remove_tags = clean_tag_list(&self.remove_tags)?;
+        if mastery.is_none() && add_tags.is_empty() && remove_tags.is_empty() {
+            return Err("没有需要应用的修改".into());
+        }
+        Ok(ValidatedPatch {
+            mastery,
+            add_tags,
+            remove_tags,
+        })
+    }
+}
+
 fn save_word_with_connection(
     conn: &Connection,
     word: &Value,
@@ -236,16 +472,17 @@ fn save_word_with_connection(
     let lookups = word.get("lookups").and_then(Value::as_u64).unwrap_or(1) as i64;
     let now = chrono::Utc::now().to_rfc3339();
     let saved = if saved_at.is_empty() { &now } else { saved_at };
+    let anki_note_id = anki_note_id_column(word);
     conn.execute(
-        "INSERT INTO words (id, lemma, translation, pos, context_meaning, explanation, source_app, source_title, mastery, kind, saved_at, updated_at, lookups, data)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        "INSERT INTO words (id, lemma, translation, pos, context_meaning, explanation, source_app, source_title, mastery, kind, saved_at, updated_at, lookups, data, anki_note_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(id) DO UPDATE SET
            lemma=excluded.lemma, translation=excluded.translation, pos=excluded.pos,
            context_meaning=excluded.context_meaning, explanation=excluded.explanation,
            source_app=excluded.source_app, source_title=excluded.source_title,
            mastery=excluded.mastery, kind=excluded.kind, updated_at=excluded.updated_at,
-           lookups=excluded.lookups, data=excluded.data",
-        params![id, lemma, translation, pos, context_meaning, explanation, source_app, source_title, mastery, kind, saved, now, lookups, word.to_string()],
+           lookups=excluded.lookups, data=excluded.data, anki_note_id=excluded.anki_note_id",
+        params![id, lemma, translation, pos, context_meaning, explanation, source_app, source_title, mastery, kind, saved, now, lookups, word.to_string(), anki_note_id],
     )
     .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM word_tags WHERE word_id = ?1", params![id])
@@ -270,6 +507,43 @@ fn save_word_with_connection(
     Ok(())
 }
 
+/// How many distinct lookups the history keeps; the oldest are dropped as new ones arrive.
+pub const HISTORY_LIMIT: i64 = 500;
+const HISTORY_SELECTION_CHARS: usize = 2000;
+const HISTORY_CONTEXT_CHARS: usize = 1000;
+const HISTORY_LEMMA_CHARS: usize = 120;
+const HISTORY_TRANSLATION_CHARS: usize = 300;
+/// The list shows a preview of long selections; reopening uses the full text.
+const HISTORY_PREVIEW_CHARS: i64 = 400;
+
+/// What one successful lookup leaves in the history.
+pub struct HistoryRecord<'a> {
+    pub selection: &'a str,
+    pub context: &'a str,
+    pub kind: &'a str,
+    pub lemma: &'a str,
+    pub translation: &'a str,
+    pub source_app: &'a str,
+    pub source_title: &'a str,
+}
+
+fn clipped(text: &str, max_chars: usize) -> String {
+    text.trim().chars().take(max_chars).collect()
+}
+
+/// The same word in another case or with other spacing is one history entry. Sentences and
+/// paragraphs ignore spacing only, exactly like the lookup cache does.
+fn history_key(selection: &str, kind: &str) -> String {
+    format!(
+        "{}\u{1f}{kind}",
+        crate::normalize_selection(selection, kind)
+    )
+}
+
+fn history_timestamp() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
 impl Database {
     pub fn open(path: &str) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| format!("DB open error: {e}"))?;
@@ -281,29 +555,13 @@ impl Database {
         })
     }
 
+    /// In-memory database for tests. Foreign keys are enforced like in the
+    /// real database, so cascading deletes are exercised too.
     #[cfg(test)]
-    pub(crate) fn open_read_only(path: &str) -> Result<Self, String> {
-        // `immutable=1` prevents SQLite from creating WAL/SHM sidecars while
-        // the live smoke test inspects the user's real database.
-        let uri_path = path.replace('\\', "/");
-        let uri = if uri_path.contains(':') {
-            format!("file:///{uri_path}?immutable=1")
-        } else {
-            format!("file:{uri_path}?immutable=1")
-        };
-        let conn = Connection::open_with_flags(
-            &uri,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        )
-        .map_err(|e| format!("DB read-only open error: {e}"))?;
-        Ok(Self {
-            conn,
-            path: path.to_string(),
-        })
-    }
-
-    pub fn open_memory() -> Result<Self, String> {
+    pub(crate) fn open_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory().map_err(|e| format!("Memory DB error: {e}"))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .map_err(|e| format!("Memory DB pragma error: {e}"))?;
         Ok(Self {
             conn,
             path: String::new(),
@@ -387,8 +645,9 @@ impl Database {
         validate_connection(&self.conn)
     }
 
-    /// Restore a validated backup into the currently open connection. A
-    /// safety snapshot is kept long enough to roll back a failed restore.
+    /// Restore a validated backup into the currently open connection. A backup made by an
+    /// earlier schema version is upgraded right after the copy, the way an old database is
+    /// when the app starts. A safety snapshot is kept long enough to roll back a failed restore.
     pub fn restore_from_backup(&mut self, backup_name: &str) -> Result<(), String> {
         if !is_safe_backup_name(backup_name) {
             return Err("备份文件名无效".into());
@@ -400,7 +659,7 @@ impl Database {
             return Err(format!("备份文件不存在: {backup_name}"));
         }
         let source = Connection::open(&backup_path).map_err(|e| format!("打开备份失败: {e}"))?;
-        validate_connection(&source)?;
+        validate_restorable(&source)?;
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S-%3f");
         let mut safety_name = format!("{RESTORE_SAFETY_PREFIX}{stamp}.db");
         let mut safety_path = db_dir.join("backups").join(&safety_name);
@@ -418,7 +677,7 @@ impl Database {
                 .run_to_completion(64, Duration::from_millis(10), None)
                 .map_err(|e| format!("执行恢复失败: {e}"))?;
             drop(backup);
-            self.validate()
+            self.initialize()
         })();
         if let Err(error) = restore_result {
             let rollback = (|| -> Result<(), String> {
@@ -576,6 +835,7 @@ impl Database {
             ],
             "streamingEnabled": true,
             "cacheTtlDays": 30,
+            "historyEnabled": true,
             "reviewLimit": 20,
             "includeLongFormReview": false,
             "sessionGapMinutes": 30,
@@ -797,17 +1057,181 @@ impl Database {
         Ok(words)
     }
 
-    pub fn save_word(&self, word: &Value) -> Result<(), String> {
-        let include_long_form = self
-            .get_settings()
+    fn include_long_form_review(&self) -> bool {
+        self.get_settings()
             .ok()
             .and_then(|settings| {
                 settings
                     .get("includeLongFormReview")
                     .and_then(Value::as_bool)
             })
-            .unwrap_or(false);
-        save_word_with_connection(&self.conn, word, include_long_form)
+            .unwrap_or(false)
+    }
+
+    /// Raw upsert: the stored document becomes exactly `word`. Use
+    /// [`Database::save_lookup_result`] for saving a fresh lookup.
+    pub fn save_word(&self, word: &Value) -> Result<(), String> {
+        save_word_with_connection(&self.conn, word, self.include_long_form_review())
+    }
+
+    /// Save the outcome of a dictionary lookup.
+    ///
+    /// Unlike [`Database::save_word`], which replaces the stored document with
+    /// whatever it is handed, this merges: looking a word up again refreshes
+    /// its content but never resets what the user owns (mastery, note, tags,
+    /// review progress, Anki link, first-saved date). A word is recognised by
+    /// its id or, failing that, by normalised lemma and kind, so a second
+    /// lookup of "Hello  World" cannot create a duplicate of "hello world".
+    /// Returns the document as stored.
+    pub fn save_lookup_result(&self, incoming: &Value) -> Result<Value, String> {
+        let lemma = str_field(incoming, "lemma").trim();
+        if lemma.is_empty() {
+            return Err("词条缺少 lemma，无法保存".into());
+        }
+        let kind = Some(str_field(incoming, "kind"))
+            .filter(|kind| !kind.trim().is_empty())
+            .unwrap_or("word");
+        let include_long_form = self.include_long_form_review();
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let by_id = match str_field(incoming, "id").trim() {
+            "" => None,
+            id => word_json_by_id(&tx, id)?,
+        };
+        let existing = match by_id {
+            Some(word) => Some(word),
+            None => find_word_with_connection(&tx, lemma, Some(kind))?,
+        };
+        let word = match &existing {
+            Some(existing) => merged_lookup_word(existing, incoming),
+            None => new_lookup_word(incoming),
+        };
+        save_word_with_connection(&tx, &word, include_long_form)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(word)
+    }
+
+    /// The saved word for a lemma (compared after trimming, collapsing
+    /// whitespace and lower-casing), optionally restricted to one kind.
+    pub fn find_word_by_lemma(
+        &self,
+        lemma: &str,
+        kind: Option<&str>,
+    ) -> Result<Option<Value>, String> {
+        find_word_with_connection(&self.conn, lemma, kind)
+    }
+
+    /// Words in the order the ids were asked for, skipping unknown and
+    /// repeated ids. Unlike [`Database::get_words_by_ids`], an empty request
+    /// yields nothing rather than the whole library, and callers can pair the
+    /// result with their own list without guessing.
+    pub fn get_words_in_order(&self, ids: &[String]) -> Result<Vec<Value>, String> {
+        let mut seen = HashSet::new();
+        let unique: Vec<&str> = ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| seen.insert(*id))
+            .collect();
+        let mut by_id: HashMap<String, Value> = HashMap::with_capacity(unique.len());
+        for chunk in unique.chunks(500) {
+            let sql = format!(
+                "SELECT id, data FROM words WHERE id IN ({})",
+                vec!["?"; chunk.len()].join(",")
+            );
+            let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                let (id, data) = row.map_err(|e| e.to_string())?;
+                if let Ok(value) = serde_json::from_str::<Value>(&data) {
+                    by_id.insert(id, value);
+                }
+            }
+        }
+        Ok(unique
+            .into_iter()
+            .filter_map(|id| by_id.remove(id))
+            .collect())
+    }
+
+    /// Record which Anki note each word became. One transaction for the whole
+    /// batch; both the JSON document and the indexed column are updated, and
+    /// ids that no longer exist are ignored. Returns the number of words
+    /// updated.
+    pub fn set_anki_note_ids(&self, pairs: &[(String, i64)]) -> Result<u32, String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let mut updated = 0_u32;
+        for (id, note_id) in pairs {
+            let Some(mut word) = word_json_by_id(&tx, id)? else {
+                continue;
+            };
+            if let Some(object) = word.as_object_mut() {
+                object.insert("ankiNoteId".into(), Value::from(*note_id));
+            }
+            tx.execute(
+                "UPDATE words SET data = ?2, anki_note_id = ?3 WHERE id = ?1",
+                params![id, word.to_string(), note_id.to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+            updated += 1;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(updated)
+    }
+
+    /// Apply one change to many words in a single transaction: either every
+    /// existing word is updated or none is. Unknown ids are counted, not fatal.
+    pub fn batch_update_words(
+        &self,
+        ids: &[String],
+        patch: &BatchWordPatch,
+    ) -> Result<BatchUpdateReport, String> {
+        let patch = patch.validated()?;
+        let touches_tags = !patch.add_tags.is_empty() || !patch.remove_tags.is_empty();
+        let include_long_form = self.include_long_form_review();
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let mut seen = HashSet::new();
+        let mut report = BatchUpdateReport {
+            updated: 0,
+            missing: 0,
+        };
+        for id in ids.iter().filter(|id| seen.insert(id.as_str())) {
+            let Some(mut word) = word_json_by_id(&tx, id)? else {
+                report.missing += 1;
+                continue;
+            };
+            let mut tags = tags_of(&word);
+            tags.retain(|tag| !patch.remove_tags.contains(tag));
+            for tag in &patch.add_tags {
+                if !tags.contains(tag) {
+                    tags.push(tag.clone());
+                }
+            }
+            let object = word
+                .as_object_mut()
+                .ok_or_else(|| format!("词条数据损坏 ({id})"))?;
+            if let Some(level) = patch.mastery {
+                object.insert("mastery".into(), Value::String(level.to_string()));
+            }
+            if touches_tags {
+                object.insert("tags".into(), tags_value(tags));
+            }
+            save_word_with_connection(&tx, &word, include_long_form)?;
+            report.updated += 1;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(report)
     }
 
     pub fn import_words(
@@ -817,35 +1241,31 @@ impl Database {
         mapping: &std::collections::HashMap<String, String>,
     ) -> Result<crate::word_import::WordImportResult, String> {
         let (rows, mut errors) = crate::word_import::parse_import_rows(content, format, mapping)?;
-        let include_long_form = self
-            .get_settings()
-            .ok()
-            .and_then(|settings| {
-                settings
-                    .get("includeLongFormReview")
-                    .and_then(Value::as_bool)
-            })
-            .unwrap_or(false);
-        let existing = self.get_all_words()?;
+        let include_long_form = self.include_long_form_review();
+        let mut known = self.get_all_words()?;
+        // Normalised lemma -> position in `known`. The first occurrence wins,
+        // exactly as a linear scan would have found it. The scan itself made
+        // big imports quadratic: 3000 rows into 3000 words took about 10 s.
+        let mut index_by_lemma: HashMap<String, usize> = HashMap::with_capacity(known.len());
+        for (position, word) in known.iter().enumerate() {
+            if let Some(lemma) = word.get("lemma").and_then(Value::as_str) {
+                index_by_lemma
+                    .entry(normalize_import_lemma(lemma))
+                    .or_insert(position);
+            }
+        }
         let tx = self
             .conn
             .unchecked_transaction()
             .map_err(|e| e.to_string())?;
-        let mut known = existing;
         let mut inserted = 0_u32;
         let mut merged = 0_u32;
         let mut skipped = errors.len() as u32;
         for row in rows {
             let imported_lemma = row.fields.get("lemma").cloned().unwrap_or_default();
             let key = normalize_import_lemma(&imported_lemma);
-            let existing_index = known.iter().position(|word| {
-                word.get("lemma")
-                    .and_then(Value::as_str)
-                    .map(normalize_import_lemma)
-                    .as_deref()
-                    == Some(key.as_str())
-            });
-            let mut word = if let Some(index) = existing_index {
+            let existing_index = index_by_lemma.get(&key).copied();
+            let word = if let Some(index) = existing_index {
                 let mut current = known[index].clone();
                 let object = current.as_object_mut().ok_or("已有词条格式无效")?;
                 for (field, value) in &row.fields {
@@ -928,7 +1348,8 @@ impl Database {
             if let Some(index) = existing_index {
                 known[index] = word;
             } else {
-                known.push(std::mem::take(&mut word));
+                index_by_lemma.insert(key, known.len());
+                known.push(word);
             }
         }
         tx.commit().map_err(|e| e.to_string())?;
@@ -939,110 +1360,6 @@ impl Database {
             errors,
         })
     }
-
-    /*
-     * The implementation below is shared by normal saves and the import
-     * transaction so review_state and user-owned JSON fields are untouched.
-     */
-    /* old implementation removed by the helper below */
-    /*
-        let id = word.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        let lemma = word.get("lemma").and_then(|v| v.as_str()).unwrap_or("");
-        let translation = word
-            .get("translation")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let pos = word.get("pos").and_then(|v| v.as_str()).unwrap_or("");
-        let context_meaning = word
-            .get("contextMeaning")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let explanation = word
-            .get("explanation")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let source_app = word.get("sourceApp").and_then(|v| v.as_str()).unwrap_or("");
-        let source_title = word
-            .get("sourceTitle")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let mastery = word
-            .get("mastery")
-            .and_then(|v| v.as_str())
-            .unwrap_or("new");
-        let kind = word.get("kind").and_then(|v| v.as_str()).unwrap_or("word");
-        let saved_at = word.get("savedAt").and_then(|v| v.as_str()).unwrap_or("");
-        let lookups = word.get("lookups").and_then(|v| v.as_u64()).unwrap_or(1) as i64;
-        let now = chrono::Utc::now().to_rfc3339();
-        let saved = if saved_at.is_empty() { &now } else { saved_at };
-
-        self.conn
-            .execute(
-                "INSERT INTO words (id, lemma, translation, pos, context_meaning, explanation, source_app, source_title, mastery, kind, saved_at, updated_at, lookups, data)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-                 ON CONFLICT(id) DO UPDATE SET
-                   lemma=excluded.lemma, translation=excluded.translation, pos=excluded.pos,
-                   context_meaning=excluded.context_meaning, explanation=excluded.explanation,
-                   source_app=excluded.source_app, source_title=excluded.source_title,
-                   mastery=excluded.mastery, kind=excluded.kind, updated_at=excluded.updated_at,
-                   lookups=excluded.lookups, data=excluded.data",
-                params![
-                    id,
-                    lemma,
-                    translation,
-                    pos,
-                    context_meaning,
-                    explanation,
-                    source_app,
-                    source_title,
-                    mastery,
-                    kind,
-                    saved,
-                    now,
-                    lookups,
-                    word.to_string(),
-                ],
-            )
-            .map_err(|e| e.to_string())?;
-
-        self.conn
-            .execute("DELETE FROM word_tags WHERE word_id = ?1", params![id])
-            .map_err(|e| e.to_string())?;
-
-        if let Some(tags) = word.get("tags").and_then(|v| v.as_array()) {
-            for tag in tags {
-                if let Some(tag_str) = tag.as_str() {
-                    self.conn
-                        .execute(
-                            "INSERT OR IGNORE INTO word_tags (word_id, tag) VALUES (?1, ?2)",
-                            params![id, tag_str],
-                        )
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-        }
-
-        let include_long_form = self
-            .get_settings()
-            .ok()
-            .and_then(|settings| {
-                settings
-                    .get("includeLongFormReview")
-                    .and_then(|value| value.as_bool())
-            })
-            .unwrap_or(false);
-        if matches!(kind, "word" | "phrase") || include_long_form {
-            self.conn
-                .execute(
-                    "INSERT OR IGNORE INTO review_state (word_id, box, due_at, created_at)
-                     VALUES (?1, 1, date('now', 'localtime', '+1 day'), datetime('now'))",
-                    params![id],
-                )
-                .map_err(|e| format!("创建复习记录失败: {e}"))?;
-        }
-
-        Ok(())
-    */
 
     pub fn get_review_queue(&self, limit: Option<u32>) -> Result<Vec<Value>, String> {
         let requested = limit.unwrap_or_else(|| {
@@ -1377,30 +1694,16 @@ impl Database {
     }
 
     pub fn tag_session(&self, session_id: &str, tags: &[String]) -> Result<u32, String> {
-        let ids = self.session_word_ids(session_id)?;
-        for id in &ids {
-            let raw: String = self
-                .conn
-                .query_row("SELECT data FROM words WHERE id=?1", params![id], |row| {
-                    row.get(0)
-                })
-                .map_err(|e| e.to_string())?;
-            let mut word: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-            let mut merged = word
-                .get("tags")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            for tag in tags {
-                if !merged.iter().any(|value| value.as_str() == Some(tag)) {
-                    merged.push(Value::String(tag.clone()));
-                }
-            }
-            word.as_object_mut()
-                .map(|object| object.insert("tags".into(), Value::Array(merged)));
-            self.save_word(&word)?;
+        let add_tags = clean_tag_list(tags)?;
+        if add_tags.is_empty() {
+            return Ok(0);
         }
-        Ok(ids.len() as u32)
+        let ids = self.session_word_ids(session_id)?;
+        let patch = BatchWordPatch {
+            add_tags,
+            ..BatchWordPatch::default()
+        };
+        Ok(self.batch_update_words(&ids, &patch)?.updated)
     }
 
     pub fn add_session_to_review(&self, session_id: &str) -> Result<u32, String> {
@@ -1426,13 +1729,19 @@ impl Database {
         self.save_word(&word)
     }
 
+    /// Delete words (and, through the foreign keys, their tags and review
+    /// state) in one transaction, so a failure cannot leave a half-deleted
+    /// selection and a large selection costs one commit instead of one each.
     pub fn delete_words(&self, ids: &[String]) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
         for id in ids {
-            self.conn
-                .execute("DELETE FROM words WHERE id = ?1", params![id])
+            tx.execute("DELETE FROM words WHERE id = ?1", params![id])
                 .map_err(|e| e.to_string())?;
         }
-        Ok(())
+        tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn get_all_tags(&self) -> Result<Vec<String>, String> {
@@ -1860,7 +2169,9 @@ impl Database {
         }))
     }
 
-    pub fn increment_usage(&self, tokens: u32) -> Result<(), String> {
+    /// Count one lookup that returned a result towards today's usage. A lookup answered from the
+    /// cache passes 0 tokens: it is still a lookup the user made, but it cost nothing.
+    pub fn record_lookup(&self, tokens: u32) -> Result<(), String> {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         self.conn
             .execute(
@@ -2127,6 +2438,145 @@ impl Database {
             .map_err(|e| e.to_string())
     }
 
+    /// Remember a lookup: a new entry, or one more time for an entry that is already there,
+    /// which then moves to the top. Only the newest [`HISTORY_LIMIT`] entries are kept, and a
+    /// blank selection is not worth remembering.
+    pub fn record_history(&self, record: &HistoryRecord<'_>) -> Result<(), String> {
+        self.record_history_at(record, &history_timestamp())
+    }
+
+    fn record_history_at(&self, record: &HistoryRecord<'_>, now: &str) -> Result<(), String> {
+        let selection = clipped(record.selection, HISTORY_SELECTION_CHARS);
+        if selection.is_empty() {
+            return Ok(());
+        }
+        let kind = match record.kind.trim() {
+            "" => "word",
+            kind => kind,
+        };
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        // A repeat refreshes what the entry says but never blanks what an earlier lookup knew:
+        // a lookup without captured context or source keeps the previous ones.
+        tx.execute(
+            "INSERT INTO lookup_history
+                 (history_key, selection, context, lemma, translation, kind,
+                  source_app, source_title, lookup_count, first_at, last_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?9)
+             ON CONFLICT(history_key) DO UPDATE SET
+                 selection = excluded.selection,
+                 lemma = excluded.lemma,
+                 translation = excluded.translation,
+                 context = CASE WHEN excluded.context <> '' THEN excluded.context ELSE context END,
+                 source_app = CASE WHEN excluded.source_app <> '' THEN excluded.source_app ELSE source_app END,
+                 source_title = CASE WHEN excluded.source_title <> '' THEN excluded.source_title ELSE source_title END,
+                 lookup_count = lookup_count + 1,
+                 last_at = excluded.last_at",
+            params![
+                history_key(&selection, kind),
+                selection,
+                clipped(record.context, HISTORY_CONTEXT_CHARS),
+                clipped(record.lemma, HISTORY_LEMMA_CHARS),
+                clipped(record.translation, HISTORY_TRANSLATION_CHARS),
+                kind,
+                record.source_app.trim(),
+                record.source_title.trim(),
+                now,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM lookup_history WHERE id IN (
+                 SELECT id FROM lookup_history ORDER BY last_at DESC, id DESC LIMIT -1 OFFSET ?1)",
+            params![HISTORY_LIMIT],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// The history, newest first. Long selections are cut to a preview: the list is for
+    /// recognising an entry, [`Database::history_lookup`] has the full text.
+    pub fn list_history(&self) -> Result<Vec<Value>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id,
+                        CASE WHEN length(selection) > ?1
+                             THEN substr(selection, 1, ?1) || '…' ELSE selection END,
+                        lemma, translation, kind, source_app, source_title,
+                        lookup_count, first_at, last_at
+                 FROM lookup_history
+                 ORDER BY last_at DESC, id DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![HISTORY_PREVIEW_CHARS], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "selection": row.get::<_, String>(1)?,
+                    "lemma": row.get::<_, String>(2)?,
+                    "translation": row.get::<_, String>(3)?,
+                    "kind": row.get::<_, String>(4)?,
+                    "sourceApp": row.get::<_, String>(5)?,
+                    "sourceTitle": row.get::<_, String>(6)?,
+                    "count": row.get::<_, i64>(7)?,
+                    "firstAt": row.get::<_, String>(8)?,
+                    "lastAt": row.get::<_, String>(9)?,
+                }))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<SqlResult<Vec<_>>>()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Everything needed to ask the same question again: the full selection and its context.
+    pub fn history_lookup(&self, id: i64) -> Result<Option<Value>, String> {
+        self.conn
+            .query_row(
+                "SELECT selection, context, kind, source_app, source_title
+                 FROM lookup_history WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(serde_json::json!({
+                        "selection": row.get::<_, String>(0)?,
+                        "context": row.get::<_, String>(1)?,
+                        "kind": row.get::<_, String>(2)?,
+                        "sourceApp": row.get::<_, String>(3)?,
+                        "sourceTitle": row.get::<_, String>(4)?,
+                    }))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn delete_history(&self, ids: &[i64]) -> Result<u64, String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let mut removed = 0_u64;
+        {
+            let mut stmt = tx
+                .prepare("DELETE FROM lookup_history WHERE id = ?1")
+                .map_err(|e| e.to_string())?;
+            for id in ids {
+                removed += stmt.execute(params![id]).map_err(|e| e.to_string())? as u64;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(removed)
+    }
+
+    pub fn clear_history(&self) -> Result<u64, String> {
+        self.conn
+            .execute("DELETE FROM lookup_history", [])
+            .map(|count| count as u64)
+            .map_err(|e| e.to_string())
+    }
+
     pub fn get_stats(&self) -> Result<Value, String> {
         let word_count: i64 = self
             .conn
@@ -2150,13 +2600,207 @@ impl Database {
                 |row| row.get(0),
             )
             .map_err(|e| e.to_string())?;
+        let history_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM lookup_history", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
 
         Ok(serde_json::json!({
             "wordCount": word_count,
             "tagCount": tag_count,
             "cacheCount": cache_count,
             "cacheSizeBytes": cache_size_bytes,
+            "historyCount": history_count,
         }))
+    }
+
+    /// Everything the learning-insights page shows, for the last `days` days (7 to 90).
+    pub fn learning_insights(&self, days: u32) -> Result<Value, String> {
+        self.learning_insights_at(days, chrono::Local::now().date_naive())
+    }
+
+    fn learning_insights_at(&self, days: u32, today: chrono::NaiveDate) -> Result<Value, String> {
+        use crate::insights;
+        let days = days.clamp(7, 90);
+        let sql_error = |e: rusqlite::Error| e.to_string();
+
+        let mut facts = insights::Facts::default();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT date, queries FROM usage_log WHERE queries > 0")
+            .map_err(sql_error)?;
+        for row in stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(sql_error)?
+        {
+            let (date, queries) = row.map_err(sql_error)?;
+            if let Ok(day) = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d") {
+                *facts.lookups.entry(day).or_insert(0) += queries;
+            }
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT saved_at FROM words")
+            .map_err(sql_error)?;
+        for row in stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sql_error)?
+        {
+            if let Some(day) = insights::local_day(&row.map_err(sql_error)?) {
+                *facts.saved.entry(day).or_insert(0) += 1;
+            }
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT date, COALESCE(SUM(count), 0) FROM local_events
+                 WHERE event = 'review_card_answered' GROUP BY date",
+            )
+            .map_err(sql_error)?;
+        for row in stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(sql_error)?
+        {
+            let (date, answered) = row.map_err(sql_error)?;
+            if let Ok(day) = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d") {
+                *facts.reviews.entry(day).or_insert(0) += answered;
+            }
+        }
+
+        // How well the words are known; anything unexpected counts as new, so the parts add up.
+        let mut mastery = serde_json::Map::new();
+        for level in ["new", "learning", "familiar", "mastered"] {
+            mastery.insert(level.into(), Value::from(0));
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT COALESCE(mastery, 'new'), COUNT(*) FROM words GROUP BY 1")
+            .map_err(sql_error)?;
+        for row in stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(sql_error)?
+        {
+            let (level, count) = row.map_err(sql_error)?;
+            let level = if mastery.contains_key(&level) {
+                level
+            } else {
+                "new".to_string()
+            };
+            let total = mastery[&level].as_i64().unwrap_or(0) + count;
+            mastery.insert(level, Value::from(total));
+        }
+
+        let today_text = insights::day_key(today);
+        let due_today: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM review_state WHERE date(due_at) <= ?1",
+                params![today_text],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        let mut boxes = [0_i64; 3];
+        let mut stmt = self
+            .conn
+            .prepare("SELECT box, COUNT(*) FROM review_state GROUP BY box")
+            .map_err(sql_error)?;
+        for row in stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .map_err(sql_error)?
+        {
+            let (box_number, count) = row.map_err(sql_error)?;
+            if (1..=3).contains(&box_number) {
+                boxes[(box_number - 1) as usize] = count;
+            }
+        }
+        let (correct, wrong): (i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(correct_count), 0), COALESCE(SUM(wrong_count), 0)
+                 FROM review_state",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(sql_error)?;
+
+        // A short ranking: each row is a name and a number, under the given keys.
+        let ranked =
+            |sql: &str, label: &'static str, number: &'static str| -> Result<Vec<Value>, String> {
+                let mut stmt = self.conn.prepare(sql).map_err(sql_error)?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        let mut item = serde_json::Map::new();
+                        item.insert(label.to_string(), Value::from(row.get::<_, String>(0)?));
+                        item.insert(number.to_string(), Value::from(row.get::<_, i64>(1)?));
+                        Ok(Value::Object(item))
+                    })
+                    .map_err(sql_error)?;
+                rows.collect::<SqlResult<Vec<Value>>>().map_err(sql_error)
+            };
+        let top_sources = ranked(
+            "SELECT source_app, COUNT(*) FROM words WHERE source_app <> ''
+             GROUP BY source_app ORDER BY 2 DESC, 1 ASC LIMIT 5",
+            "source",
+            "count",
+        )?;
+        let often_looked_up = ranked(
+            "SELECT lemma, lookups FROM words
+             WHERE lookups > 1 AND kind IN ('word', 'phrase')
+             ORDER BY lookups DESC, saved_at DESC, lemma ASC LIMIT 5",
+            "lemma",
+            "count",
+        )?;
+        let hard_words = ranked(
+            "SELECT w.lemma, r.wrong_count FROM review_state r JOIN words w ON w.id = r.word_id
+             WHERE r.wrong_count > 0 AND w.kind IN ('word', 'phrase')
+             ORDER BY r.wrong_count DESC, r.correct_count ASC, w.lemma ASC LIMIT 5",
+            "lemma",
+            "wrong",
+        )?;
+
+        let word_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM words", [], |row| row.get(0))
+            .map_err(sql_error)?;
+        let total_lookups: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(queries), 0) FROM usage_log",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+
+        let mut result = insights::activity(days, today, &facts);
+        if let Some(object) = result.as_object_mut() {
+            object.insert("today".into(), Value::from(today_text));
+            object.insert("days".into(), Value::from(days));
+            object.insert(
+                "totals".into(),
+                serde_json::json!({ "words": word_count, "lookups": total_lookups }),
+            );
+            object.insert("mastery".into(), Value::Object(mastery));
+            object.insert(
+                "review".into(),
+                serde_json::json!({
+                    "dueToday": due_today,
+                    "total": boxes.iter().sum::<i64>(),
+                    "boxCounts": boxes,
+                    "correct": correct,
+                    "wrong": wrong,
+                }),
+            );
+            object.insert("topSources".into(), Value::Array(top_sources));
+            object.insert("oftenLookedUp".into(), Value::Array(often_looked_up));
+            object.insert("hardWords".into(), Value::Array(hard_words));
+        }
+        Ok(result)
     }
 }
 
@@ -2192,8 +2836,29 @@ pub(crate) fn validate_database_file(path: &Path) -> Result<(), String> {
 }
 
 fn validate_schema_contract(conn: &Connection) -> Result<(), String> {
-    const REQUIRED_COLUMNS: &[(&str, &[&str])] = &[
+    validate_schema_contract_as_of(conn, crate::migrations::LATEST_SCHEMA_VERSION)
+}
+
+/// A backup made by this or an earlier version can be restored: afterwards it is upgraded
+/// exactly like an old database the app opens. One made by a newer app cannot, since this
+/// app does not know what it holds. What the backup must contain is what its own version had.
+fn validate_restorable(conn: &Connection) -> Result<(), String> {
+    validate_integrity(conn)?;
+    let version = crate::migrations::current_version(conn)?;
+    if version > crate::migrations::LATEST_SCHEMA_VERSION {
+        return Err(format!(
+            "备份来自更新版本的应用（schema v{version}），请先升级应用再恢复"
+        ));
+    }
+    validate_schema_contract_as_of(conn, version)
+}
+
+/// Checks the tables and columns a database of schema `version` has to have. Each entry says
+/// since which version it exists, so an older backup is held to what its own version had.
+fn validate_schema_contract_as_of(conn: &Connection, version: i64) -> Result<(), String> {
+    const REQUIRED_COLUMNS: &[(i64, &str, &[&str])] = &[
         (
+            0,
             "words",
             &[
                 "id",
@@ -2212,12 +2877,17 @@ fn validate_schema_contract(conn: &Connection) -> Result<(), String> {
                 "data",
             ],
         ),
-        ("word_tags", &["word_id", "tag"]),
-        ("cache", &["cache_key", "model", "response", "created_at"]),
-        ("settings", &["key", "value"]),
-        ("templates", &["id", "data"]),
-        ("usage_log", &["date", "queries", "tokens"]),
+        (0, "word_tags", &["word_id", "tag"]),
         (
+            0,
+            "cache",
+            &["cache_key", "model", "response", "created_at"],
+        ),
+        (0, "settings", &["key", "value"]),
+        (0, "templates", &["id", "data"]),
+        (0, "usage_log", &["date", "queries", "tokens"]),
+        (
+            1,
             "review_state",
             &[
                 "word_id",
@@ -2231,6 +2901,7 @@ fn validate_schema_contract(conn: &Connection) -> Result<(), String> {
             ],
         ),
         (
+            3,
             "glossary_terms",
             &[
                 "id",
@@ -2245,10 +2916,35 @@ fn validate_schema_contract(conn: &Connection) -> Result<(), String> {
                 "updated_at",
             ],
         ),
-        ("local_events", &["id", "date", "event", "count", "extra"]),
+        (
+            4,
+            "local_events",
+            &["id", "date", "event", "count", "extra"],
+        ),
+        (
+            6,
+            "lookup_history",
+            &[
+                "id",
+                "history_key",
+                "selection",
+                "context",
+                "lemma",
+                "translation",
+                "kind",
+                "source_app",
+                "source_title",
+                "lookup_count",
+                "first_at",
+                "last_at",
+            ],
+        ),
     ];
 
-    for (table, required_columns) in REQUIRED_COLUMNS {
+    for (_, table, required_columns) in REQUIRED_COLUMNS
+        .iter()
+        .filter(|(since, _, _)| *since <= version)
+    {
         let exists: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
@@ -3146,6 +3842,904 @@ mod tests {
     }
 
     #[test]
+    fn saving_a_lookup_inserts_a_complete_new_word() {
+        let db = new_db();
+        let saved = db
+            .save_lookup_result(&lookup_entry("Idempotent", "word", "幂等的"))
+            .unwrap();
+        let id = saved["id"].as_str().unwrap();
+        assert!(!id.is_empty());
+        assert!(!saved["savedAt"].as_str().unwrap().is_empty());
+        assert_eq!(saved["mastery"], "new");
+        assert_eq!(saved["lookups"], 1);
+        assert_eq!(saved["note"], "");
+        assert_eq!(saved["tags"], serde_json::json!([]));
+        assert_eq!(db.get_all_words().unwrap(), vec![saved.clone()]);
+        let reviews: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM review_state WHERE word_id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reviews, 1);
+    }
+
+    #[test]
+    fn saving_a_lookup_again_keeps_everything_the_user_owns() {
+        let db = new_db();
+        let first = db
+            .save_lookup_result(&lookup_entry("idempotent", "word", "旧释义"))
+            .unwrap();
+        let id = first["id"].as_str().unwrap().to_string();
+        db.update_word(
+            &id,
+            &serde_json::json!({"mastery": "familiar", "note": "我的笔记", "tags": ["cs"]}),
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "UPDATE review_state SET box=3 WHERE word_id=?1",
+                params![id],
+            )
+            .unwrap();
+        db.set_anki_note_ids(&[(id.clone(), 1_700_000_000_123)])
+            .unwrap();
+
+        // The lookup window only knows the entry it fetched: no user state.
+        let mut again = lookup_entry("idempotent", "word", "新释义");
+        again["id"] = Value::String(id.clone());
+        again["mastery"] = Value::String("new".into());
+        again["tags"] = serde_json::json!(["ai"]);
+        again["savedAt"] = Value::String("2099-01-01T00:00:00Z".into());
+        again["sourceApp"] = Value::String("Browser".into());
+        again["context"] = Value::String("a newer sentence".into());
+        again["lookups"] = Value::from(1);
+        let merged = db.save_lookup_result(&again).unwrap();
+
+        // The content follows the newest lookup ...
+        assert_eq!(merged["translation"], "新释义");
+        assert_eq!(merged["context"], "a newer sentence");
+        // ... while everything the user owns, and the first source, is kept.
+        assert_eq!(merged["id"], id.as_str());
+        assert_eq!(merged["mastery"], "familiar");
+        assert_eq!(merged["note"], "我的笔记");
+        assert_eq!(merged["tags"], serde_json::json!(["cs", "ai"]));
+        assert_eq!(merged["savedAt"], first["savedAt"]);
+        assert_eq!(merged["sourceApp"], "Reader");
+        assert_eq!(merged["lookups"], 2);
+        assert_eq!(merged["ankiNoteId"], 1_700_000_000_123_i64);
+
+        // One row, and what was returned is what is stored.
+        assert_eq!(db.get_all_words().unwrap(), vec![merged.clone()]);
+        let box_number: i64 = db
+            .conn
+            .query_row(
+                "SELECT box FROM review_state WHERE word_id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(box_number, 3, "review progress must survive a re-lookup");
+        let anki: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT anki_note_id FROM words WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(anki.as_deref(), Some("1700000000123"));
+        let mut stmt = db
+            .conn
+            .prepare("SELECT tag FROM word_tags WHERE word_id=?1 ORDER BY tag")
+            .unwrap();
+        let tags: Vec<String> = stmt
+            .query_map(params![id], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(tags, ["ai", "cs"]);
+    }
+
+    #[test]
+    fn a_second_lookup_with_a_new_id_merges_by_normalised_lemma_and_kind() {
+        let db = new_db();
+        let first = db
+            .save_lookup_result(&lookup_entry("Hello  World", "phrase", "你好世界"))
+            .unwrap();
+        let mut again = lookup_entry(" hello world ", "phrase", "世界你好");
+        again["id"] = Value::String("w-brand-new-id".into());
+        let merged = db.save_lookup_result(&again).unwrap();
+        assert_eq!(merged["id"], first["id"]);
+        assert_eq!(merged["lemma"], "Hello  World", "stored spelling is kept");
+        assert_eq!(merged["translation"], "世界你好");
+        assert_eq!(merged["lookups"], 2);
+        assert_eq!(db.get_all_words().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn lookups_of_different_kinds_stay_separate_words() {
+        let db = new_db();
+        db.save_lookup_result(&lookup_entry("run", "word", "跑"))
+            .unwrap();
+        db.save_lookup_result(&lookup_entry("run", "sentence", "跑。"))
+            .unwrap();
+        assert_eq!(db.get_all_words().unwrap().len(), 2);
+        assert!(db
+            .find_word_by_lemma("RUN", Some("sentence"))
+            .unwrap()
+            .is_some());
+        assert!(db
+            .find_word_by_lemma("run", Some("phrase"))
+            .unwrap()
+            .is_none());
+        assert!(db.find_word_by_lemma("  Run ", None).unwrap().is_some());
+        assert!(db.find_word_by_lemma("   ", None).unwrap().is_none());
+    }
+
+    #[test]
+    fn lemma_matching_folds_non_ascii_case_like_the_importer() {
+        // SQLite's own lower() only understands ASCII, so this would have been
+        // missed by a purely SQL-side comparison.
+        let db = new_db();
+        db.save_lookup_result(&lookup_entry("Über", "word", "over"))
+            .unwrap();
+        let merged = db
+            .save_lookup_result(&lookup_entry("über", "word", "above"))
+            .unwrap();
+        assert_eq!(merged["lookups"], 2);
+        assert_eq!(db.get_all_words().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn saving_a_lookup_without_a_lemma_is_rejected_and_stores_nothing() {
+        let db = new_db();
+        assert!(db
+            .save_lookup_result(&lookup_entry("   ", "word", "x"))
+            .is_err());
+        assert!(db
+            .save_lookup_result(&serde_json::json!("not an object"))
+            .is_err());
+        assert!(db.get_all_words().unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_duplicates_resolve_to_the_earliest_saved_word() {
+        let db = new_db();
+        let mut early = sample_word("early", "Reader", "2026-08-01T10:00:00+08:00");
+        early["lemma"] = Value::String("dup".into());
+        let mut late = sample_word("late", "Reader", "2026-08-02T10:00:00+08:00");
+        late["lemma"] = Value::String("Dup".into());
+        db.save_word(&late).unwrap();
+        db.save_word(&early).unwrap();
+        let merged = db
+            .save_lookup_result(&lookup_entry("dup", "word", "新"))
+            .unwrap();
+        assert_eq!(merged["id"], "early");
+        assert_eq!(
+            db.get_all_words().unwrap().len(),
+            2,
+            "existing duplicates are never silently deleted"
+        );
+    }
+
+    #[test]
+    fn words_in_order_follow_the_request_and_skip_unknown_and_repeated_ids() {
+        let db = new_db();
+        for (id, saved_at) in [
+            ("a", "2026-08-01T10:00:00+08:00"),
+            ("b", "2026-08-02T10:00:00+08:00"),
+            ("c", "2026-08-03T10:00:00+08:00"),
+        ] {
+            db.save_word(&sample_word(id, "Reader", saved_at)).unwrap();
+        }
+        let ids: Vec<String> = ["a", "c", "missing", "b", "a"].map(String::from).to_vec();
+        assert_eq!(
+            ids_of(&db.get_words_in_order(&ids).unwrap()),
+            ["a", "c", "b"]
+        );
+        // The older helper sorts newest first, so pairing its output with the
+        // requested ids by position (what the Anki export did) mixed words up.
+        let legacy = db
+            .get_words_by_ids(&["a".to_string(), "c".to_string()])
+            .unwrap();
+        assert_eq!(ids_of(&legacy), ["c", "a"]);
+        assert!(db.get_words_in_order(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn anki_note_ids_are_stored_in_the_document_and_the_indexed_column() {
+        let db = new_db();
+        for id in ["a", "b", "c"] {
+            db.save_word(&sample_word(id, "Reader", "2026-08-01T10:00:00+08:00"))
+                .unwrap();
+        }
+        let updated = db
+            .set_anki_note_ids(&[("a".into(), 11), ("ghost".into(), 99), ("b".into(), 22)])
+            .unwrap();
+        assert_eq!(updated, 2);
+        let words = db
+            .get_words_in_order(&["a".to_string(), "b".to_string()])
+            .unwrap();
+        assert_eq!(words[0]["ankiNoteId"], 11);
+        assert_eq!(words[1]["ankiNoteId"], 22);
+        let column = |id: &str| -> Option<String> {
+            db.conn
+                .query_row(
+                    "SELECT anki_note_id FROM words WHERE id=?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(column("a").as_deref(), Some("11"));
+        assert_eq!(column("b").as_deref(), Some("22"));
+        assert_eq!(column("c"), None, "a word never sent has no link");
+        // An ordinary edit keeps the link in the document and the column.
+        db.update_word("a", &serde_json::json!({"note": "edited"}))
+            .unwrap();
+        assert_eq!(column("a").as_deref(), Some("11"));
+    }
+
+    #[test]
+    fn batch_update_changes_mastery_and_edits_tags_on_every_word() {
+        let db = new_db();
+        for (id, tags) in [
+            ("a", serde_json::json!(["x"])),
+            ("b", serde_json::json!([])),
+            ("c", serde_json::json!(["x", "y"])),
+        ] {
+            let mut word = sample_word(id, "Reader", "2026-08-01T10:00:00+08:00");
+            word["tags"] = tags;
+            db.save_word(&word).unwrap();
+        }
+        let ids: Vec<String> = ["a", "b", "c", "ghost", "a"].map(String::from).to_vec();
+        let report = db
+            .batch_update_words(
+                &ids,
+                &BatchWordPatch {
+                    mastery: Some("learning".into()),
+                    add_tags: vec![" fresh ".into(), "x".into()],
+                    remove_tags: vec!["y".into()],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            report,
+            BatchUpdateReport {
+                updated: 3,
+                missing: 1
+            }
+        );
+        let words = db
+            .get_words_in_order(&["a".to_string(), "b".to_string(), "c".to_string()])
+            .unwrap();
+        let tags: Vec<Value> = words.iter().map(|word| word["tags"].clone()).collect();
+        assert_eq!(
+            tags,
+            vec![
+                serde_json::json!(["x", "fresh"]),
+                serde_json::json!(["fresh", "x"]),
+                serde_json::json!(["x", "fresh"]),
+            ]
+        );
+        assert!(words.iter().all(|word| word["mastery"] == "learning"));
+        let mut stmt = db
+            .conn
+            .prepare("SELECT tag FROM word_tags WHERE word_id='c' ORDER BY tag")
+            .unwrap();
+        let indexed: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(indexed, ["fresh", "x"]);
+        let reviews: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM review_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(reviews, 3, "batch edits must not reset review state");
+    }
+
+    #[test]
+    fn batch_mastery_change_leaves_tags_untouched() {
+        let db = new_db();
+        let mut word = sample_word("a", "Reader", "2026-08-01T10:00:00+08:00");
+        word["tags"] = serde_json::json!(["  spaced ", "dup", "dup"]);
+        db.save_word(&word).unwrap();
+        db.batch_update_words(
+            &["a".to_string()],
+            &BatchWordPatch {
+                mastery: Some("mastered".into()),
+                ..BatchWordPatch::default()
+            },
+        )
+        .unwrap();
+        let stored = db.get_words_in_order(&["a".to_string()]).unwrap();
+        assert_eq!(stored[0]["mastery"], "mastered");
+        assert_eq!(stored[0]["tags"], word["tags"]);
+    }
+
+    #[test]
+    fn batch_update_rejects_bad_patches_before_touching_any_word() {
+        let db = new_db();
+        db.save_word(&sample_word("a", "Reader", "2026-08-01T10:00:00+08:00"))
+            .unwrap();
+        let ids = vec!["a".to_string()];
+        let bad_patches = [
+            BatchWordPatch {
+                mastery: Some("expert".into()),
+                ..BatchWordPatch::default()
+            },
+            BatchWordPatch::default(),
+            BatchWordPatch {
+                add_tags: vec!["x".repeat(33)],
+                ..BatchWordPatch::default()
+            },
+            BatchWordPatch {
+                add_tags: (0..21).map(|n| format!("t{n}")).collect(),
+                ..BatchWordPatch::default()
+            },
+        ];
+        for patch in &bad_patches {
+            assert!(db.batch_update_words(&ids, patch).is_err(), "{patch:?}");
+        }
+        let stored = db.get_words_in_order(&ids).unwrap();
+        assert_eq!(stored[0]["mastery"], "new");
+        assert_eq!(stored[0]["tags"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn deleting_words_removes_their_tags_and_review_state_together() {
+        let db = new_db();
+        for id in ["a", "b", "c"] {
+            let mut word = sample_word(id, "Reader", "2026-08-01T10:00:00+08:00");
+            word["tags"] = serde_json::json!(["t"]);
+            db.save_word(&word).unwrap();
+        }
+        db.delete_words(&["a".to_string(), "b".to_string(), "ghost".to_string()])
+            .unwrap();
+        assert_eq!(ids_of(&db.get_all_words().unwrap()), ["c"]);
+        let count = |table: &str| -> i64 {
+            db.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(count("word_tags"), 1);
+        assert_eq!(count("review_state"), 1);
+    }
+
+    fn new_db() -> Database {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        db
+    }
+
+    /// What the lookup window hands over: the entry content, no user state.
+    fn lookup_entry(lemma: &str, kind: &str, translation: &str) -> Value {
+        serde_json::json!({
+            "selection": lemma,
+            "lemma": lemma,
+            "translation": translation,
+            "pos": "n.",
+            "contextMeaning": "context meaning",
+            "explanation": "explanation",
+            "kind": kind,
+            "sourceApp": "Reader",
+            "sourceTitle": "Doc",
+            "context": "context",
+            "tags": [],
+            "examples": [],
+            "associations": [],
+            "senses": [],
+            "collocations": []
+        })
+    }
+
+    fn ids_of(words: &[Value]) -> Vec<String> {
+        words
+            .iter()
+            .map(|word| word["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn usage_counts_today_and_this_month_but_not_older_months() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO usage_log (date, queries, tokens) VALUES ('2000-01-15', 7, 7000)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.get_usage().unwrap()["month"], 0);
+
+        db.record_lookup(120).unwrap();
+        db.record_lookup(0).unwrap(); // answered from the cache: counted, but free
+
+        let usage = db.get_usage().unwrap();
+        assert_eq!(usage["today"], 2);
+        assert_eq!(usage["month"], 2);
+        assert_eq!(usage["tokens"], 120);
+    }
+
+    fn history_db() -> Database {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        db
+    }
+
+    fn lookup<'a>(selection: &'a str, kind: &'a str) -> HistoryRecord<'a> {
+        HistoryRecord {
+            selection,
+            context: "",
+            kind,
+            lemma: "",
+            translation: "",
+            source_app: "",
+            source_title: "",
+        }
+    }
+
+    /// Strictly increasing timestamps, so ordering never depends on the clock.
+    fn at(n: u32) -> String {
+        format!("2026-10-07T12:00:{:02}.{:03}Z", n / 1000, n % 1000)
+    }
+
+    #[test]
+    fn history_keeps_one_entry_per_lookup_and_counts_repeats() {
+        let db = history_db();
+        let first = HistoryRecord {
+            lemma: "run",
+            translation: "跑",
+            ..lookup("Run", "word")
+        };
+        let again = HistoryRecord {
+            translation: "奔跑",
+            ..lookup("  run ", "word")
+        };
+        db.record_history_at(&first, &at(1)).unwrap();
+        db.record_history_at(&again, &at(2)).unwrap();
+
+        let list = db.list_history().unwrap();
+        assert_eq!(list.len(), 1, "case and spacing do not make a new word");
+        assert_eq!(list[0]["count"], 2);
+        assert_eq!(list[0]["selection"], "run", "the latest spelling is shown");
+        assert_eq!(list[0]["translation"], "奔跑");
+        assert_eq!(list[0]["firstAt"], at(1).as_str());
+        assert_eq!(list[0]["lastAt"], at(2).as_str());
+    }
+
+    #[test]
+    fn history_tells_sentences_apart_by_case_and_kinds_apart_always() {
+        let db = history_db();
+        db.record_history_at(&lookup("Time flies", "sentence"), &at(1))
+            .unwrap();
+        db.record_history_at(&lookup("time flies", "sentence"), &at(2))
+            .unwrap();
+        db.record_history_at(&lookup("Time   flies", "sentence"), &at(3))
+            .unwrap();
+        db.record_history_at(&lookup("Time flies", "phrase"), &at(4))
+            .unwrap();
+
+        let counts: Vec<(String, i64)> = db
+            .list_history()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                (
+                    format!(
+                        "{}/{}",
+                        item["selection"].as_str().unwrap(),
+                        item["kind"].as_str().unwrap()
+                    ),
+                    item["count"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            counts,
+            [
+                ("Time flies/phrase".to_string(), 1),
+                ("Time   flies/sentence".to_string(), 2),
+                ("time flies/sentence".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn history_lists_the_newest_first_and_a_repeat_moves_to_the_top() {
+        let db = history_db();
+        for (index, word) in ["alpha", "beta", "gamma"].into_iter().enumerate() {
+            db.record_history_at(&lookup(word, "word"), &at(index as u32 + 1))
+                .unwrap();
+        }
+        let order = |db: &Database| -> Vec<String> {
+            db.list_history()
+                .unwrap()
+                .iter()
+                .map(|item| item["selection"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(order(&db), ["gamma", "beta", "alpha"]);
+
+        db.record_history_at(&lookup("alpha", "word"), &at(10))
+            .unwrap();
+        assert_eq!(order(&db), ["alpha", "gamma", "beta"]);
+    }
+
+    #[test]
+    fn history_keeps_only_the_newest_entries() {
+        let db = history_db();
+        let total = HISTORY_LIMIT as u32 + 5;
+        for index in 0..total {
+            db.record_history_at(&lookup(&format!("word{index}"), "word"), &at(index))
+                .unwrap();
+        }
+        let list = db.list_history().unwrap();
+        assert_eq!(list.len() as i64, HISTORY_LIMIT);
+        assert_eq!(list[0]["selection"], format!("word{}", total - 1));
+        let oldest_kept = list.last().unwrap()["selection"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            oldest_kept, "word5",
+            "word0..word4 were the oldest and are gone"
+        );
+    }
+
+    #[test]
+    fn history_ignores_blank_selections_and_clips_long_text() {
+        let db = history_db();
+        db.record_history_at(&lookup("  \n ", "word"), &at(1))
+            .unwrap();
+        assert!(db.list_history().unwrap().is_empty());
+
+        let long = "字".repeat(5000);
+        db.record_history_at(&lookup(&long, "paragraph"), &at(2))
+            .unwrap();
+        let id = db.list_history().unwrap()[0]["id"].as_i64().unwrap();
+
+        let preview = db.list_history().unwrap()[0]["selection"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            preview.chars().count(),
+            401,
+            "400 characters and an ellipsis"
+        );
+        assert!(preview.ends_with('…'));
+        let full = db.history_lookup(id).unwrap().unwrap();
+        assert_eq!(full["selection"].as_str().unwrap().chars().count(), 2000);
+    }
+
+    #[test]
+    fn a_repeat_without_context_or_source_keeps_what_the_earlier_lookup_knew() {
+        let db = history_db();
+        let with_source = HistoryRecord {
+            context: "He was running late.",
+            source_app: "chrome.exe",
+            source_title: "News",
+            ..lookup("running", "word")
+        };
+        db.record_history_at(&with_source, &at(1)).unwrap();
+        db.record_history_at(&lookup("running", "word"), &at(2))
+            .unwrap();
+
+        let id = db.list_history().unwrap()[0]["id"].as_i64().unwrap();
+        let kept = db.history_lookup(id).unwrap().unwrap();
+        assert_eq!(kept["context"], "He was running late.");
+        assert_eq!(kept["sourceApp"], "chrome.exe");
+        assert_eq!(kept["sourceTitle"], "News");
+
+        let newer = HistoryRecord {
+            context: "Running is fun.",
+            source_app: "word.exe",
+            ..lookup("running", "word")
+        };
+        db.record_history_at(&newer, &at(3)).unwrap();
+        let updated = db.history_lookup(id).unwrap().unwrap();
+        assert_eq!(updated["context"], "Running is fun.");
+        assert_eq!(updated["sourceApp"], "word.exe");
+        assert_eq!(
+            updated["sourceTitle"], "News",
+            "no new title: the old one stays"
+        );
+    }
+
+    #[test]
+    fn history_can_be_reopened_deleted_and_cleared() {
+        let db = history_db();
+        let sentence = HistoryRecord {
+            context: "A sentence before.",
+            ..lookup("Time flies like an arrow.", "sentence")
+        };
+        db.record_history_at(&sentence, &at(1)).unwrap();
+        db.record_history_at(&lookup("alpha", "word"), &at(2))
+            .unwrap();
+        db.record_history_at(&lookup("beta", "word"), &at(3))
+            .unwrap();
+        assert_eq!(db.get_stats().unwrap()["historyCount"], 3);
+
+        let list = db.list_history().unwrap();
+        let sentence_id = list[2]["id"].as_i64().unwrap();
+        let question = db.history_lookup(sentence_id).unwrap().unwrap();
+        assert_eq!(question["selection"], "Time flies like an arrow.");
+        assert_eq!(question["context"], "A sentence before.");
+        assert_eq!(question["kind"], "sentence");
+        assert!(db.history_lookup(987_654).unwrap().is_none());
+
+        let beta_id = list[0]["id"].as_i64().unwrap();
+        assert_eq!(db.delete_history(&[beta_id, 987_654]).unwrap(), 1);
+        assert_eq!(db.list_history().unwrap().len(), 2);
+
+        assert_eq!(db.clear_history().unwrap(), 2);
+        assert!(db.list_history().unwrap().is_empty());
+        assert_eq!(db.get_stats().unwrap()["historyCount"], 0);
+    }
+
+    fn local_noon(day: chrono::NaiveDate) -> String {
+        use chrono::TimeZone;
+        chrono::Local
+            .from_local_datetime(&day.and_hms_opt(12, 0, 0).unwrap())
+            .earliest()
+            .unwrap()
+            .to_rfc3339()
+    }
+
+    #[test]
+    fn insights_summarise_the_days_the_library_and_the_reviews() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
+        let ago = |n: u64| today.checked_sub_days(chrono::Days::new(n)).unwrap();
+
+        let word = |id: &str,
+                    lemma: &str,
+                    kind: &str,
+                    mastery: &str,
+                    source: &str,
+                    lookups: u64,
+                    saved: chrono::NaiveDate| {
+            let mut word = sample_word(id, source, &local_noon(saved));
+            word["lemma"] = Value::String(lemma.into());
+            word["kind"] = Value::String(kind.into());
+            word["mastery"] = Value::String(mastery.into());
+            word["lookups"] = Value::from(lookups);
+            word
+        };
+        for saved in [
+            word("a", "run", "word", "learning", "Reader", 5, today),
+            word("b", "serendipity", "word", "new", "Reader", 1, ago(1)),
+            word(
+                "c",
+                "ubiquitous",
+                "word",
+                "mastered",
+                "chrome.exe",
+                3,
+                ago(2),
+            ),
+            // Long ago, a sentence (kept out of the word rankings) with a mastery nobody knows.
+            word("d", "Time flies.", "sentence", "odd", "", 9, ago(40)),
+        ] {
+            db.save_word(&saved).unwrap();
+        }
+        for (day, queries) in [(today, 4), (ago(1), 0), (ago(3), 2), (ago(60), 50)] {
+            db.conn
+                .execute(
+                    "INSERT INTO usage_log (date, queries, tokens) VALUES (?1, ?2, 0)",
+                    params![day.format("%Y-%m-%d").to_string(), queries],
+                )
+                .unwrap();
+        }
+        for (day, event, count) in [
+            (ago(1), "review_card_answered", 3),
+            (ago(1), "lookup_cache_hit", 8),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO local_events (date, event, count, extra) VALUES (?1, ?2, ?3, '{}')",
+                    params![day.format("%Y-%m-%d").to_string(), event, count],
+                )
+                .unwrap();
+        }
+        for (id, due, box_number, correct, wrong) in [
+            ("a", "2026-10-07", 1, 4, 0),
+            ("b", "2026-10-20", 2, 1, 3),
+            ("c", "2026-10-01", 3, 6, 1),
+        ] {
+            db.conn
+                .execute(
+                    "UPDATE review_state SET due_at=?2, box=?3, correct_count=?4, wrong_count=?5
+                     WHERE word_id=?1",
+                    params![id, due, box_number, correct, wrong],
+                )
+                .unwrap();
+        }
+
+        let result = db.learning_insights_at(30, today).unwrap();
+
+        assert_eq!(result["today"], "2026-10-07");
+        assert_eq!(result["days"], 30);
+        let daily = result["daily"].as_array().unwrap();
+        assert_eq!(daily.len(), 30);
+        assert_eq!(daily[29]["date"], "2026-10-07");
+        assert_eq!(
+            (daily[29]["lookups"].as_i64(), daily[29]["saved"].as_i64()),
+            (Some(4), Some(1))
+        );
+        assert_eq!(
+            (
+                daily[28]["lookups"].as_i64(),
+                daily[28]["saved"].as_i64(),
+                daily[28]["reviews"].as_i64()
+            ),
+            (Some(0), Some(1), Some(3)),
+            "yesterday: a lookup count of zero is no lookups, a review came from the event log"
+        );
+        assert_eq!(daily[26]["lookups"], 2);
+        assert_eq!(
+            result["window"],
+            serde_json::json!({"lookups": 6, "saved": 3, "reviews": 3}),
+            "what is older than the window is left out"
+        );
+        assert_eq!(result["savedThisWeek"], 3);
+        assert_eq!(
+            result["streak"],
+            serde_json::json!({"current": 4, "longest": 4, "activeDays": 6})
+        );
+        assert_eq!(
+            result["totals"],
+            serde_json::json!({"words": 4, "lookups": 56}),
+            "all time, not just the window"
+        );
+        assert_eq!(
+            result["mastery"],
+            serde_json::json!({"new": 2, "learning": 1, "familiar": 0, "mastered": 1}),
+            "an unknown level counts as new, so the parts add up to the words"
+        );
+        assert_eq!(
+            result["review"],
+            serde_json::json!({
+                "dueToday": 2,
+                "total": 3,
+                "boxCounts": [1, 1, 1],
+                "correct": 11,
+                "wrong": 4,
+            })
+        );
+        assert_eq!(
+            result["topSources"],
+            serde_json::json!([
+                {"source": "Reader", "count": 2},
+                {"source": "chrome.exe", "count": 1},
+            ]),
+            "a word without a source is not a source"
+        );
+        assert_eq!(
+            result["oftenLookedUp"],
+            serde_json::json!([
+                {"lemma": "run", "count": 5},
+                {"lemma": "ubiquitous", "count": 3},
+            ]),
+            "the sentence was looked up most, but this list is about words"
+        );
+        assert_eq!(
+            result["hardWords"],
+            serde_json::json!([
+                {"lemma": "serendipity", "wrong": 3},
+                {"lemma": "ubiquitous", "wrong": 1},
+            ])
+        );
+    }
+
+    #[test]
+    fn insights_of_an_empty_library_are_all_zeros_not_an_error() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
+
+        let result = db.learning_insights_at(30, today).unwrap();
+
+        assert_eq!(result["daily"].as_array().unwrap().len(), 30);
+        assert_eq!(
+            result["window"],
+            serde_json::json!({"lookups": 0, "saved": 0, "reviews": 0})
+        );
+        assert_eq!(
+            result["streak"],
+            serde_json::json!({"current": 0, "longest": 0, "activeDays": 0})
+        );
+        assert_eq!(
+            result["totals"],
+            serde_json::json!({"words": 0, "lookups": 0})
+        );
+        assert_eq!(result["review"]["boxCounts"], serde_json::json!([0, 0, 0]));
+        assert_eq!(result["topSources"], serde_json::json!([]));
+        assert_eq!(result["hardWords"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn insights_keep_the_window_between_a_week_and_a_quarter() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
+
+        assert_eq!(db.learning_insights_at(1, today).unwrap()["days"], 7);
+        assert_eq!(db.learning_insights_at(500, today).unwrap()["days"], 90);
+        assert_eq!(
+            db.learning_insights_at(500, today).unwrap()["daily"]
+                .as_array()
+                .unwrap()
+                .len(),
+            90
+        );
+    }
+
+    #[test]
+    fn importing_thousands_of_rows_stays_fast() {
+        let db = Database::open_memory().unwrap();
+        db.initialize().unwrap();
+        const EXISTING: usize = 3_000;
+        const ROWS: usize = 3_000;
+        // One save per existing word: work of linear cost, which the import is measured against.
+        let seeding_started = std::time::Instant::now();
+        {
+            let tx = db.conn.unchecked_transaction().unwrap();
+            for index in 0..EXISTING {
+                let word = sample_word(
+                    &format!("seed{index}"),
+                    "Reader",
+                    "2026-08-01T10:00:00+08:00",
+                );
+                save_word_with_connection(&tx, &word, false).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let seeding = seeding_started.elapsed();
+        // Even rows hit an existing word (case-insensitively), odd rows are new.
+        let mut csv = String::from("lemma,translation\n");
+        for index in 0..ROWS {
+            if index % 2 == 0 {
+                csv.push_str(&format!("SEED{index},合并{index}\n"));
+            } else {
+                csv.push_str(&format!("fresh{index},新词{index}\n"));
+            }
+        }
+        let mapping = [
+            ("lemma".to_string(), "lemma".to_string()),
+            ("translation".to_string(), "translation".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let started = std::time::Instant::now();
+        let result = db.import_words(&csv, "csv", &mapping).unwrap();
+        let elapsed = started.elapsed();
+        println!("import: {EXISTING} words saved in {seeding:?}, then {ROWS} rows imported in {elapsed:?}");
+        // A quadratic lemma lookup took ~10 s for this size, far more than saving the existing
+        // words does; with the hash index the import costs about as much as that saving. So it
+        // may take up to six times the saving, or stay within four seconds.
+        assert_fast_enough(
+            &format!("importing {ROWS} rows into {EXISTING} words"),
+            elapsed,
+            std::time::Duration::from_secs(4),
+            seeding,
+            6,
+        );
+        assert_eq!(result.merged as usize, ROWS / 2);
+        assert_eq!(result.inserted as usize, ROWS / 2);
+        assert_eq!(db.get_all_words().unwrap().len(), EXISTING + ROWS / 2);
+    }
+
+    #[test]
     fn restore_validates_backup_and_restores_the_open_database() {
         let root = TestDir::new("restore");
         let path = root.0.join(DB_FILENAME);
@@ -3268,6 +4862,91 @@ mod tests {
             })
             .unwrap();
         assert_eq!(lemma, "current value");
+    }
+
+    #[test]
+    fn a_backup_from_an_older_version_is_restored_and_brought_up_to_date() {
+        let root = TestDir::new("restore-older-schema");
+        let path = root.0.join(DB_FILENAME);
+        let mut db = Database::open(path.to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        db.save_word(&serde_json::json!({"id": "kept", "lemma": "kept", "kind": "word"}))
+            .unwrap();
+        let backup_name = backup_database(&db).unwrap();
+
+        // What an earlier version wrote: the same file, but from before the history table.
+        let backup_path = root.0.join("backups").join(&backup_name);
+        {
+            let old = Connection::open(&backup_path).unwrap();
+            old.execute_batch("DROP TABLE lookup_history; PRAGMA user_version = 5;")
+                .unwrap();
+        }
+
+        db.save_word(&serde_json::json!({"id": "later", "lemma": "later", "kind": "word"}))
+            .unwrap();
+        restore_backup(&mut db, &backup_name).unwrap();
+
+        let words = db.get_all_words().unwrap();
+        assert_eq!(words.len(), 1, "the restore replaces what was there");
+        assert_eq!(words[0]["lemma"], "kept");
+        assert_eq!(
+            crate::migrations::current_version(&db.conn).unwrap(),
+            crate::migrations::LATEST_SCHEMA_VERSION
+        );
+        // The upgrade is complete, not just a version number: the new table is usable.
+        db.record_history(&lookup("kept", "word")).unwrap();
+        assert_eq!(db.list_history().unwrap().len(), 1);
+        assert!(
+            list_backups(path.to_str().unwrap())
+                .unwrap()
+                .iter()
+                .any(|item| item["kind"] == "restoreSafety"),
+            "what was there before is kept, in case the restore was a mistake"
+        );
+    }
+
+    #[test]
+    fn a_backup_from_a_newer_version_is_refused_and_nothing_changes() {
+        let root = TestDir::new("restore-newer-schema");
+        let path = root.0.join(DB_FILENAME);
+        let mut db = Database::open(path.to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        db.save_word(&serde_json::json!({"id": "current", "lemma": "current", "kind": "word"}))
+            .unwrap();
+        let backup_name = backup_database(&db).unwrap();
+        {
+            let newer = Connection::open(root.0.join("backups").join(&backup_name)).unwrap();
+            newer.execute_batch("PRAGMA user_version = 99;").unwrap();
+        }
+
+        let error = restore_backup(&mut db, &backup_name).unwrap_err();
+        assert!(error.contains("更新版本"), "{error}");
+        let words = db.get_all_words().unwrap();
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0]["lemma"], "current");
+        assert_eq!(
+            crate::migrations::current_version(&db.conn).unwrap(),
+            crate::migrations::LATEST_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn an_older_backup_must_still_hold_what_its_own_version_had() {
+        let root = TestDir::new("restore-older-incomplete");
+        let path = root.0.join(DB_FILENAME);
+        let mut db = Database::open(path.to_str().unwrap()).unwrap();
+        db.initialize().unwrap();
+        let backup_name = backup_database(&db).unwrap();
+        {
+            // Claims to be v5, but the table v5 certainly had is gone.
+            let broken = Connection::open(root.0.join("backups").join(&backup_name)).unwrap();
+            broken
+                .execute_batch("DROP TABLE glossary_terms; PRAGMA user_version = 5;")
+                .unwrap();
+        }
+
+        let error = restore_backup(&mut db, &backup_name).unwrap_err();
+        assert!(error.contains("glossary_terms"), "{error}");
     }
 
     #[test]
@@ -3438,6 +5117,7 @@ mod tests {
     fn ten_thousand_glossary_terms_match_within_budget() {
         let db = Database::open_memory().unwrap();
         db.initialize().unwrap();
+        let seeding_started = std::time::Instant::now();
         let tx = db.conn.unchecked_transaction().unwrap();
         for index in 0..10_000 {
             tx.execute(
@@ -3447,20 +5127,48 @@ mod tests {
             .unwrap();
         }
         tx.commit().unwrap();
+        let seeding = seeding_started.elapsed();
         let started = std::time::Instant::now();
         let matched = db
             .find_glossary_matches("term9999", "unrelated context", "general")
             .unwrap();
         assert_eq!(matched.len(), 1);
-        // Keep the query budget meaningful while allowing the Windows CI
-        // scheduler to briefly preempt the test process under parallel load.
-        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        // Matching one lookup must cost far less than writing the ten thousand terms did.
+        assert_fast_enough(
+            "matching against ten thousand glossary terms",
+            started.elapsed(),
+            std::time::Duration::from_millis(500),
+            seeding,
+            1,
+        );
         assert_eq!(
             db.list_glossary_terms(None, None, 20, 0).unwrap()["items"]
                 .as_array()
                 .unwrap()
                 .len(),
             20
+        );
+    }
+
+    /// A timing assertion that holds on a slow machine too.
+    ///
+    /// A wall-clock budget measures the host as much as the code: on a laptop that is busy with
+    /// other work the same query takes many times as long, and a test that fails then proves
+    /// nothing. So a measurement passes when it is within `budget`, which is what a machine at
+    /// rest achieves, or when it costs no more than `allowed_share` times `reference`: the time
+    /// that work of known, linear cost took on this same machine a moment before. Code that has
+    /// become quadratic misses both by a wide margin.
+    fn assert_fast_enough(
+        what: &str,
+        took: std::time::Duration,
+        budget: std::time::Duration,
+        reference: std::time::Duration,
+        allowed_share: u32,
+    ) {
+        assert!(
+            took <= budget || took <= reference * allowed_share,
+            "{what} took {took:?}: over its budget of {budget:?}, and over {allowed_share} times \
+             the {reference:?} that the reference work took on this machine"
         );
     }
 
@@ -3651,6 +5359,8 @@ mod tests {
     fn ten_thousand_words_meet_queue_and_session_budgets() {
         let db = Database::open_memory().unwrap();
         db.initialize().unwrap();
+        // Filling the library is work of linear cost, which the two reads are measured against.
+        let seeding_started = std::time::Instant::now();
         let tx = db.conn.unchecked_transaction().unwrap();
         {
             let mut insert_word = tx
@@ -3676,19 +5386,23 @@ mod tests {
             }
         }
         tx.commit().unwrap();
+        let seeding = seeding_started.elapsed();
 
         let queue_started = std::time::Instant::now();
         assert_eq!(db.get_review_queue(Some(20)).unwrap().len(), 20);
-        assert!(
-            queue_started.elapsed().as_millis() < 500,
-            "review queue exceeded 500ms"
-        );
+        let queue = queue_started.elapsed();
 
         let sessions_started = std::time::Instant::now();
         assert!(!db.get_reading_sessions(30, 50, 0).unwrap().is_empty());
-        assert!(
-            sessions_started.elapsed().as_millis() < 500,
-            "session aggregation exceeded 500ms"
+        let sessions = sessions_started.elapsed();
+
+        println!(
+            "ten thousand words: filled in {seeding:?}, queue {queue:?}, sessions {sessions:?}"
         );
+        // Reading the library is far cheaper than writing it; a read that costs as much as
+        // filling the whole library has gone quadratic.
+        let budget = std::time::Duration::from_millis(500);
+        assert_fast_enough("the review queue", queue, budget, seeding, 1);
+        assert_fast_enough("the reading sessions", sessions, budget, seeding, 1);
     }
 }

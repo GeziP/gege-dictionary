@@ -65,6 +65,21 @@ function LookupHarness() {
   );
 }
 
+function RetryHarness() {
+  const { triggerLookup, retryLookup } = useLexNote();
+  return (
+    <>
+      <button type="button" onClick={() => triggerLookup(' a b c d e\n', 'ctx', 'phrase')}>lookup</button>
+      <button type="button" onClick={() => retryLookup()}>retry</button>
+    </>
+  );
+}
+
+function UsageHarness() {
+  const { usage } = useLexNote();
+  return <span data-testid="usage-today">{usage.today}</span>;
+}
+
 describe('settings persistence', () => {
   afterEach(() => {
     cleanup();
@@ -204,5 +219,52 @@ describe('settings persistence', () => {
 
     await waitFor(() => expect(screen.getByTestId('lookup-status')).toHaveTextContent('streaming'));
     expect(screen.getByTestId('lookup-result')).toHaveTextContent('partial result');
+  });
+
+  it('retries a failed lookup as the kind it was first looked up as, not a recount of its words', async () => {
+    // Five words with stray whitespace: the backend calls this a phrase, while splitting on
+    // /\s+/ finds six pieces and would have called it a sentence.
+    vi.mocked(bridge.lookupWordStream)
+      .mockRejectedValueOnce(new Error('[network] down'))
+      .mockRejectedValueOnce(new Error('[network] still down'));
+    render(<LexNoteProvider><RetryHarness /></LexNoteProvider>);
+    await waitFor(() => expect(streamHandlers.error).toBeDefined());
+    await userEvent.click(screen.getByRole('button', { name: 'lookup' }));
+    await waitFor(() => expect(bridge.lookupWordStream).toHaveBeenCalledTimes(1));
+
+    await userEvent.click(screen.getByRole('button', { name: 'retry' }));
+
+    await waitFor(() => expect(bridge.lookupWordStream).toHaveBeenCalledTimes(2));
+    const [first, second] = vi.mocked(bridge.lookupWordStream).mock.calls;
+    expect(second.slice(0, 3)).toEqual(first.slice(0, 3));
+    expect(second[2]).toBe('phrase');
+  });
+});
+
+describe('usage', () => {
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  it('picks up lookups counted by the backend when the window regains focus', async () => {
+    render(<LexNoteProvider><UsageHarness /></LexNoteProvider>);
+    await waitFor(() => expect(bridge.getUsage).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId('usage-today')).toHaveTextContent('0');
+    vi.mocked(bridge.getUsage).mockResolvedValueOnce({ today: 3, month: 9, tokens: 1500 });
+
+    window.dispatchEvent(new Event('focus'));
+
+    await waitFor(() => expect(screen.getByTestId('usage-today')).toHaveTextContent('3'));
+  });
+
+  it('does not poll for usage from the small lookup window, which shows none', async () => {
+    render(<LexNoteProvider loadWords={false}><UsageHarness /></LexNoteProvider>);
+    await waitFor(() => expect(bridge.getUsage).toHaveBeenCalledTimes(1));
+
+    window.dispatchEvent(new Event('focus'));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(bridge.getUsage).toHaveBeenCalledTimes(1);
   });
 });

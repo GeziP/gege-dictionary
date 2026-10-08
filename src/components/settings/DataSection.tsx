@@ -28,6 +28,7 @@ interface DbInfo {
   dataDir: string;
   cacheCount: number;
   cacheSizeBytes: number;
+  historyCount: number;
 }
 
 export function DataSection() {
@@ -57,6 +58,7 @@ export function DataSection() {
         dataDir: stats.dataDir,
         cacheCount: stats.cacheCount,
         cacheSizeBytes: stats.cacheSizeBytes,
+        historyCount: stats.historyCount ?? 0,
       });
       setNewDir(stats.dataDir);
       setBackups(bks as Backup[]);
@@ -178,6 +180,21 @@ export function DataSection() {
     }
   };
 
+  const handleClearHistory = async () => {
+    const count = dbInfo?.historyCount ?? 0;
+    if (!confirm(`确定要清空全部 ${count} 条查词历史吗？已收藏到生词库的词不受影响。`)) return;
+    setLoading('clear-history');
+    try {
+      const removed = await bridge.clearLookupHistory();
+      flash('ok', `已清空 ${removed} 条查词历史`);
+      await loadInfo();
+    } catch (e) {
+      flash('error', `清空查词历史失败: ${e}`);
+    } finally {
+      setLoading(null);
+    }
+  };
+
   const formatSize = (bytes: number) => {
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -288,7 +305,26 @@ export function DataSection() {
         </p>
       </SettingsSection>
 
-      <SettingsSection title="用量" description="仅在本机统计，不上报。token 数为按字符估算值，实际以服务商账单为准。">
+      <SettingsSection title="查词历史" description="记下你查过什么，方便在「生词库 → 历史」里回看、搜索，并一键再次打开。只保存在本机，最多保留最近 500 条。">
+        <Toggle
+          checked={settings.historyEnabled !== false}
+          onChange={(value) => updateSettings({ historyEnabled: value })}
+          label="记录查词历史"
+          description="关闭后不再新增记录，已有记录会保留，可随时清空。" />
+        <div className="mt-1 flex items-center gap-2">
+          <p className="flex-1 text-[11px] text-ink-subtle">当前 {dbInfo?.historyCount ?? 0} 条</p>
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={loading === 'clear-history' || !dbInfo?.historyCount}
+            onClick={handleClearHistory}
+          >
+            {loading === 'clear-history' ? '清理中…' : '清空历史'}
+          </Button>
+        </div>
+      </SettingsSection>
+
+      <SettingsSection title="用量" description="仅在本机统计，不上报。查询次数包含命中本地缓存的查询；token 只统计真正发给模型的请求，数值按字符估算，实际以服务商账单为准。">
         <div className="grid grid-cols-3 gap-2">
           {[
             { label: '今日查询', value: `${usage.today} 次` },
@@ -314,6 +350,9 @@ export function DataSection() {
             <li>当前 Prompt 模板</li>
             <li>当前领域与解析风格，以及实际命中的个人术语（未命中时不发送术语表）</li>
           </ol>
+          <p className="mt-2">
+            查词历史（你选中的文本、上下文、释义和来源应用）只保存在本机数据库里，不会发送给模型或任何服务器；可以在上方的「查词历史」中关闭或清空。
+          </p>
           <p className="mt-2">
             鸽鸽词典没有服务端，不收集任何内容；崩溃日志默认不包含用户文本，API Key 在日志中脱敏。导出的数据库快照包含当前机器的 DPAPI 密文，换机器后需要重新配置 API Key。
           </p>

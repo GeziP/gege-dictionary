@@ -26,10 +26,17 @@ export function CaptureSection() {
   );
   const lookupInIde = settings.lookupInIde !== false;
 
+  // The switch can also be changed from the tray menu, and a pause from there ends by itself,
+  // so what the page shows is read again whenever the user comes back to it.
   useEffect(() => {
-    bridge.getClipboardWatchStatus().then(setWatchEnabled).catch((error) => {
-      console.error('Failed to read clipboard watch status:', error);
-    });
+    const read = () => {
+      bridge.getClipboardWatchStatus().then(setWatchEnabled).catch((error) => {
+        console.error('Failed to read clipboard watch status:', error);
+      });
+    };
+    read();
+    window.addEventListener('focus', read);
+    return () => window.removeEventListener('focus', read);
   }, []);
 
   useEffect(() => {

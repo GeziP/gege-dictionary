@@ -128,6 +128,8 @@ export interface SavedWord extends Entry {
   lookups: number;
   note: string;
   reviewState?: ReviewState;
+  /** Anki note this word was sent as; set by the backend, never by the UI. */
+  ankiNoteId?: number;
 }
 
 export interface ReviewState {
@@ -148,6 +150,52 @@ export interface ReviewStats {
   total: number;
 }
 
+/** What happened on one local calendar day. */
+export interface InsightsDay {
+  /** yyyy-MM-dd, the user's local day. */
+  date: string;
+  /** Lookups that got an answer (from the model or from the cache). */
+  lookups: number;
+  /** Words added to the library. */
+  saved: number;
+  /** Review cards answered. */
+  reviews: number;
+}
+
+/** The figures behind the learning-insights page, as the backend computes them. */
+export interface LearningInsights {
+  /** The local day the figures are as of (yyyy-MM-dd). */
+  today: string;
+  /** How many days the chart and the window sums cover (7 to 90). */
+  days: number;
+  /** One entry for each day of the window, oldest first, zeros included. */
+  daily: InsightsDay[];
+  window: { lookups: number; saved: number; reviews: number };
+  /** Words saved during the last seven days, today included. */
+  savedThisWeek: number;
+  streak: {
+    /** Consecutive active days up to today (a run that ended yesterday still counts). */
+    current: number;
+    longest: number;
+    /** Days with any activity, ever. */
+    activeDays: number;
+  };
+  totals: { words: number; lookups: number };
+  mastery: Record<Mastery, number>;
+  review: {
+    dueToday: number;
+    /** Cards in the review boxes. */
+    total: number;
+    boxCounts: [number, number, number];
+    /** Right and wrong answers over the cards' whole life. */
+    correct: number;
+    wrong: number;
+  };
+  topSources: Array<{ source: string; count: number }>;
+  oftenLookedUp: Array<{ lemma: string; count: number }>;
+  hardWords: Array<{ lemma: string; wrong: number }>;
+}
+
 export interface ReadingSession {
   id: string;
   sourceApp: string;
@@ -157,6 +205,23 @@ export interface ReadingSession {
   wordCount: number;
   preview: string[];
   wordIds: string[];
+}
+
+/** One remembered lookup: what was asked, what the answer said about it, and how often. */
+export interface LookupHistoryItem {
+  id: number;
+  /** The text that was looked up; cut to a preview when it is very long. */
+  selection: string;
+  lemma: string;
+  translation: string;
+  kind: SelectionKind;
+  sourceApp: string;
+  sourceTitle: string;
+  /** How many times this was looked up. */
+  count: number;
+  /** ISO timestamps (UTC) of the first and the latest lookup. */
+  firstAt: string;
+  lastAt: string;
 }
 
 export interface LookupRequest {
@@ -277,6 +342,8 @@ export interface AppSettings {
   ideBlacklist?: string[];
   streamingEnabled?: boolean;
   cacheTtlDays?: 0 | 7 | 30 | 90;
+  /** Remember what was looked up (default on); turning it off keeps what is already there. */
+  historyEnabled?: boolean;
   reviewLimit?: 0 | 10 | 20 | 50;
   includeLongFormReview?: boolean;
   sessionGapMinutes?: 15 | 30 | 60;
