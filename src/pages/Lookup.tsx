@@ -17,6 +17,7 @@ import { useLexNote } from '../contexts/LexNoteContext';
 import { Skeleton } from '../components/ui/Skeleton';
 import { SpeakButton } from '../components/card/SpeakButton';
 import { LookupErrorState } from '../components/card/LookupErrorState';
+import { HighlightWord } from '../components/card/HighlightWord';
 import type { EntryMetadata, SavedWord } from '../types/lexnote';
 import { classNames } from '../utils/format';
 import { RichText } from '../components/ui/RichText';
@@ -24,6 +25,22 @@ import { DomainAnalysis } from '../components/domain/DomainAnalysis';
 import * as bridge from '../lib/tauri-bridge';
 import { resolveLookupShortcut } from '../lib/lookup-keys';
 import { MAX_TAG_CHARS, newWordId, normalizeTag } from '../lib/words';
+
+const LOOKUP_FONT_KEY = 'gege.lookup.fontSize';
+const LOOKUP_FONT_MIN = 10;
+const LOOKUP_FONT_MAX = 18;
+const LOOKUP_FONT_DEFAULT = 13;
+
+/** The size the user last chose for the text of the answer, or the usual one. */
+function readLookupFontSize(): number {
+  try {
+    const stored = Number(window.localStorage.getItem(LOOKUP_FONT_KEY));
+    if (Number.isFinite(stored) && stored >= LOOKUP_FONT_MIN && stored <= LOOKUP_FONT_MAX) return Math.round(stored);
+  } catch {
+    // No storage: the usual size.
+  }
+  return LOOKUP_FONT_DEFAULT;
+}
 
 export function Lookup() {
   const {
@@ -59,14 +76,24 @@ export function Lookup() {
   const [initDone, setInitDone] = useState(false);
 
   const [emptyHint, setEmptyHint] = useState(false);
-  const [fontSize, setFontSize] = useState(13);
+  const [fontSize, setFontSize] = useState(readLookupFontSize);
   const [interleave, setInterleave] = useState(true);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [showContext, setShowContext] = useState(false);
   const [contextDraft, setContextDraft] = useState('');
   const [ankiFlash, setAnkiFlash] = useState<string | null>(null);
-  const fontUp = () => setFontSize((s) => Math.min(s + 1, 18));
-  const fontDown = () => setFontSize((s) => Math.max(s - 1, 10));
+  const fontUp = () => setFontSize((s) => Math.min(s + 1, LOOKUP_FONT_MAX));
+  const fontDown = () => setFontSize((s) => Math.max(s - 1, LOOKUP_FONT_MIN));
+  // The size is kept for the next time the window opens. It is kept here and not in the settings:
+  // this window holds a copy of the settings from when it was opened, and saving them from here
+  // could undo what was changed in the main window since.
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(LOOKUP_FONT_KEY, String(fontSize));
+    } catch {
+      // No storage, no memory of the size; it is the default again next time.
+    }
+  }, [fontSize]);
 
   useEffect(() => {
     setContextDraft(lookupContext || '');
@@ -308,12 +335,12 @@ export function Lookup() {
           </span>
           <div className="flex items-center gap-0.5 rounded border border-line px-0.5">
             <button type="button" title="缩小字体" onClick={fontDown}
-              className="flex h-4 w-4 items-center justify-center rounded text-ink-subtle hover:text-ink">
+              className="flex h-5 w-5 items-center justify-center rounded text-ink-subtle hover:text-ink">
               <MinusIcon size={9} />
             </button>
-            <span className="text-[9px] text-ink-subtle">{fontSize}</span>
+            <span className="min-w-[1.25rem] text-center text-[10px] tabular-nums text-ink-subtle">{fontSize}</span>
             <button type="button" title="放大字体" onClick={fontUp}
-              className="flex h-4 w-4 items-center justify-center rounded text-ink-subtle hover:text-ink">
+              className="flex h-5 w-5 items-center justify-center rounded text-ink-subtle hover:text-ink">
               <PlusIcon size={9} />
             </button>
           </div>
@@ -323,7 +350,7 @@ export function Lookup() {
               title={interleave ? '整段显示' : '逐句对照'}
               onClick={() => setInterleave(!interleave)}
               className={classNames(
-                'flex h-5 w-5 items-center justify-center rounded transition-colors',
+                'flex h-6 w-6 items-center justify-center rounded transition-colors',
                 interleave ? 'text-accent' : 'text-ink-subtle hover:text-ink'
               )}
             >
@@ -335,7 +362,7 @@ export function Lookup() {
               type="button"
               title="跳过缓存，重新解析"
               onClick={handleReanalyze}
-              className="flex h-5 w-5 items-center justify-center rounded text-ink-subtle hover:text-accent"
+              className="flex h-6 w-6 items-center justify-center rounded text-ink-subtle hover:text-accent"
             >
               <RefreshCwIcon size={11} />
             </button>
@@ -345,7 +372,7 @@ export function Lookup() {
             title="编辑上下文并重解析"
             onClick={() => setShowContext((v) => !v)}
             className={classNames(
-              'flex h-5 w-5 items-center justify-center rounded transition-colors',
+              'flex h-6 w-6 items-center justify-center rounded transition-colors',
               showContext ? 'text-accent' : 'text-ink-subtle hover:text-ink'
             )}
           >
@@ -356,7 +383,7 @@ export function Lookup() {
             title={pinned ? '取消钉住' : '钉住窗口'}
             onClick={() => setPinned(!pinned)}
             className={classNames(
-              'flex h-5 w-5 items-center justify-center rounded transition-colors',
+              'flex h-6 w-6 items-center justify-center rounded transition-colors',
               pinned ? 'text-accent' : 'text-ink-subtle hover:text-ink'
             )}
           >
@@ -366,7 +393,7 @@ export function Lookup() {
             type="button"
             title="关闭 (Esc)"
             onClick={() => bridge.closeLookupWindow()}
-            className="flex h-5 w-5 items-center justify-center rounded text-ink-subtle hover:text-ink"
+            className="flex h-6 w-6 items-center justify-center rounded text-ink-subtle hover:text-ink"
           >
             <XIcon size={12} />
           </button>
@@ -478,10 +505,11 @@ export function Lookup() {
                     {entry.contextMeaning || entry.translation}
                   </div>
                   {entry.translation && entry.contextMeaning && (
-                    <p className="text-[0.92em] text-ink-muted">
+                    // A div, not a p: the text is markdown, which makes paragraphs of its own.
+                    <div className="text-[0.92em] text-ink-muted">
                       <span className="font-medium text-ink-subtle">翻译：</span>
                       <RichText>{entry.translation}</RichText>
-                    </p>
+                    </div>
                   )}
                 </>
               )}
@@ -586,11 +614,6 @@ export function Lookup() {
                 </span>
               )}
 
-              {/* AI disclaimer */}
-              <p className="mt-1 border-t border-line pt-1.5 text-[10px] text-ink-subtle/60">
-                AI 生成内容，专业术语和代码请以官方文档为准
-              </p>
-
               {/* Syntax (for sentences) */}
               {entry.syntax && entry.syntax.length > 0 && (
                 <div>
@@ -620,6 +643,13 @@ export function Lookup() {
                   </div>
                 </div>
               )}
+
+              {/* AI disclaimer: at the end of what the model wrote, where it is read as a note on all of it */}
+              {lookupStatus === 'done' && (
+                <p className="border-t border-line pt-1.5 text-[10px] text-ink-subtle">
+                  AI 生成内容，专业术语和代码请以官方文档为准
+                </p>
+              )}
             </motion.div>
           )}
         </div>
@@ -627,7 +657,9 @@ export function Lookup() {
         {/* Template & Model Info */}
         {entry && lookupStatus === 'done' && (
           <div className="flex items-center gap-2 border-t border-line bg-sunken/50 px-3 py-1 text-[10px] text-ink-subtle">
-            <span>模板: <span className="font-medium text-ink-muted">{(entry as EntryMetadata)._templateName || '未知'}</span></span>
+            {(entry as EntryMetadata)._templateName ? (
+              <span>模板: <span className="font-medium text-ink-muted">{(entry as EntryMetadata)._templateName}</span></span>
+            ) : null}
             {(entry as EntryMetadata).fromCache && (
               <span className="rounded-full bg-positive/15 px-1.5 py-px text-[9px] font-medium text-positive">缓存</span>
             )}
@@ -734,24 +766,5 @@ function InterleavedParagraph({ pairs }: { pairs: { en: string; zh: string }[] }
         </div>
       ))}
     </div>
-  );
-}
-
-function HighlightWord({ text, word }: { text: string; word: string }) {
-  if (!word) return <>{text}</>;
-  const regex = new RegExp(`(${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\w*)`, 'gi');
-  const parts = text.split(regex);
-  return (
-    <>
-      {parts.map((part, i) =>
-        regex.test(part) ? (
-          <span key={i} className="rounded bg-highlight px-0.5 font-medium">
-            {part}
-          </span>
-        ) : (
-          <React.Fragment key={i}>{part}</React.Fragment>
-        )
-      )}
-    </>
   );
 }
