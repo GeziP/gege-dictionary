@@ -1,0 +1,12 @@
+# The Rust that this project is built, linted and tested with, on every machine and in CI.
+#
+# CI runs `cargo clippy --all-targets -- -D warnings`. With an unpinned "stable" every new Rust
+# release can add a lint and turn a pull request red for a reason that has nothing to do with
+# it. So the version is chosen on purpose, and changed on purpose: raise it here, run clippy
+# and `cargo test --lib`, fix what the newer toolchain complains about, and commit all of it
+# together. `rustup` installs this toolchain by itself the first time it is needed; the CI
+# workflows install it with `rustup toolchain install`, which reads this file.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

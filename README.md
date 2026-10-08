@@ -109,7 +109,8 @@
 ### 从源码构建
 
 ```bash
-# 前置条件：Node.js >=20.19 或 >=22.12、Rust 1.75+、Visual Studio Build Tools
+# 前置条件：Node.js >=20.19 或 >=22.12、rustup、Visual Studio Build Tools
+# Rust 版本由仓库根的 rust-toolchain.toml 固定（1.95.0），rustup 会在第一次需要时自动安装
 git clone https://github.com/GeziP/gege-dictionary.git
 cd gege-dictionary
 npm ci
