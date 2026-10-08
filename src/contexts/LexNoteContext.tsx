@@ -12,6 +12,7 @@ import type {
 import { DEFAULT_ENRICH_PACE, DEFAULT_ENRICH_TOKENS } from '../lib/enrichment';
 import * as bridge from '../lib/tauri-bridge';
 import { upsertSavedWord } from '../lib/words';
+import { errorText } from '../utils/format';
 
 const DEFAULT_SETTINGS: AppSettings = {
   provider: DEFAULT_PROVIDER,
@@ -114,6 +115,8 @@ interface LexNoteValue {
   settings: AppSettings;
   settingsSaveStatus: SettingsSaveStatus;
   settingsSaveError: string | null;
+  /** Puts away the account of a save that failed, once it has been read. */
+  dismissSettingsSaveError: () => void;
   templates: PromptTemplate[];
   usage: Usage;
   network: NetworkMode;
@@ -136,7 +139,14 @@ interface LexNoteValue {
   saveWord: (word: SavedWord) => Promise<SavedWord>;
   /** Puts a word back exactly as given, with nothing merged (the undo of a save). */
   restoreWord: (word: SavedWord) => Promise<void>;
-  removeWords: (ids: string[]) => void;
+  /** Puts several words back as they were (the undo of a delete); the screen follows the backend. */
+  restoreWords: (words: SavedWord[]) => Promise<void>;
+  /**
+   * Takes words out of the library. The list changes at once; the promise settles when the backend
+   * has agreed, with the words as they were (what an undo needs). If it refuses, the list is read
+   * again, so that it shows what is really stored, and the promise rejects with the reason.
+   */
+  removeWords: (ids: string[]) => Promise<SavedWord[]>;
   updateWord: (id: string, patch: Partial<SavedWord>) => void;
   tagWords: (ids: string[], tags: string[]) => void;
   batchSetMastery: (ids: string[], mastery: SavedWord['mastery']) => void;
@@ -146,7 +156,7 @@ interface LexNoteValue {
   /** Looks the same text up again, as the same kind it was first looked up as. */
   retryLookup: (context?: string) => void;
   clearLookup: () => void;
-  refreshWords: () => void;
+  refreshWords: () => Promise<void>;
   refreshAppState: () => Promise<void>;
   flushSettings: () => Promise<void>;
 }
@@ -169,6 +179,12 @@ export function LexNoteProvider({
   const isTauri = bridge.isTauri();
 
   const [words, setWords] = useState<SavedWord[]>([]);
+  // What a delete has to hand back for an undo, which is the list as it is now, not as the
+  // callback was made.
+  const wordsRef = useRef<SavedWord[]>(words);
+  useEffect(() => {
+    wordsRef.current = words;
+  }, [words]);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const settingsRef = useRef(DEFAULT_SETTINGS);
   const confirmedSettingsRef = useRef<AppSettings>(DEFAULT_SETTINGS);
@@ -310,7 +326,7 @@ export function LexNoteProvider({
       setSettings(finalSettings);
       if (lastError) {
         setSettingsSaveStatus('error');
-        setSettingsSaveError(String(lastError));
+        setSettingsSaveError(errorText(lastError));
       } else {
         setSettingsSaveStatus('idle');
       }
@@ -331,6 +347,12 @@ export function LexNoteProvider({
     },
     [drainSettingsQueue, isTauri]
   );
+
+  const dismissSettingsSaveError = useCallback(() => {
+    setSettingsSaveError(null);
+    // A save that is going on is still going on; only a failure is put away.
+    setSettingsSaveStatus((status) => (status === 'error' ? 'idle' : status));
+  }, []);
 
   const flushSettings = useCallback(async () => {
     while (drainingSettingsRef.current) {
@@ -366,6 +388,23 @@ export function LexNoteProvider({
     [isTauri]
   );
 
+  const restoreWords = useCallback(
+    async (restored: SavedWord[]): Promise<void> => {
+      if (restored.length === 0) return;
+      try {
+        // One at a time, as the backend puts a word back with one command. The words that were
+        // put back stay on the screen even if a later one fails: they really are saved again.
+        for (const word of restored) {
+          if (isTauri) await bridge.restoreWord(word);
+          setWords((prev) => upsertSavedWord(prev, word));
+        }
+      } finally {
+        if (isTauri) bridge.emitWordSaved().catch(console.error);
+      }
+    },
+    [isTauri]
+  );
+
   // The edits below are applied to the list at once and confirmed by the
   // backend afterwards. If it refuses, the list is reloaded so the screen
   // shows what is really stored instead of an edit that never happened.
@@ -378,15 +417,19 @@ export function LexNoteProvider({
   );
 
   const removeWords = useCallback(
-    (ids: string[]) => {
+    async (ids: string[]): Promise<SavedWord[]> => {
       const gone = new Set(ids);
+      const removed = wordsRef.current.filter((w) => gone.has(w.id));
       setWords((prev) => prev.filter((w) => !gone.has(w.id)));
-      if (isTauri) {
-        bridge
-          .deleteWords(ids)
-          .then(() => bridge.emitWordSaved())
-          .catch(reloadAfterFailure);
+      if (!isTauri) return removed;
+      try {
+        await bridge.deleteWords(ids);
+      } catch (error) {
+        reloadAfterFailure(error);
+        throw error;
       }
+      bridge.emitWordSaved().catch(console.error);
+      return removed;
     },
     [isTauri, reloadAfterFailure]
   );
@@ -619,6 +662,7 @@ export function LexNoteProvider({
     settings,
     settingsSaveStatus,
     settingsSaveError,
+    dismissSettingsSaveError,
     templates,
     usage,
     network,
@@ -639,6 +683,7 @@ export function LexNoteProvider({
     updateSettings,
     saveWord,
     restoreWord,
+    restoreWords,
     removeWords,
     updateWord,
     tagWords,

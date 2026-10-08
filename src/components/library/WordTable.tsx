@@ -4,6 +4,7 @@ import { useRowWindow } from '../../hooks/useRowWindow';
 import type { SortField, SortState } from '../../lib/library-list';
 import type { SavedWord } from '../../types/lexnote';
 import { classNames, relativeTime } from '../../utils/format';
+import { Button } from '../ui/Button';
 import { Chip } from '../ui/Chip';
 import { MasteryBadge } from '../ui/MasteryBadge';
 
@@ -27,6 +28,8 @@ interface WordTableProps {
   onToggleSelect: (id: string) => void;
   onToggleAll: () => void;
   onActivate: (id: string) => void;
+  /** Puts the search and the filters away; offered when they leave nothing to show. */
+  onClearFilters?: () => void;
 }
 
 function SortIcon({ field, sort }: { field: SortField; sort?: SortState }) {
@@ -87,7 +90,7 @@ const WordRow = React.memo(function WordRow({
         </button>
       </td>
       <td className="max-w-[12rem] truncate py-2 pr-3 text-ink-muted">{word.translation}</td>
-      <td className="hidden max-w-[12rem] py-2 pr-3 xl:table-cell">
+      <td className="hidden max-w-[12rem] py-2 pr-3 2xl:table-cell">
         <span className="flex flex-nowrap items-center gap-1 overflow-hidden">
           {word.tags.slice(0, 2).map((tag) => (
             <Chip key={tag} label={tag} tone="muted" />
@@ -97,7 +100,7 @@ const WordRow = React.memo(function WordRow({
           ) : null}
         </span>
       </td>
-      <td className="hidden max-w-[9rem] truncate py-2 pr-3 text-ink-subtle lg:table-cell">
+      <td className="hidden max-w-[9rem] truncate py-2 pr-3 text-ink-subtle xl:table-cell">
         {word.sourceApp}
       </td>
       <td className="whitespace-nowrap py-2 pr-3 text-ink-subtle">{relativeTime(word.savedAt)}</td>
@@ -167,7 +170,8 @@ export function WordTable({
   onSortChange,
   onToggleSelect,
   onToggleAll,
-  onActivate
+  onActivate,
+  onClearFilters
 }: WordTableProps) {
   const windowed = density === 'table' && words.length > WINDOW_FROM;
   const { scrollerRef, rows, measure } = useRowWindow({ count: words.length, enabled: windowed });
@@ -175,6 +179,10 @@ export function WordTable({
   React.useLayoutEffect(() => {
     if (windowed && bodyRef.current) measure(bodyRef.current.querySelectorAll<HTMLElement>('tr[data-row]'));
   }, [windowed, rows.start, rows.end, measure]);
+
+  /** Tells assistive technology which column the list is in order of, and which way. */
+  const ariaSort = (field: SortField) =>
+    sort?.field === field ? (sort.dir === 'asc' ? 'ascending' : 'descending') : undefined;
 
   const cycle = (field: SortField) => {
     if (!onSortChange) return;
@@ -190,6 +198,11 @@ export function WordTable({
       <div className="flex flex-1 flex-col items-center justify-center gap-1 p-8 text-center">
         <p className="text-sm text-ink">没有匹配的生词</p>
         <p className="text-xs text-ink-subtle">换个关键词，或清除左侧的筛选条件。</p>
+        {onClearFilters ? (
+          <Button size="sm" className="mt-3" onClick={onClearFilters}>
+            清除搜索和筛选
+          </Button>
+        ) : null}
       </div>);
 
   }
@@ -223,25 +236,25 @@ export function WordTable({
                 className="h-3.5 w-3.5 accent-[color:var(--accent)]"
               />
             </th>
-            <th scope="col" className="py-2 pr-3 font-medium">
+            <th scope="col" aria-sort={ariaSort('lemma')} className="whitespace-nowrap py-2 pr-3 font-medium">
               <button type="button" onClick={() => cycle('lemma')} className="inline-flex items-center hover:text-ink">
                 单词<SortIcon field="lemma" sort={sort} />
               </button>
             </th>
-            <th scope="col" className="py-2 pr-3 font-medium">翻译</th>
-            <th scope="col" className="hidden py-2 pr-3 font-medium xl:table-cell">标签</th>
-            <th scope="col" className="hidden py-2 pr-3 font-medium lg:table-cell">来源</th>
-            <th scope="col" className="py-2 pr-3 font-medium">
+            <th scope="col" className="whitespace-nowrap py-2 pr-3 font-medium">翻译</th>
+            <th scope="col" className="hidden whitespace-nowrap py-2 pr-3 font-medium 2xl:table-cell">标签</th>
+            <th scope="col" className="hidden whitespace-nowrap py-2 pr-3 font-medium xl:table-cell">来源</th>
+            <th scope="col" aria-sort={ariaSort('savedAt')} className="whitespace-nowrap py-2 pr-3 font-medium">
               <button type="button" onClick={() => cycle('savedAt')} className="inline-flex items-center hover:text-ink">
                 收藏时间<SortIcon field="savedAt" sort={sort} />
               </button>
             </th>
-            <th scope="col" className="py-2 pr-3 text-right font-medium">
+            <th scope="col" aria-sort={ariaSort('lookups')} className="whitespace-nowrap py-2 pr-3 text-right font-medium">
               <button type="button" onClick={() => cycle('lookups')} className="inline-flex items-center justify-end hover:text-ink">
                 查询次数<SortIcon field="lookups" sort={sort} />
               </button>
             </th>
-            <th scope="col" className="py-2 pr-3 font-medium">
+            <th scope="col" aria-sort={ariaSort('mastery')} className="whitespace-nowrap py-2 pr-3 font-medium">
               <button type="button" onClick={() => cycle('mastery')} className="inline-flex items-center hover:text-ink">
                 掌握度<SortIcon field="mastery" sort={sort} />
               </button>

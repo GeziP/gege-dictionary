@@ -13,22 +13,19 @@ import {
 } from 'lucide-react';
 import { useLexNote } from '../../contexts/LexNoteContext';
 import { useReanalysis } from '../../hooks/useReanalysis';
-import type { Mastery, SavedWord } from '../../types/lexnote';
+import { isBare } from '../../lib/enrichment';
+import { READER_MAX, READER_MIN } from '../../lib/reader-size';
+import type { SavedWord } from '../../types/lexnote';
 import { classNames, relativeTime } from '../../utils/format';
 import { Button } from '../ui/Button';
 import { Chip } from '../ui/Chip';
+import { MASTERY_META, MASTERY_ORDER } from '../ui/MasteryBadge';
 import { SpeakButton } from '../card/SpeakButton';
 import { EditableText } from './EditableText';
 import { ReanalysisBanner } from './ReanalysisBanner';
 import { RichText } from '../ui/RichText';
 import { DomainAnalysis } from '../domain/DomainAnalysis';
 import * as bridge from '../../lib/tauri-bridge';
-
-const MASTERY: { value: Mastery; label: string }[] = [
-  { value: 'new', label: '新词' },
-  { value: 'familiar', label: '熟悉' },
-  { value: 'mastered', label: '已掌握' },
-];
 
 function FieldLabel({ children }: { children: React.ReactNode }) {
   return (
@@ -41,15 +38,22 @@ function FieldLabel({ children }: { children: React.ReactNode }) {
 export function WordDetail({
   word,
   onClose,
+  onDelete,
   inline,
-  fontSize: initialFontSize = 13,
+  fontSize = 13,
+  onFontSizeChange,
 }: {
   word: SavedWord | null;
   onClose?: () => void;
+  /** The delete button asks the page to delete the word: it is the page that says what happened and offers the undo. */
+  onDelete?: (word: SavedWord) => void;
   inline?: boolean;
+  /** The size of the text of the word, as the user keeps it in the settings. */
   fontSize?: number;
+  /** When given, the detail has the buttons that make the text larger or smaller. */
+  onFontSizeChange?: (size: number) => void;
 }) {
-  const { updateWord, removeWords, settings, tags } = useLexNote();
+  const { updateWord, settings, tags } = useLexNote();
   const navigate = useNavigate();
   const {
     state: reanalysis,
@@ -61,7 +65,6 @@ export function WordDetail({
   } = useReanalysis(word);
   const [savedFlash, setSavedFlash] = useState(false);
   const [tagDraft, setTagDraft] = useState('');
-  const [fontSize, setFontSize] = useState(initialFontSize);
   const [interleave, setInterleave] = useState(true);
   const [ankiMsg, setAnkiMsg] = useState<string | null>(null);
   const flashTimer = useRef<number>();
@@ -95,9 +98,15 @@ export function WordDetail({
     }
   };
 
-  const suggestions = tags.filter(
-    (tag) => !word.tags.includes(tag) && tag.startsWith(tagDraft.toLowerCase())
-  );
+  // The tags the library has that this word has not: the browser offers them as the user types,
+  // and what is typed is what gets added.
+  const suggestions = tags.filter((tag) => !word.tags.includes(tag));
+
+  const addTag = () => {
+    const tag = tagDraft.trim().toLowerCase();
+    setTagDraft('');
+    if (tag && !word.tags.includes(tag)) patch({ tags: [...word.tags, tag] });
+  };
 
   const asideClass = inline
     ? 'flex flex-col h-full'
@@ -117,70 +126,28 @@ export function WordDetail({
               <XIcon size={14} className="text-ink-subtle" />
             </button>
           )}
-          <h2 className="font-serif text-[18px] font-bold leading-tight text-ink">{word.lemma}</h2>
-          <span className="text-[11px] text-ink-subtle">{word.pos}</span>
-          <span className="font-ipa text-[12px] text-ink-muted">{word.ipaUS}</span>
+          <h2
+            title={word.lemma}
+            className="min-w-0 truncate font-serif text-[18px] font-bold leading-tight text-ink"
+          >
+            {word.lemma}
+          </h2>
+          {word.pos ? <span className="shrink-0 text-[11px] text-ink-subtle">{word.pos}</span> : null}
+          {word.ipaUS ? (
+            <span className="shrink-0 whitespace-nowrap font-ipa text-[12px] text-ink-muted">{word.ipaUS}</span>
+          ) : null}
           <SpeakButton text={word.lemma} label={`朗读 ${word.lemma}`} size={13} />
           {settings.anki?.enabled && (
             <button
               type="button"
               title="发送到 Anki"
               onClick={() => void sendToAnki()}
-              className="rounded border border-line px-1.5 py-0.5 text-[10px] text-ink-muted hover:text-ink"
+              className="shrink-0 rounded border border-line px-1.5 py-0.5 text-[10px] text-ink-muted hover:text-ink"
             >
               Anki
             </button>
           )}
-          {ankiMsg && (
-            <span className="max-w-[140px] truncate text-[10px] text-ink-subtle">{ankiMsg}</span>
-          )}
-          <div className="ml-auto flex items-center gap-1">
-            <div className="flex items-center gap-0.5 rounded border border-line px-0.5">
-              <button
-                type="button"
-                aria-label="缩小字体"
-                title="缩小字体"
-                onClick={() => setFontSize((s) => Math.max(10, s - 1))}
-                className="flex h-5 w-5 items-center justify-center rounded text-ink-subtle hover:text-ink"
-              >
-                <MinusIcon size={10} />
-              </button>
-              <span className="min-w-[20px] text-center text-[9px] text-ink-muted">{fontSize}</span>
-              <button
-                type="button"
-                aria-label="放大字体"
-                title="放大字体"
-                onClick={() => setFontSize((s) => Math.min(22, s + 1))}
-                className="flex h-5 w-5 items-center justify-center rounded text-ink-subtle hover:text-ink"
-              >
-                <PlusIcon size={10} />
-              </button>
-            </div>
-            {word.kind === 'paragraph' && (
-              <button
-                type="button"
-                title={interleave ? '整段显示' : '逐句对照'}
-                onClick={() => setInterleave(!interleave)}
-                className={classNames(
-                  'flex h-6 w-6 items-center justify-center rounded transition-colors',
-                  interleave ? 'text-accent' : 'text-ink-subtle hover:text-ink'
-                )}
-              >
-                {interleave ? <ListIcon size={13} /> : <AlignJustifyIcon size={13} />}
-              </button>
-            )}
-            <AnimatePresence>
-              {savedFlash ? (
-                <motion.span
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  className="inline-flex items-center gap-1 text-[11px] text-positive"
-                >
-                  <CheckIcon size={11} /> 已保存
-                </motion.span>
-              ) : null}
-            </AnimatePresence>
+          <div className="ml-auto flex shrink-0 items-center gap-1.5">
             <Button
               size="sm"
               icon={<SparklesIcon size={12} />}
@@ -190,35 +157,101 @@ export function WordDetail({
             >
               {reanalysis.status === 'running' ? '解析中…' : '重新解析'}
             </Button>
-            <Button
-              size="sm"
-              variant="danger"
-              icon={<Trash2Icon size={12} />}
-              aria-label="删除该生词"
-              onClick={() => removeWords([word.id])}
-            />
+            {onDelete ? (
+              <Button
+                size="sm"
+                variant="danger"
+                icon={<Trash2Icon size={12} />}
+                aria-label="删除该生词"
+                title="删除该生词（删除后可以撤销）"
+                onClick={() => onDelete(word)}
+              />
+            ) : null}
           </div>
         </div>
+        {ankiMsg ? (
+          <p role="status" className="mt-1 text-[10px] text-ink-subtle">
+            {ankiMsg}
+          </p>
+        ) : null}
 
         <div className="mt-1.5 flex items-center gap-2">
-          <div className="flex gap-0.5 rounded-md border border-line p-0.5">
-            {MASTERY.map((item) => (
+          <div role="group" aria-label="掌握度" className="flex shrink-0 gap-0.5 rounded-md border border-line p-0.5">
+            {MASTERY_ORDER.map((value) => (
               <button
-                key={item.value}
+                key={value}
                 type="button"
-                onClick={() => patch({ mastery: item.value })}
+                aria-pressed={word.mastery === value}
+                onClick={() => patch({ mastery: value })}
                 className={classNames(
-                  'rounded px-2 py-0.5 text-[10px] transition-colors',
-                  word.mastery === item.value
+                  'whitespace-nowrap rounded px-2 py-0.5 text-[10px] transition-colors',
+                  word.mastery === value
                     ? 'bg-accent-soft text-accent'
                     : 'text-ink-muted hover:bg-sunken hover:text-ink'
                 )}
               >
-                {item.label}
+                {MASTERY_META[value].label}
               </button>
             ))}
           </div>
-          <span className="text-[10px] text-ink-subtle">查询 {word.lookups} 次</span>
+          <span className="whitespace-nowrap text-[10px] text-ink-subtle">查询 {word.lookups} 次</span>
+          <div className="ml-auto flex items-center gap-1.5">
+            <AnimatePresence>
+              {savedFlash ? (
+                <motion.span
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  className="inline-flex items-center gap-1 whitespace-nowrap text-[11px] text-positive"
+                >
+                  <CheckIcon size={11} /> 已保存
+                </motion.span>
+              ) : null}
+            </AnimatePresence>
+            {word.kind === 'paragraph' && (
+              <button
+                type="button"
+                title={interleave ? '整段显示' : '逐句对照'}
+                aria-label={interleave ? '整段显示' : '逐句对照'}
+                onClick={() => setInterleave(!interleave)}
+                className={classNames(
+                  'flex h-6 w-6 items-center justify-center rounded transition-colors',
+                  interleave ? 'text-accent' : 'text-ink-subtle hover:text-ink'
+                )}
+              >
+                {interleave ? <ListIcon size={13} /> : <AlignJustifyIcon size={13} />}
+              </button>
+            )}
+            {onFontSizeChange ? (
+              <div
+                role="group"
+                aria-label="阅读字号"
+                className="flex items-center gap-0.5 rounded border border-line px-0.5"
+              >
+                <button
+                  type="button"
+                  aria-label="缩小字体"
+                  title="缩小字体"
+                  disabled={fontSize <= READER_MIN}
+                  onClick={() => onFontSizeChange(fontSize - 1)}
+                  className="flex h-5 w-5 items-center justify-center rounded text-ink-subtle hover:text-ink disabled:opacity-40"
+                >
+                  <MinusIcon size={10} />
+                </button>
+                <span className="min-w-[20px] text-center text-[10px] tabular-nums text-ink-muted">{fontSize}</span>
+                <button
+                  type="button"
+                  aria-label="放大字体"
+                  title="放大字体"
+                  disabled={fontSize >= READER_MAX}
+                  onClick={() => onFontSizeChange(fontSize + 1)}
+                  className="flex h-5 w-5 items-center justify-center rounded text-ink-subtle hover:text-ink disabled:opacity-40"
+                >
+                  <PlusIcon size={10} />
+                </button>
+              </div>
+            ) : null}
+          </div>
         </div>
       </div>
 
@@ -233,42 +266,54 @@ export function WordDetail({
       />
 
       <div className="space-y-2 px-2 py-2" style={{ fontSize: `${fontSize}px` }}>
-        {word.tags.length > 0 && (
-          <section>
-            <FieldLabel>标签</FieldLabel>
-            <div className="flex flex-wrap items-center gap-1 px-2">
-              {word.tags.map((tag) => (
-                <Chip
-                  key={tag}
-                  label={tag}
-                  tone="accent"
-                  onRemove={() => patch({ tags: word.tags.filter((t) => t !== tag) })}
-                />
-              ))}
-              <span className="inline-flex items-center gap-1 rounded-full border border-dashed border-line px-2 py-0.5">
-                <PlusIcon size={10} className="text-ink-subtle" />
-                <input
-                  value={tagDraft}
-                  onChange={(event) => setTagDraft(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter' && tagDraft.trim()) {
-                      patch({
-                        tags: [
-                          ...word.tags,
-                          (suggestions[0] ?? tagDraft).trim().toLowerCase(),
-                        ],
-                      });
-                      setTagDraft('');
-                    }
-                  }}
-                  placeholder="新标签"
-                  aria-label="添加标签"
-                  className="w-16 bg-transparent text-[11px] text-ink placeholder:text-ink-subtle outline-none"
-                />
-              </span>
-            </div>
-          </section>
-        )}
+        {isBare(word) && reanalysis.status === 'idle' ? (
+          <p className="mx-2 rounded-md bg-accent-soft px-2.5 py-1.5 text-[11px] leading-relaxed text-accent">
+            这个词目前只有释义，还没有义项和例句。点上方的「重新解析」可以补全。
+          </p>
+        ) : null}
+
+        <section>
+          <FieldLabel>标签</FieldLabel>
+          <div className="flex flex-wrap items-center gap-1 px-2">
+            {word.tags.map((tag) => (
+              <Chip
+                key={tag}
+                label={tag}
+                tone="accent"
+                onRemove={() => patch({ tags: word.tags.filter((t) => t !== tag) })}
+              />
+            ))}
+            <span className="inline-flex items-center gap-1 rounded-full border border-dashed border-line px-2 py-0.5">
+              <PlusIcon size={10} className="text-ink-subtle" aria-hidden="true" />
+              <input
+                value={tagDraft}
+                list="word-detail-tags"
+                onChange={(event) => setTagDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    addTag();
+                  } else if (event.key === 'Escape' && tagDraft) {
+                    // Gives up the tag being typed; with nothing typed, Escape goes on to close the panel.
+                    event.stopPropagation();
+                    setTagDraft('');
+                  }
+                }}
+                placeholder={word.tags.length > 0 ? '新标签' : '添加标签，回车确认'}
+                aria-label="添加标签"
+                className={classNames(
+                  'bg-transparent text-[11px] text-ink placeholder:text-ink-subtle outline-none',
+                  word.tags.length > 0 ? 'w-16' : 'w-32'
+                )}
+              />
+              <datalist id="word-detail-tags">
+                {suggestions.map((tag) => (
+                  <option key={tag} value={tag} />
+                ))}
+              </datalist>
+            </span>
+          </div>
+        </section>
 
         {word.kind === 'paragraph' && interleave ? (
           <section>
@@ -409,11 +454,13 @@ export function WordDetail({
         </section>
 
         <section>
-          <FieldLabel>原始上下文</FieldLabel>
+          <FieldLabel>{word.context ? '原始上下文' : '来源'}</FieldLabel>
           <div className="mx-2 rounded-md border border-line bg-raised p-2">
-            <p className="text-[11px] leading-relaxed text-ink-muted">"{word.context}"</p>
-            <p className="mt-1 text-[10px] text-ink-subtle">
-              {word.sourceApp} · {relativeTime(word.savedAt)}
+            {word.context ? (
+              <p className="text-[11px] leading-relaxed text-ink-muted">“{word.context}”</p>
+            ) : null}
+            <p className={classNames('text-[10px] text-ink-subtle', word.context && 'mt-1')}>
+              {[word.sourceApp, relativeTime(word.savedAt)].filter(Boolean).join(' · ')}
             </p>
           </div>
         </section>

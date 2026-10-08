@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
   AlertTriangleIcon,
@@ -8,6 +8,7 @@ import {
   SettingsIcon,
   SparklesIcon,
   SquareIcon,
+  XIcon,
 } from 'lucide-react';
 import type { EnrichmentControl } from '../../hooks/useEnrichment';
 import {
@@ -23,6 +24,31 @@ import type { EnrichmentProgress, EnrichmentStatus } from '../../types/lexnote';
 import { Button } from '../ui/Button';
 
 const PANEL = 'mx-3 mt-3 rounded-lg border border-accent-line bg-surface px-4 py-3';
+/** What is said when there is only a suggestion to make: a line of its own, not a card. */
+const PROMPT = 'mx-3 mt-2 flex items-start gap-2.5 rounded-md border border-accent-line bg-surface px-3 py-2';
+
+/**
+ * The prompt to fill in the bare words can be put away. It is put away for as many words as were
+ * waiting then: it comes back when more of them are waiting than that (a new import), not when
+ * the window is opened again.
+ */
+const PROMPT_HIDDEN_KEY = 'gege.enrichment.prompt-hidden-at';
+
+function readHiddenAt(): number {
+  try {
+    return Number(window.localStorage.getItem(PROMPT_HIDDEN_KEY)) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeHiddenAt(count: number): void {
+  try {
+    window.localStorage.setItem(PROMPT_HIDDEN_KEY, String(count));
+  } catch {
+    // Without storage the prompt comes back the next time the page is opened; no harm done.
+  }
+}
 
 function TokensToday({ status }: { status: EnrichmentStatus }) {
   const used = formatTokens(status.tokensToday);
@@ -96,6 +122,15 @@ function Failures({ progress }: { progress: EnrichmentProgress }) {
  */
 export function EnrichmentPanel({ enrichment }: { enrichment: EnrichmentControl }) {
   const { status, error, busy, dismissed, start, pause, resume, stop, dismiss } = enrichment;
+  const [hiddenAt, setHiddenAt] = useState(readHiddenAt);
+  const waiting = status?.pending;
+  useEffect(() => {
+    // Fewer words wait than when the prompt was put away: what comes after that is new.
+    if (waiting !== undefined && hiddenAt > waiting) {
+      writeHiddenAt(waiting);
+      setHiddenAt(waiting);
+    }
+  }, [hiddenAt, waiting]);
   const failure = error ? (
     <p role="alert" className="mt-2 text-[11px] text-danger">{error}</p>
   ) : null;
@@ -192,36 +227,46 @@ export function EnrichmentPanel({ enrichment }: { enrichment: EnrichmentControl 
     );
   }
 
-  if (status.pending === 0) return failure ? <div className={PANEL}>{failure}</div> : null;
+  if (status.pending === 0 || status.pending <= hiddenAt) return failure ? <div className={PANEL}>{failure}</div> : null;
 
   return (
-    <section aria-label="批量补全" className={PANEL}>
-      <div className="flex items-start gap-3">
-        <Heading icon={<SparklesIcon size={17} aria-hidden="true" />} title={`${status.pending} 个词还没有义项和例句`}>
-          <p className="text-xs text-ink-muted">
-            它们只有导入时的释义。可以让主模型逐个补全；只填空缺的部分，你写的释义、笔记、标签和复习进度都不会被改动。
-          </p>
-          <p className="mt-1 text-[11px] text-ink-subtle">
-            全部补完约需 {formatTokens(estimateTokens(status.pending))} tokens。<TokensToday status={status} />
-            {status.dailyLimit !== null && estimateTokens(status.pending) > status.dailyLimit
-              ? '，额度用完会自动停下，剩下的明天可以接着补。'
-              : '。'}
-          </p>
-          {failure}
-        </Heading>
-        <div className="flex shrink-0 items-center gap-2">
-          <Link
-            to="/settings"
-            aria-label="补全的额度和节奏在设置里调整"
-            title="补全的额度和节奏在设置里调整"
-            className="inline-flex h-control items-center rounded-md border border-transparent px-2 text-ink-muted hover:bg-sunken hover:text-ink"
-          >
-            <SettingsIcon size={13} aria-hidden="true" />
-          </Link>
-          <Button size="sm" variant="primary" icon={<SparklesIcon size={13} aria-hidden="true" />} onClick={() => void start()} disabled={busy}>
-            开始补全
-          </Button>
-        </div>
+    <section aria-label="批量补全" className={PROMPT}>
+      <SparklesIcon size={15} className="mt-0.5 shrink-0 text-accent" aria-hidden="true" />
+      <div className="min-w-0 flex-1">
+        <p className="text-xs font-semibold text-ink">{status.pending} 个词还没有义项和例句</p>
+        <p className="text-[11px] leading-relaxed text-ink-muted">
+          它们只有导入时的释义。可以让主模型逐个补全，只填空缺的部分，你写的释义、笔记、标签和复习进度都不会被改动。
+          全部补完约需 {formatTokens(estimateTokens(status.pending))} tokens。<TokensToday status={status} />
+          {status.dailyLimit !== null && estimateTokens(status.pending) > status.dailyLimit
+            ? '，额度用完会自动停下，剩下的明天可以接着补。'
+            : '。'}
+        </p>
+        {failure}
+      </div>
+      <div className="flex shrink-0 items-center gap-1">
+        <Link
+          to="/settings"
+          aria-label="补全的额度和节奏在设置里调整"
+          title="补全的额度和节奏在设置里调整"
+          className="inline-flex h-control items-center rounded-md border border-transparent px-2 text-ink-muted hover:bg-sunken hover:text-ink"
+        >
+          <SettingsIcon size={13} aria-hidden="true" />
+        </Link>
+        <Button size="sm" variant="primary" icon={<SparklesIcon size={13} aria-hidden="true" />} onClick={() => void start()} disabled={busy}>
+          开始补全
+        </Button>
+        <button
+          type="button"
+          aria-label="暂时不再提示"
+          title="暂时不再提示；有更多词需要补全时会再提醒。选中词以后，也可以用「补全所选」。"
+          onClick={() => {
+            writeHiddenAt(status.pending);
+            setHiddenAt(status.pending);
+          }}
+          className="inline-flex h-control w-7 items-center justify-center rounded-md text-ink-subtle hover:bg-sunken hover:text-ink"
+        >
+          <XIcon size={13} aria-hidden="true" />
+        </button>
       </div>
     </section>
   );

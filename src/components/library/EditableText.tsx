@@ -22,6 +22,9 @@ export function EditableText({
   const [draft, setDraft] = useState(value);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  // An edit ends once, however it was ended: a field that is taken out of the page while it has
+  // the focus can report that it lost it, when the edit is long over.
+  const over = useRef(true);
 
   useEffect(() => {
     if (!editing) setDraft(value);
@@ -34,6 +37,7 @@ export function EditableText({
   }, []);
 
   const startEdit = () => {
+    over.current = false;
     setEditing(true);
     setDraft(value);
     requestAnimationFrame(() => {
@@ -47,11 +51,14 @@ export function EditableText({
   };
 
   const commit = () => {
+    if (over.current) return;
+    over.current = true;
     setEditing(false);
     if (draft !== value) onCommit(draft);
   };
 
   const cancel = () => {
+    over.current = true;
     setDraft(value);
     setEditing(false);
   };
@@ -63,7 +70,12 @@ export function EditableText({
         tabIndex={0}
         aria-label={label}
         onClick={startEdit}
-        onKeyDown={(e) => { if (e.key === 'Enter') startEdit(); }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            startEdit();
+          }
+        }}
         className={classNames(
           'w-full cursor-text rounded-md border border-transparent px-2 py-1 text-[13px] leading-relaxed transition-colors hover:border-line hover:bg-surface',
           !value && 'text-ink-subtle italic',
@@ -88,7 +100,11 @@ export function EditableText({
         }}
         onBlur={commit}
         onKeyDown={(e) => {
-          if (e.key === 'Escape') cancel();
+          // Escape gives up the edit and nothing more: it does not also close the panel around it.
+          if (e.key === 'Escape') {
+            e.stopPropagation();
+            cancel();
+          }
         }}
         className={classNames(
           'w-full resize-none overflow-hidden rounded-md border border-accent bg-surface px-2 py-1 text-[13px] leading-relaxed text-ink outline-none',
@@ -108,7 +124,10 @@ export function EditableText({
       onBlur={commit}
       onKeyDown={(e) => {
         if (e.key === 'Enter') e.currentTarget.blur();
-        if (e.key === 'Escape') cancel();
+        if (e.key === 'Escape') {
+          e.stopPropagation();
+          cancel();
+        }
       }}
       className={classNames(
         'w-full rounded-md border border-accent bg-surface px-2 py-1 text-[13px] leading-relaxed text-ink outline-none',

@@ -241,4 +241,55 @@ describe('the table of saved words', () => {
 
     expect(screen.getByText('没有匹配的生词')).toBeInTheDocument();
   });
+
+  it('offers to put the search and the filters away when they leave nothing, if it is given the way to', async () => {
+    const onClearFilters = vi.fn();
+    renderTable([], { onClearFilters });
+
+    await userEvent.click(screen.getByRole('button', { name: '清除搜索和筛选' }));
+
+    expect(onClearFilters).toHaveBeenCalledTimes(1);
+  });
+
+  it('offers nothing to put away where there is nothing that could be', () => {
+    renderTable([]);
+
+    expect(screen.queryByRole('button', { name: '清除搜索和筛选' })).not.toBeInTheDocument();
+  });
+
+  describe('the order of the list', () => {
+    const headerOf = (name: string) => screen.getByRole('columnheader', { name: new RegExp(name) });
+
+    it('is told to assistive technology on the column the list is in the order of, and on that alone', () => {
+      renderTable(words(3), { sort: { field: 'savedAt', dir: 'desc' } });
+
+      expect(headerOf('收藏时间')).toHaveAttribute('aria-sort', 'descending');
+      expect(headerOf('单词')).not.toHaveAttribute('aria-sort');
+      expect(headerOf('查询次数')).not.toHaveAttribute('aria-sort');
+      expect(headerOf('掌握度')).not.toHaveAttribute('aria-sort');
+    });
+
+    it('says which way, and follows the list when the order is turned round', () => {
+      const { rerender, props } = renderTable(words(3), { sort: { field: 'lemma', dir: 'asc' } });
+      expect(headerOf('单词')).toHaveAttribute('aria-sort', 'ascending');
+
+      rerender(<WordTable {...props} sort={{ field: 'lemma', dir: 'desc' }} />);
+
+      expect(headerOf('单词')).toHaveAttribute('aria-sort', 'descending');
+    });
+
+    it('is chosen with the button in the header: alphabetical first for the words, newest or most first for the rest', async () => {
+      const onSortChange = vi.fn();
+      renderTable(words(3), { sort: { field: 'savedAt', dir: 'desc' }, onSortChange });
+
+      await userEvent.click(screen.getByRole('button', { name: /单词/ }));
+      await userEvent.click(screen.getByRole('button', { name: /查询次数/ }));
+      await userEvent.click(screen.getByRole('button', { name: /收藏时间/ }));
+
+      expect(onSortChange).toHaveBeenNthCalledWith(1, { field: 'lemma', dir: 'asc' });
+      expect(onSortChange).toHaveBeenNthCalledWith(2, { field: 'lookups', dir: 'desc' });
+      // The column it is in the order of already: the same order the other way round.
+      expect(onSortChange).toHaveBeenNthCalledWith(3, { field: 'savedAt', dir: 'asc' });
+    });
+  });
 });
