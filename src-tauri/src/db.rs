@@ -1,3 +1,4 @@
+use crate::enrich;
 use crate::glossary::{self, GlossaryTerm};
 use crate::review::{self, Answer, Step};
 use rusqlite::{
@@ -19,6 +20,15 @@ const AUTO_BACKUP_PREFIX: &str = "gege-backup-";
 const PREMIGRATION_BACKUP_PREFIX: &str = "gege-premigrate-";
 const RESTORE_SAFETY_PREFIX: &str = "gege-restore-safety-";
 const MIN_FREE_SPACE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Which rows of `words` are bare, for [`Database::bare_words`]. It has to say what
+/// [`enrich::is_bare`] says about the document (a test holds the two to each other). The `CASE`
+/// keeps one row with a damaged document from failing the whole query.
+const BARE_WORDS_SQL: &str = "COALESCE(NULLIF(kind, ''), 'word') IN ('word', 'phrase')
+    AND CASE WHEN json_valid(data)
+        THEN COALESCE(json_array_length(data, '$.senses'), 0) = 0
+         AND COALESCE(json_array_length(data, '$.examples'), 0) = 0
+        ELSE 0 END";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -840,6 +850,8 @@ impl Database {
             "reviewLimit": 20,
             "includeLongFormReview": false,
             "sessionGapMinutes": 30,
+            "enrichDailyTokens": enrich::DEFAULT_DAILY_TOKENS,
+            "enrichPace": "normal",
             "activeDomainProfile": "general",
             "analysisStyle": "standard",
             "autoCheckUpdates": true,
@@ -1360,6 +1372,79 @@ impl Database {
             skipped,
             errors,
         })
+    }
+
+    /// The words that have nothing but a form and a meaning (see [`enrich::is_bare`]), oldest
+    /// first, as their ids and lemmas. With `only`, just those of the given ids.
+    pub fn bare_words(&self, only: Option<&[String]>) -> Result<Vec<enrich::Candidate>, String> {
+        let wanted: Option<HashSet<&str>> =
+            only.map(|ids| ids.iter().map(String::as_str).collect());
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT id, lemma FROM words WHERE {BARE_WORDS_SQL} ORDER BY saved_at ASC, id ASC"
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(enrich::Candidate {
+                    id: row.get(0)?,
+                    lemma: row.get(1)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let mut words = Vec::new();
+        for row in rows {
+            let candidate = row.map_err(|e| e.to_string())?;
+            if wanted
+                .as_ref()
+                .is_none_or(|wanted| wanted.contains(candidate.id.as_str()))
+            {
+                words.push(candidate);
+            }
+        }
+        Ok(words)
+    }
+
+    /// How many words [`Database::bare_words`] would give.
+    pub fn count_bare_words(&self) -> Result<usize, String> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM words WHERE {BARE_WORDS_SQL}"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// Put what a model answered into the word where the word has nothing yet (see
+    /// [`enrich::fill_gaps`]). The word is read and written in one transaction, so a note the
+    /// user types meanwhile is not lost, and a word that was deleted or filled in elsewhere since
+    /// the batch looked at it is left alone. An answer with nothing to add is an error rather
+    /// than a word that is "done" and still bare, which the next run would ask for again.
+    pub fn fill_in_word(&self, id: &str, answer: &Value) -> Result<enrich::Filled, String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let Some(word) = word_json_by_id(&tx, id)? else {
+            return Ok(enrich::Filled::Gone);
+        };
+        if !enrich::is_bare(&word) {
+            return Ok(enrich::Filled::NotBare);
+        }
+        let filled = enrich::fill_gaps(&word, answer);
+        if enrich::is_bare(&filled) {
+            return Err(crate::llm::coded(
+                "empty",
+                "模型没有给出义项或例句，词条保持原样",
+            ));
+        }
+        save_word_with_connection(&tx, &filled, self.include_long_form_review())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(enrich::Filled::Done(Box::new(filled)))
     }
 
     pub fn get_review_queue(&self, limit: Option<u32>) -> Result<Vec<Value>, String> {
@@ -2190,6 +2275,35 @@ impl Database {
             )
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Count tokens that were spent today without a lookup of the user's behind them: what the
+    /// batch enrichment asks of the model. Today's lookups stay as they were.
+    pub fn record_tokens(&self, tokens: u32) -> Result<(), String> {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        self.conn
+            .execute(
+                "INSERT INTO usage_log (date, queries, tokens) VALUES (?1, 0, ?2)
+                 ON CONFLICT(date) DO UPDATE SET tokens = tokens + ?2",
+                params![today, tokens as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Estimated tokens spent today, by lookups and by the batch together.
+    pub fn tokens_today(&self) -> Result<u64, String> {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let tokens: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT tokens FROM usage_log WHERE date = ?1",
+                params![today],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(tokens.unwrap_or(0).max(0) as u64)
     }
 
     pub fn record_local_event(&self, event: &str, extra: &Value) -> Result<(), String> {
@@ -4312,6 +4426,316 @@ mod tests {
         assert_eq!(usage["tokens"], 120);
     }
 
+    #[test]
+    fn the_batch_spends_tokens_without_making_lookups() {
+        let db = new_db();
+        assert_eq!(db.tokens_today().unwrap(), 0);
+
+        db.record_lookup(120).unwrap();
+        db.record_tokens(500).unwrap();
+        db.record_tokens(80).unwrap();
+
+        assert_eq!(db.tokens_today().unwrap(), 700);
+        let usage = db.get_usage().unwrap();
+        assert_eq!(usage["today"], 1, "the batch is not a lookup of the user");
+        assert_eq!(usage["tokens"], 700);
+    }
+
+    #[test]
+    fn the_batch_can_be_the_only_use_of_the_day() {
+        let db = new_db();
+        db.record_tokens(300).unwrap();
+
+        assert_eq!(db.tokens_today().unwrap(), 300);
+        assert_eq!(db.get_usage().unwrap()["today"], 0);
+    }
+
+    #[test]
+    fn only_todays_tokens_count_towards_the_limit_of_the_day() {
+        let db = new_db();
+        db.conn
+            .execute(
+                "INSERT INTO usage_log (date, queries, tokens) VALUES ('2000-01-15', 7, 7000)",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(db.tokens_today().unwrap(), 0);
+    }
+
+    fn variant(id: &str, edit: impl FnOnce(&mut Value)) -> Value {
+        let mut word = sample_word(id, "Reader", "2026-08-01T10:00:00+00:00");
+        edit(&mut word);
+        word
+    }
+
+    fn model_answer() -> Value {
+        serde_json::json!({
+            "lemma": "a-form-the-model-prefers",
+            "translation": "模型的释义",
+            "pos": "adj.",
+            "ipaUS": "/əˈfemərəl/",
+            "ipaUK": "/ɪˈfemərəl/",
+            "contextMeaning": "语境义",
+            "explanation": "lasting a very short time",
+            "senses": [{ "pos": "adj.", "translation": "短暂的", "gloss": "first" }],
+            "associations": [{ "title": "transient", "text": "近义" }],
+            "examples": [{ "en": "Fame is ephemeral.", "zh": "名声转瞬即逝。" }],
+            "collocations": [{ "phrase": "ephemeral beauty", "translation": "转瞬即逝的美" }],
+            "register": "formal",
+            "_model": "test-model"
+        })
+    }
+
+    fn ids_of_candidates(candidates: &[enrich::Candidate]) -> Vec<String> {
+        candidates
+            .iter()
+            .map(|candidate| candidate.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_bare_words_are_the_ones_the_rule_in_rust_calls_bare() {
+        let db = new_db();
+        let words = vec![
+            variant("bare-word", |_| {}),
+            variant("bare-phrase", |word| word["kind"] = "phrase".into()),
+            variant("unsaid-kind", |word| word["kind"] = "".into()),
+            variant("with-senses", |word| {
+                word["senses"] = serde_json::json!([{ "translation": "义" }])
+            }),
+            variant("with-examples", |word| {
+                word["examples"] = serde_json::json!([{ "en": "x", "zh": "y" }])
+            }),
+            variant("sentence", |word| word["kind"] = "sentence".into()),
+            variant("paragraph", |word| word["kind"] = "paragraph".into()),
+            variant("no-lists", |word| {
+                let fields = word.as_object_mut().unwrap();
+                fields.remove("senses");
+                fields.remove("examples");
+            }),
+            variant("odd-lists", |word| {
+                word["senses"] = "oops".into();
+                word["examples"] = Value::Null;
+            }),
+        ];
+        for word in &words {
+            db.save_word(word).unwrap();
+        }
+
+        let mut expected: Vec<String> = words
+            .iter()
+            .filter(|word| enrich::is_bare(word))
+            .map(|word| word["id"].as_str().unwrap().to_string())
+            .collect();
+        expected.sort();
+        let mut listed = ids_of_candidates(&db.bare_words(None).unwrap());
+        listed.sort();
+
+        assert_eq!(listed, expected, "the query and the rule disagree");
+        assert_eq!(db.count_bare_words().unwrap(), expected.len());
+        // Not a test of nothing against nothing.
+        assert_eq!(
+            expected,
+            [
+                "bare-phrase",
+                "bare-word",
+                "no-lists",
+                "odd-lists",
+                "unsaid-kind"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_bare_words_come_oldest_first_and_can_be_narrowed_down() {
+        let db = new_db();
+        for (id, saved_at) in [
+            ("c", "2026-08-03T10:00:00+00:00"),
+            ("b", "2026-08-01T10:00:00+00:00"),
+            ("a", "2026-08-01T10:00:00+00:00"),
+        ] {
+            db.save_word(&sample_word(id, "", saved_at)).unwrap();
+        }
+        let mut done = sample_word("d", "", "2026-07-01T10:00:00+00:00");
+        done["senses"] = serde_json::json!([{ "translation": "义" }]);
+        db.save_word(&done).unwrap();
+
+        let all = db.bare_words(None).unwrap();
+        assert_eq!(ids_of_candidates(&all), ["a", "b", "c"]);
+        assert_eq!(all[0].lemma, "a");
+
+        let some = db
+            .bare_words(Some(&["c".into(), "d".into(), "nobody".into()]))
+            .unwrap();
+        assert_eq!(ids_of_candidates(&some), ["c"]);
+        assert!(db.bare_words(Some(&[])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_damaged_document_does_not_fail_the_whole_list() {
+        let db = new_db();
+        db.save_word(&sample_word("good", "", "2026-08-01T10:00:00+00:00"))
+            .unwrap();
+        db.save_word(&sample_word("damaged", "", "2026-08-01T10:00:00+00:00"))
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE words SET data = 'not json at all' WHERE id = 'damaged'",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(ids_of_candidates(&db.bare_words(None).unwrap()), ["good"]);
+        assert_eq!(db.count_bare_words().unwrap(), 1);
+    }
+
+    #[test]
+    fn filling_a_bare_word_adds_what_it_lacks_and_leaves_what_the_user_owns() {
+        let db = new_db();
+        let mut word = sample_word("alpha", "Reader", "2026-08-01T10:00:00+00:00");
+        word["note"] = "我的笔记".into();
+        word["tags"] = serde_json::json!(["托福"]);
+        word["mastery"] = "learning".into();
+        word["lookups"] = 3.into();
+        db.save_word(&word).unwrap();
+        db.conn
+            .execute(
+                "UPDATE review_state SET box = 3 WHERE word_id = 'alpha'",
+                [],
+            )
+            .unwrap();
+
+        let filled = db.fill_in_word("alpha", &model_answer()).unwrap();
+        let enrich::Filled::Done(stored) = filled else {
+            panic!("expected the word to be filled, got {filled:?}");
+        };
+
+        // What was missing is there now.
+        assert_eq!(stored["senses"][0]["gloss"], "first");
+        assert_eq!(stored["examples"][0]["en"], "Fame is ephemeral.");
+        assert_eq!(stored["collocations"][0]["phrase"], "ephemeral beauty");
+        assert_eq!(stored["ipaUS"], "/əˈfemərəl/");
+        assert_eq!(stored["register"], "formal");
+        assert_eq!(stored["_model"], "test-model");
+        // What the user owns, and what the word already said, is not touched.
+        assert_eq!(stored["id"], "alpha");
+        assert_eq!(stored["lemma"], "alpha");
+        assert_eq!(stored["translation"], "alpha-中文");
+        assert_eq!(stored["pos"], "n.");
+        assert_eq!(stored["note"], "我的笔记");
+        assert_eq!(stored["tags"], serde_json::json!(["托福"]));
+        assert_eq!(stored["mastery"], "learning");
+        assert_eq!(stored["lookups"], 3);
+        assert_eq!(stored["savedAt"], "2026-08-01T10:00:00+00:00");
+        assert_eq!(stored["sourceApp"], "Reader");
+
+        // What came back is what is stored, and the rest of the database agrees with it.
+        let in_the_library = db.get_words_in_order(&["alpha".to_string()]).unwrap();
+        assert_eq!(in_the_library, [*stored]);
+        let box_number: i64 = db
+            .conn
+            .query_row(
+                "SELECT box FROM review_state WHERE word_id = 'alpha'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(box_number, 3, "review progress is the user's");
+        let tags: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM word_tags WHERE word_id = 'alpha'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tags, 1);
+        assert_eq!(db.count_bare_words().unwrap(), 0);
+        assert_eq!(db.get_all_words().unwrap().len(), 1, "no second entry");
+    }
+
+    #[test]
+    fn a_note_typed_while_the_model_was_answering_is_not_lost() {
+        let db = new_db();
+        let word = sample_word("alpha", "", "2026-08-01T10:00:00+00:00");
+        db.save_word(&word).unwrap();
+
+        // The batch looked at the word, asked the model, and in the meantime the user wrote a note.
+        let mut edited = word.clone();
+        edited["note"] = "写在这期间的笔记".into();
+        db.save_word(&edited).unwrap();
+        db.fill_in_word("alpha", &model_answer()).unwrap();
+
+        let stored = &db.get_words_in_order(&["alpha".to_string()]).unwrap()[0];
+        assert_eq!(stored["note"], "写在这期间的笔记");
+        assert_eq!(stored["senses"][0]["gloss"], "first");
+    }
+
+    #[test]
+    fn a_word_deleted_in_the_meantime_is_not_brought_back() {
+        let db = new_db();
+        db.save_word(&sample_word("alpha", "", "2026-08-01T10:00:00+00:00"))
+            .unwrap();
+        db.delete_words(&["alpha".to_string()]).unwrap();
+
+        let outcome = db.fill_in_word("alpha", &model_answer()).unwrap();
+
+        assert_eq!(outcome, enrich::Filled::Gone);
+        assert!(db.get_all_words().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_word_that_is_no_longer_bare_is_left_as_it_is() {
+        let db = new_db();
+        let mut word = sample_word("alpha", "", "2026-08-01T10:00:00+00:00");
+        word["senses"] = serde_json::json!([{ "translation": "我自己加的义项" }]);
+        db.save_word(&word).unwrap();
+        let mut sentence = sample_word("beta", "", "2026-08-01T10:00:00+00:00");
+        sentence["kind"] = "sentence".into();
+        db.save_word(&sentence).unwrap();
+
+        assert_eq!(
+            db.fill_in_word("alpha", &model_answer()).unwrap(),
+            enrich::Filled::NotBare
+        );
+        assert_eq!(
+            db.fill_in_word("beta", &model_answer()).unwrap(),
+            enrich::Filled::NotBare
+        );
+
+        let stored = db
+            .get_words_in_order(&["alpha".to_string(), "beta".to_string()])
+            .unwrap();
+        assert_eq!(stored, [word, sentence]);
+    }
+
+    #[test]
+    fn an_answer_with_nothing_to_add_is_an_error_and_changes_nothing() {
+        let db = new_db();
+        let word = sample_word("alpha", "", "2026-08-01T10:00:00+00:00");
+        db.save_word(&word).unwrap();
+
+        for nothing in [
+            serde_json::json!({ "lemma": "alpha", "senses": [], "examples": [] }),
+            serde_json::json!({}),
+            serde_json::json!("not even an object"),
+        ] {
+            let error = db.fill_in_word("alpha", &nothing).unwrap_err();
+            assert!(error.starts_with("[empty]"), "{error}");
+        }
+
+        assert_eq!(
+            db.get_words_in_order(&["alpha".to_string()]).unwrap(),
+            [word]
+        );
+        assert_eq!(
+            db.count_bare_words().unwrap(),
+            1,
+            "it is still there to be asked again"
+        );
+    }
+
     fn history_db() -> Database {
         let db = Database::open_memory().unwrap();
         db.initialize().unwrap();
@@ -5246,6 +5670,8 @@ mod tests {
         assert_eq!(settings["theme"], "dark");
         assert_eq!(settings["reviewLimit"], 20);
         assert_eq!(settings["sessionGapMinutes"], 30);
+        assert_eq!(settings["enrichDailyTokens"], enrich::DEFAULT_DAILY_TOKENS);
+        assert_eq!(settings["enrichPace"], "normal");
         assert_eq!(settings["autoCheckUpdates"], true);
         assert_eq!(settings["activeDomainProfile"], "general");
         assert_eq!(settings["analysisStyle"], "standard");

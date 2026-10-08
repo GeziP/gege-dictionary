@@ -4,7 +4,7 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LexNoteProvider } from '../contexts/LexNoteContext';
 import * as bridge from '../lib/tauri-bridge';
-import type { SavedWord } from '../types/lexnote';
+import type { EnrichmentProgress, EnrichmentStatus, SavedWord } from '../types/lexnote';
 import { Library } from './Library';
 
 vi.mock('../lib/tauri-bridge', () => ({
@@ -20,7 +20,33 @@ vi.mock('../lib/tauri-bridge', () => ({
   listenLookupDelta: vi.fn(),
   listenWordSaved: vi.fn(),
   getReviewStats: vi.fn(),
+  getEnrichmentStatus: vi.fn(),
+  startEnrichment: vi.fn(),
+  pauseEnrichment: vi.fn(),
+  resumeEnrichment: vi.fn(),
+  stopEnrichment: vi.fn(),
+  listenEnrichmentProgress: vi.fn(),
 }));
+
+const IDLE: EnrichmentProgress = {
+  run: 0,
+  state: 'idle',
+  total: 0,
+  done: 0,
+  failed: 0,
+  skipped: 0,
+  tokens: 0,
+  current: null,
+  stoppedBecause: null,
+  failures: [],
+};
+const RUNNING: EnrichmentProgress = { ...IDLE, run: 1, state: 'running', total: 2, current: 'alpha' };
+const enrichmentStatus = (progress: EnrichmentProgress = IDLE): EnrichmentStatus => ({
+  pending: 2,
+  tokensToday: 0,
+  dailyLimit: 100_000,
+  progress,
+});
 
 const word = (lemma: string, overrides: Record<string, unknown> = {}): SavedWord =>
   ({
@@ -89,6 +115,9 @@ describe('the word list in the library', () => {
     vi.mocked(bridge.listenLookupDelta).mockResolvedValue(() => undefined);
     vi.mocked(bridge.listenWordSaved).mockResolvedValue(() => undefined);
     vi.mocked(bridge.getReviewStats).mockResolvedValue({ dueCount: 0, boxCounts: [0, 0, 0], total: 3 });
+    vi.mocked(bridge.getEnrichmentStatus).mockResolvedValue(enrichmentStatus());
+    vi.mocked(bridge.listenEnrichmentProgress).mockResolvedValue(() => undefined);
+    vi.mocked(bridge.startEnrichment).mockResolvedValue(RUNNING);
   });
 
   afterEach(() => {
@@ -171,5 +200,67 @@ describe('the word list in the library', () => {
     expect(pick('alpha')).not.toBeChecked();
     expect(pick('beta')).not.toBeChecked();
     expect(pick('livelock')).not.toBeChecked();
+  });
+
+  describe('filling in the words that have only a meaning', () => {
+    it('offers to do it for all of them, which are the ones without senses and examples', async () => {
+      vi.mocked(bridge.startEnrichment).mockImplementation(async () => {
+        // The backend is running now, and says so from here on.
+        vi.mocked(bridge.getEnrichmentStatus).mockResolvedValue(enrichmentStatus(RUNNING));
+        return RUNNING;
+      });
+      renderPage();
+
+      expect(await screen.findByText('2 个词还没有义项和例句')).toBeInTheDocument();
+      await userEvent.click(screen.getByRole('button', { name: '开始补全' }));
+
+      expect(bridge.startEnrichment).toHaveBeenCalledTimes(1);
+      expect(bridge.startEnrichment).toHaveBeenCalledWith(undefined);
+      expect(await screen.findByText('正在补全生词')).toBeInTheDocument();
+    });
+
+    it('offers to do it for the selected words that are bare, and only for those', async () => {
+      renderPage();
+      await screen.findByRole('checkbox', { name: '选择 alpha' });
+
+      await userEvent.click(pick('alpha'));
+      await userEvent.click(pick('livelock'));
+      expect(await screen.findByRole('button', { name: '补全所选（1）' })).toBeEnabled();
+      await userEvent.click(screen.getByRole('button', { name: '补全所选（1）' }));
+
+      expect(bridge.startEnrichment).toHaveBeenCalledWith(['alpha']);
+    });
+
+    it('offers nothing for a selection in which no word is bare', async () => {
+      renderPage();
+      await screen.findByRole('checkbox', { name: '选择 alpha' });
+
+      await userEvent.click(pick('livelock'));
+
+      expect(await screen.findByText('已选 1 条')).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /补全所选/ })).not.toBeInTheDocument();
+    });
+
+    it('does not start a second batch from the selection while one is going on', async () => {
+      vi.mocked(bridge.getEnrichmentStatus).mockResolvedValue(enrichmentStatus(RUNNING));
+      renderPage();
+      await screen.findByText('正在补全生词');
+
+      await userEvent.click(pick('beta'));
+
+      const button = await screen.findByRole('button', { name: '补全所选（1）' });
+      expect(button).toBeDisabled();
+      expect(button).toHaveAttribute('title', '已经有一轮补全在进行，请先暂停或停止它');
+    });
+
+    it('says nothing when every word has its senses or examples', async () => {
+      vi.mocked(bridge.getAllWords).mockResolvedValue([WORDS[2]]);
+      vi.mocked(bridge.getEnrichmentStatus).mockResolvedValue({ ...enrichmentStatus(), pending: 0 });
+      renderPage();
+      await screen.findByRole('checkbox', { name: '选择 livelock' });
+
+      expect(screen.queryByText(/还没有义项和例句/)).not.toBeInTheDocument();
+      expect(screen.queryByRole('region', { name: '批量补全' })).not.toBeInTheDocument();
+    });
   });
 });

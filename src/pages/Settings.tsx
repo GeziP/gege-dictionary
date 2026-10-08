@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { WindowFrame } from '../components/shell/WindowFrame';
 import { ProviderSection } from '../components/settings/ProviderSection';
 import { BackupProviderSection } from '../components/settings/BackupProviderSection';
+import { EnrichmentSection } from '../components/settings/EnrichmentSection';
 import { CaptureSection } from '../components/settings/CaptureSection';
 import { PromptSection } from '../components/settings/PromptSection';
 import { AppearanceSection } from '../components/settings/AppearanceSection';
@@ -59,6 +60,7 @@ export function Settings() {
             <div className="space-y-3">
               <ProviderSection />
               <BackupProviderSection />
+              <EnrichmentSection />
             </div>
           ) : null}
           {tab === 'capture' ? <CaptureSection /> : null}

@@ -4,6 +4,7 @@ mod content_filter;
 mod db;
 #[cfg(windows)]
 mod dpapi;
+mod enrich;
 mod glossary;
 mod insights;
 mod llm;
@@ -1897,6 +1898,7 @@ pub fn run() {
             last_looked_up: Mutex::new(None),
             startup_warnings: Mutex::new(startup_warnings),
         })
+        .manage(enrich::Enrichment::default())
         .invoke_handler(tauri::generate_handler![
             get_all_words,
             search_words,
@@ -1940,6 +1942,11 @@ pub fn run() {
             lookup::lookup_word,
             lookup::lookup_word_stream,
             lookup::test_connection,
+            enrich::get_enrichment_status,
+            enrich::start_enrichment,
+            enrich::pause_enrichment,
+            enrich::resume_enrichment,
+            enrich::stop_enrichment,
             speak_text,
             stop_speaking,
             list_voices,

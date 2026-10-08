@@ -110,6 +110,16 @@ enum Service {
     Backup,
 }
 
+/// Who is asking. The words the user looks up are counted in the usage figures, remembered in
+/// the history and measured by the cache statistics. The batch enrichment of imported words asks
+/// the same questions in the background, and is none of those: it costs tokens, and only that is
+/// counted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Asker {
+    User,
+    Batch,
+}
+
 struct PreparedLookup {
     main: ModelTarget,
     /// Asked once when the main service fails in a way another one may fix. `None` unless the
@@ -119,8 +129,10 @@ struct PreparedLookup {
     template_name: String,
     cache_key: String,
     cache_hit: Option<serde_json::Value>,
-    /// Whether answered lookups are remembered in the history (a setting the user can turn off).
+    /// Whether answered lookups are remembered in the history (a setting the user can turn off,
+    /// and never done for a batch).
     record_history: bool,
+    asker: Asker,
 }
 
 /// The question a lookup answers: what was selected, around what, and as which kind.
@@ -287,7 +299,11 @@ fn finish_lookup(
                     eprintln!("[lookup] could not cache the answer: {e}");
                 }
             }
-            if let Err(e) = db.record_lookup(tokens) {
+            let counted = match prepared.asker {
+                Asker::User => db.record_lookup(tokens),
+                Asker::Batch => db.record_tokens(tokens),
+            };
+            if let Err(e) = counted {
                 eprintln!("[lookup] could not record usage: {e}");
             }
             if prepared.record_history {
@@ -392,6 +408,7 @@ fn prepare_lookup(
     kind: &str,
     force_refresh: bool,
     log_prefix: &str,
+    asker: Asker,
 ) -> Result<PreparedLookup, String> {
     let record_history;
     let LookupPlan {
@@ -403,7 +420,7 @@ fn prepare_lookup(
     } = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let settings = db.get_settings()?;
-        record_history = crate::history_enabled(&settings);
+        record_history = asker == Asker::User && crate::history_enabled(&settings);
         let provider = settings
             .get("provider")
             .ok_or_else(|| llm::coded("no_key", "尚未配置模型服务，请到设置页填写"))?
@@ -463,10 +480,12 @@ fn prepare_lookup(
                 "[{log_prefix}] glossary_term_applied count={}, domain={domain}",
                 glossary_matches.len()
             );
-            let _ = db.record_local_event(
-                "glossary_term_applied",
-                &serde_json::json!({ "count_bucket": glossary_matches.len().min(10).to_string() }),
-            );
+            if asker == Asker::User {
+                let _ = db.record_local_event(
+                    "glossary_term_applied",
+                    &serde_json::json!({ "count_bucket": glossary_matches.len().min(10).to_string() }),
+                );
+            }
         }
         let tpl_body = glossary::enrich_template(&tpl_body, domain, style, &glossary_matches);
 
@@ -506,7 +525,10 @@ fn prepare_lookup(
     if !force_refresh {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         if let Some(mut cached) = db.get_cache(&cache_key, cache_ttl)? {
-            let _ = db.record_local_event("lookup_cache_hit", &serde_json::json!({ "kind": kind }));
+            if asker == Asker::User {
+                let _ =
+                    db.record_local_event("lookup_cache_hit", &serde_json::json!({ "kind": kind }));
+            }
             if let Some(obj) = cached.as_object_mut() {
                 obj.insert("fromCache".to_string(), serde_json::Value::Bool(true));
                 obj.insert(
@@ -515,11 +537,11 @@ fn prepare_lookup(
                 );
             }
             cache_hit = Some(cached);
-        } else {
+        } else if asker == Asker::User {
             let _ =
                 db.record_local_event("lookup_cache_miss", &serde_json::json!({ "kind": kind }));
         }
-    } else {
+    } else if asker == Asker::User {
         let _ = state.db.lock().map(|db| {
             db.record_local_event("lookup_cache_miss", &serde_json::json!({ "kind": kind }))
         });
@@ -533,6 +555,7 @@ fn prepare_lookup(
         cache_key,
         cache_hit,
         record_history,
+        asker,
     })
 }
 
@@ -878,36 +901,18 @@ fn note_backup_used(state: &AppState, kind: &str, reason: &str) {
 // Tauri commands
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-pub async fn lookup_word(
-    state: tauri::State<'_, AppState>,
-    selection: String,
-    context: String,
-    kind: String,
-    force_refresh: bool,
-) -> Result<serde_json::Value, String> {
-    let mut prepared = prepare_lookup(
-        &state,
-        &selection,
-        &context,
-        &kind,
-        force_refresh,
-        "lookup_word",
-    )?;
-    let request = LookupRequest {
-        selection: &selection,
-        context: &context,
-        kind: &kind,
-    };
-
+/// Answer a prepared lookup without streaming: from the cache when it can, else from the model
+/// services. Gives the entry and what it cost in estimated tokens (nothing, from the cache).
+async fn answer_lookup(
+    state: &tauri::State<'_, AppState>,
+    mut prepared: PreparedLookup,
+    request: LookupRequest<'_>,
+) -> Result<(serde_json::Value, u32), String> {
     if let Some(cached) = prepared.cache_hit.take() {
         eprintln!("[lookup_word] cache HIT");
-        return Ok(finish_lookup(
-            &state,
-            &prepared,
-            request,
-            cached,
-            Answer::Cache,
+        return Ok((
+            finish_lookup(state, &prepared, request, cached, Answer::Cache),
+            0,
         ));
     }
 
@@ -923,11 +928,12 @@ pub async fn lookup_word(
     )
     .await
     .map_err(|failure| failure.message)?;
-    if let Some(reason) = main_failure {
-        note_backup_used(&state, &kind, &reason);
+    if let Some(reason) = main_failure.filter(|_| prepared.asker == Asker::User) {
+        note_backup_used(state, request.kind, &reason);
     }
 
-    let prompt = llm::build_prompt(&prepared.template_body, &selection, &context);
+    let prompt = llm::build_prompt(&prepared.template_body, request.selection, request.context);
+    let tokens = llm::estimate_lookup_tokens(&prompt, &reply.raw);
     let answer = Answer::Model {
         prompt: &prompt,
         raw: &reply.raw,
@@ -935,13 +941,64 @@ pub async fn lookup_word(
         service,
     };
     eprintln!("[lookup_word] done, returning entry");
-    Ok(finish_lookup(
-        &state,
-        &prepared,
-        request,
-        reply.entry,
-        answer,
+    Ok((
+        finish_lookup(state, &prepared, request, reply.entry, answer),
+        tokens,
     ))
+}
+
+#[tauri::command]
+pub async fn lookup_word(
+    state: tauri::State<'_, AppState>,
+    selection: String,
+    context: String,
+    kind: String,
+    force_refresh: bool,
+) -> Result<serde_json::Value, String> {
+    let prepared = prepare_lookup(
+        &state,
+        &selection,
+        &context,
+        &kind,
+        force_refresh,
+        "lookup_word",
+        Asker::User,
+    )?;
+    let request = LookupRequest {
+        selection: &selection,
+        context: &context,
+        kind: &kind,
+    };
+    answer_lookup(&state, prepared, request)
+        .await
+        .map(|(entry, _tokens)| entry)
+}
+
+/// Ask for the entry of a word that is already in the library, for the batch enrichment of the
+/// words that were imported bare. What the model answers is as good as a lookup's, but it is not
+/// one the user made: it leaves no history, adds no lookup to the day's count and does not move
+/// the cache statistics. What it costs is counted. Gives the entry and its estimated tokens.
+pub(crate) async fn lookup_for_enrichment(
+    state: &tauri::State<'_, AppState>,
+    selection: &str,
+    context: &str,
+    kind: &str,
+) -> Result<(serde_json::Value, u32), String> {
+    let prepared = prepare_lookup(
+        state,
+        selection,
+        context,
+        kind,
+        false,
+        "enrich",
+        Asker::Batch,
+    )?;
+    let request = LookupRequest {
+        selection,
+        context,
+        kind,
+    };
+    answer_lookup(state, prepared, request).await
 }
 
 #[tauri::command]
@@ -961,6 +1018,7 @@ pub async fn lookup_word_stream(
         &kind,
         force_refresh,
         "lookup_stream",
+        Asker::User,
     )?;
     let request = LookupRequest {
         selection: &selection,
@@ -1493,6 +1551,16 @@ mod tests {
             cache_key: "key-under-the-main-model".into(),
             cache_hit: None,
             record_history: true,
+            asker: Asker::User,
+        }
+    }
+
+    /// The same preparation as one that the batch enrichment makes: no history is kept for it.
+    fn prepared_for_a_batch() -> PreparedLookup {
+        PreparedLookup {
+            record_history: false,
+            asker: Asker::Batch,
+            ..prepared_with_backup()
         }
     }
 
@@ -1583,6 +1651,35 @@ mod tests {
             .get_cache("key-under-the-main-model", 30)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn what_a_batch_asks_costs_tokens_but_is_not_a_lookup_the_user_made() {
+        let state = ready_state();
+        let answer = Answer::Model {
+            prompt: "Explain running",
+            raw: "{\"lemma\":\"run\"}",
+            model: "main-model",
+            service: Service::Main,
+        };
+
+        let entry = serde_json::json!({ "lemma": "run", "translation": "跑" });
+        let finished = finish_lookup(&state, &prepared_for_a_batch(), REQUEST, entry, answer);
+
+        // It is still an answer from the model, kept for next time like any other...
+        assert_eq!(finished["_model"], "main-model");
+        let db = state.db.lock().unwrap();
+        assert!(db
+            .get_cache("key-under-the-main-model", 30)
+            .unwrap()
+            .is_some());
+        // ...paid for in tokens, but neither a lookup of the day nor a line in the history.
+        let usage = db.get_usage().unwrap();
+        assert_eq!(usage["today"], 0);
+        assert_eq!(usage["month"], 0);
+        assert!(usage["tokens"].as_i64().unwrap() > 0);
+        assert!(db.tokens_today().unwrap() > 0);
+        assert!(db.list_history().unwrap().is_empty());
     }
 
     #[test]

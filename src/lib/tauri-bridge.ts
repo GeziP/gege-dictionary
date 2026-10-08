@@ -1,5 +1,7 @@
 import type {
   AppSettings,
+  EnrichmentProgress,
+  EnrichmentStatus,
   Entry,
   GlossaryImportReport,
   GlossaryPage,
@@ -118,6 +120,39 @@ export async function getReviewStats(): Promise<ReviewStats> {
 /** Streak, activity chart, mastery and review figures for the last `days` days (7 to 90). */
 export async function getLearningInsights(days: number): Promise<LearningInsights> {
   return invoke<LearningInsights>('get_learning_insights', { days });
+}
+
+/** How the batch enrichment stands: the words waiting for it, today's tokens and the run, if any. */
+export async function getEnrichmentStatus(): Promise<EnrichmentStatus> {
+  return invoke<EnrichmentStatus>('get_enrichment_status');
+}
+
+/**
+ * Starts filling in the words that have only a form and a meaning: all of them, or those of `ids`
+ * that are. Rejects when there is nothing to do or a run is still going on.
+ */
+export async function startEnrichment(ids?: string[]): Promise<EnrichmentProgress> {
+  return invoke<EnrichmentProgress>('start_enrichment', { ids });
+}
+
+/** No new request is sent until it is resumed; the one on its way is let finish. */
+export async function pauseEnrichment(): Promise<EnrichmentProgress> {
+  return invoke<EnrichmentProgress>('pause_enrichment');
+}
+
+export async function resumeEnrichment(): Promise<EnrichmentProgress> {
+  return invoke<EnrichmentProgress>('resume_enrichment');
+}
+
+/** Ends the run after the request on its way; what is done stays done. */
+export async function stopEnrichment(): Promise<EnrichmentProgress> {
+  return invoke<EnrichmentProgress>('stop_enrichment');
+}
+
+export async function listenEnrichmentProgress(
+  handler: (progress: EnrichmentProgress) => void,
+): Promise<() => void> {
+  return listen('enrichment://progress', handler as (payload: unknown) => void);
 }
 
 export async function resetReviewState(wordId: string): Promise<void> {

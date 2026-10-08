@@ -324,7 +324,7 @@ export function DataSection() {
         </div>
       </SettingsSection>
 
-      <SettingsSection title="用量" description="仅在本机统计，不上报。查询次数包含命中本地缓存的查询；token 只统计真正发给模型的请求，数值按字符估算，实际以服务商账单为准。">
+      <SettingsSection title="用量" description="仅在本机统计，不上报。查询次数包含命中本地缓存的查询，不含批量补全；token 只统计真正发给模型的请求（批量补全用掉的也算在内），数值按字符估算，实际以服务商账单为准。">
         <div className="grid grid-cols-3 gap-2">
           {[
             { label: '今日查询', value: `${usage.today} 次` },

@@ -167,6 +167,55 @@ export interface ReviewStats {
   total: number;
 }
 
+export type EnrichmentPace = 'gentle' | 'normal' | 'fast';
+
+/** Where a batch enrichment run stands. `stopping` is a run that was stopped and is finishing its last request. */
+export type EnrichmentState = 'idle' | 'running' | 'paused' | 'stopping' | 'finished' | 'stopped';
+
+/** Why a run ended before it was through, other than because the user stopped it. */
+export interface EnrichmentStopReason {
+  /** A lookup error code (`no_key`, `auth`, `model`, `rate_limit`, ...), `budget`, or `repeated`. */
+  code: string;
+  /** The backend's own `[code] message` wording. */
+  message: string;
+}
+
+export interface EnrichmentFailure {
+  lemma: string;
+  code: string;
+  message: string;
+}
+
+/** What the backend says about a run, as it goes. */
+export interface EnrichmentProgress {
+  /** Which run this is since the app was started (0: none yet). */
+  run: number;
+  state: EnrichmentState;
+  /** The words the run set out to do. */
+  total: number;
+  done: number;
+  failed: number;
+  /** Words that no longer needed it when their turn came. */
+  skipped: number;
+  /** Estimated tokens the run has used. */
+  tokens: number;
+  /** The word being asked about. */
+  current: string | null;
+  stoppedBecause: EnrichmentStopReason | null;
+  /** The first words that failed, and why; `failed` counts all of them. */
+  failures: EnrichmentFailure[];
+}
+
+export interface EnrichmentStatus {
+  /** Words that have only a form and a meaning: what a run would work on. */
+  pending: number;
+  /** Estimated tokens used today by lookups and the batch together. */
+  tokensToday: number;
+  /** The most the day's use may grow to by the batch; null when there is no limit. */
+  dailyLimit: number | null;
+  progress: EnrichmentProgress;
+}
+
 /** What happened on one local calendar day. */
 export interface InsightsDay {
   /** yyyy-MM-dd, the user's local day. */
@@ -399,6 +448,10 @@ export interface AppSettings {
   reviewLimit?: 0 | 10 | 20 | 50;
   includeLongFormReview?: boolean;
   sessionGapMinutes?: 15 | 30 | 60;
+  /** The most tokens (lookups and batch together) the day's use may grow to by the batch enrichment; 0 is no limit. */
+  enrichDailyTokens?: number;
+  /** How quickly the batch enrichment sends its requests. */
+  enrichPace?: EnrichmentPace;
   activeDomainProfile: DomainProfile;
   analysisStyle: AnalysisStyle;
   autoCheckUpdates?: boolean;

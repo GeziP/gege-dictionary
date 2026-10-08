@@ -9,6 +9,7 @@ import type {
   PromptTemplate,
   SavedWord,
 } from '../types/lexnote';
+import { DEFAULT_ENRICH_PACE, DEFAULT_ENRICH_TOKENS } from '../lib/enrichment';
 import * as bridge from '../lib/tauri-bridge';
 import { upsertSavedWord } from '../lib/words';
 
@@ -44,6 +45,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   reviewLimit: 20,
   includeLongFormReview: false,
   sessionGapMinutes: 30,
+  enrichDailyTokens: DEFAULT_ENRICH_TOKENS,
+  enrichPace: DEFAULT_ENRICH_PACE,
   activeDomainProfile: 'general',
   analysisStyle: 'standard',
   autoCheckUpdates: true,
