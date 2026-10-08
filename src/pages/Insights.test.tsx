@@ -221,9 +221,9 @@ describe('the learning-insights page', () => {
     const boxes = within(review.getByRole('list', { name: '复习档位分布' })).getAllByRole('listitem');
     // the box, how many cards are in it, and when its cards come back, as one run of text
     expect(boxes.map((box) => box.textContent)).toEqual([
-      'Box 120 张 · 1 天后再见',
-      'Box 212 张 · 3 天后再见',
-      'Box 36 张 · 7 天后再见',
+      '第 1 档20 张 · 1 天后再见',
+      '第 2 档12 张 · 3 天后再见',
+      '第 3 档6 张 · 7 天后再见',
     ]);
   });
 
