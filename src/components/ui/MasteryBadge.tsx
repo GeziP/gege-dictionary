@@ -1,14 +1,16 @@
 /* eslint-disable react-refresh/only-export-components */
 import React from 'react';
 import { CheckCircle2Icon, CircleDashedIcon, CircleDotIcon } from 'lucide-react';
+import { MASTERY_LABELS } from '../../lib/insights';
 import { classNames } from '../../utils/format';
 import type { Mastery } from '../../types/lexnote';
 
+/** The levels in the order a word goes through them: that is the order the lists and menus show them in. */
 export const MASTERY_META: Record<Mastery, { label: string; icon: typeof CircleDashedIcon; tone: string }> = {
-  new: { label: '新词', icon: CircleDashedIcon, tone: 'text-danger' },
-  familiar: { label: '熟悉', icon: CircleDotIcon, tone: 'text-warn' },
-  learning: { label: '巩固中', icon: CircleDotIcon, tone: 'text-warn' },
-  mastered: { label: '已掌握', icon: CheckCircle2Icon, tone: 'text-positive' },
+  new: { label: MASTERY_LABELS.new, icon: CircleDashedIcon, tone: 'text-danger' },
+  learning: { label: MASTERY_LABELS.learning, icon: CircleDotIcon, tone: 'text-warn' },
+  familiar: { label: MASTERY_LABELS.familiar, icon: CircleDotIcon, tone: 'text-warn' },
+  mastered: { label: MASTERY_LABELS.mastered, icon: CheckCircle2Icon, tone: 'text-positive' },
 };
 
 export const MASTERY_ORDER: Mastery[] = ['new', 'learning', 'mastered'];

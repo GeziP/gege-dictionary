@@ -14,6 +14,14 @@ export type RangeDays = (typeof RANGES)[number];
 
 export const MASTERY_LEVELS: Mastery[] = ['new', 'learning', 'familiar', 'mastered'];
 
+/** What each level is called, in the badge, the charts and the weekly report alike. */
+export const MASTERY_LABELS: Record<Mastery, string> = {
+  new: '新词',
+  learning: '巩固中',
+  familiar: '熟悉',
+  mastered: '已掌握',
+};
+
 /**
  * Right answers as a percentage of all answers, or `null` while nothing was answered. A card
  * that was found hard was not answered right. Rounding never claims more than the truth: 100
@@ -154,21 +162,26 @@ export function calendarWeeks(calendar: ReviewCalendar): CalendarCell[][] {
   return weeks;
 }
 
+/** How many review cards were answered, over some days or one, and how. */
+export type ReviewAnswers = Pick<ReviewCalendarDay, 'total' | 'correct' | 'hard' | 'wrong'>;
+
 /**
- * "10月7日 周三：复习 12 张（答对 9，有点难 2，答错 1）". Answers whose kind was not recorded
+ * "复习 12 张（答对 9，有点难 2，答错 1）", or "没有复习". Answers whose kind was not recorded
  * are in the total but not in the brackets, which then say how many there are.
  */
-export function describeReviewDay(day: ReviewCalendarDay): string {
-  const label = dayLabel(day.date);
-  if (day.total <= 0) return `${label}：没有复习`;
+export function describeReviewTotals(answers: ReviewAnswers): string {
+  if (answers.total <= 0) return '没有复习';
   const parts: string[] = [];
-  if (day.correct > 0) parts.push(`答对 ${day.correct}`);
-  if (day.hard > 0) parts.push(`有点难 ${day.hard}`);
-  if (day.wrong > 0) parts.push(`答错 ${day.wrong}`);
-  const unknown = day.total - day.correct - day.hard - day.wrong;
+  if (answers.correct > 0) parts.push(`答对 ${answers.correct}`);
+  if (answers.hard > 0) parts.push(`有点难 ${answers.hard}`);
+  if (answers.wrong > 0) parts.push(`答错 ${answers.wrong}`);
+  const unknown = answers.total - answers.correct - answers.hard - answers.wrong;
   if (unknown > 0) parts.push(`未记录 ${unknown}`);
-  return `${label}：复习 ${day.total} 张（${parts.join('，')}）`;
+  return `复习 ${answers.total} 张（${parts.join('，')}）`;
 }
+
+/** "10月7日 周三：复习 12 张（答对 9，有点难 2，答错 1）". */
+export const describeReviewDay = (day: ReviewCalendarDay): string => `${dayLabel(day.date)}：${describeReviewTotals(day)}`;
 
 /** "近 12 周复习了 31 张，分布在 6 天", or that there was nothing. */
 export function describeCalendar(calendar: ReviewCalendar): string {

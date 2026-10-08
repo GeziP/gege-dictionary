@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { WeeklyCard } from '../components/insights/WeeklyCard';
 import { WindowFrame } from '../components/shell/WindowFrame';
 import { Button } from '../components/ui/Button';
 import { MASTERY_META } from '../components/ui/MasteryBadge';
@@ -160,7 +161,7 @@ function Report({ data }: { data: LearningInsights }) {
   return (
     <>
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Stat label="生词库" value={totals.words} unit="个" note={`本周新增 ${data.savedThisWeek} 个`} />
+        <Stat label="生词库" value={totals.words} unit="个" note={`近 7 天新增 ${data.savedThisWeek} 个`} />
         <Stat label="连续学习" value={streak.current} unit="天" note={streakNote(data)} />
         <Stat label="今日待复习" value={review.dueToday} unit="张" note={`复习库共 ${review.total} 张`} />
         <Stat
@@ -170,6 +171,8 @@ function Report({ data }: { data: LearningInsights }) {
           note={`累计查词 ${totals.lookups} 次`}
         />
       </div>
+
+      <WeeklyCard data={data} />
 
       <ActivityCard data={data} />
 

@@ -452,6 +452,8 @@ export interface AppSettings {
   enrichDailyTokens?: number;
   /** How quickly the batch enrichment sends its requests. */
   enrichPace?: EnrichmentPace;
+  /** The days of a week (1 to 7) the user wants to learn on; 0 is no goal. */
+  weeklyGoalDays?: number;
   activeDomainProfile: DomainProfile;
   analysisStyle: AnalysisStyle;
   autoCheckUpdates?: boolean;

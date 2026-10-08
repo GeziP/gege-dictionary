@@ -20,6 +20,8 @@ vi.mock('../lib/tauri-bridge', () => ({
   listenLookupError: vi.fn(),
   listenLookupDelta: vi.fn(),
   getLearningInsights: vi.fn(),
+  saveFileDialog: vi.fn(),
+  copyText: vi.fn(),
 }));
 
 /** What the backend would answer next, by window length. */
@@ -94,7 +96,8 @@ describe('the learning-insights page', () => {
     await screen.findByRole('group', { name: '生词库' });
 
     expect(stat('生词库').getByText('40')).toBeInTheDocument();
-    expect(stat('生词库').getByText('本周新增 2 个')).toBeInTheDocument();
+    // the last seven days, which is not the calendar week the weekly card is about
+    expect(stat('生词库').getByText('近 7 天新增 2 个')).toBeInTheDocument();
 
     expect(stat('连续学习').getByText('4')).toBeInTheDocument();
     expect(stat('连续学习').getByText('最长连续 6 天')).toBeInTheDocument();
@@ -105,6 +108,47 @@ describe('the learning-insights page', () => {
     // 4 today, 1 two days ago and 2 three days ago
     expect(stat('近 30 天查词').getByText('7')).toBeInTheDocument();
     expect(stat('近 30 天查词').getByText('累计查词 156 次')).toBeInTheDocument();
+  });
+
+  it('shows this week day by day, with a goal to set, below the figures', async () => {
+    renderPage();
+    await screen.findByRole('group', { name: '生词库' });
+
+    const weekly = card('每周回顾');
+    expect(weekly.getAllByRole('listitem')).toHaveLength(7);
+    expect(weekly.getByText('本周学习了 3 天：查词 5 次，收藏 2 个，复习 3 张')).toBeInTheDocument();
+    expect(weekly.getByLabelText('每周目标')).toHaveDisplayValue('不设目标');
+    // reading the page takes one request; the report asks for its own, and only when it is asked for
+    expect(bridge.getLearningInsights).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the week the same whichever range is chosen, since the week is the calendar\u2019s', async () => {
+    renderPage();
+    await screen.findByRole('group', { name: '生词库' });
+
+    await userEvent.click(screen.getByRole('radio', { name: '7 天' }));
+    await screen.findByRole('region', { name: '近 7 天的学习活动' });
+    expect(card('每周回顾').getByText('本周学习了 3 天：查词 5 次，收藏 2 个，复习 3 张')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('radio', { name: '90 天' }));
+    await screen.findByRole('region', { name: '近 90 天的学习活动' });
+    expect(card('每周回顾').getByText('本周学习了 3 天：查词 5 次，收藏 2 个，复习 3 张')).toBeInTheDocument();
+  });
+
+  it('saves the report from the last 14 days, whatever range the page is showing', async () => {
+    vi.mocked(bridge.saveFileDialog).mockResolvedValue('D:\\笔记\\周报.md');
+    renderPage();
+    await screen.findByRole('group', { name: '生词库' });
+    await userEvent.click(screen.getByRole('radio', { name: '90 天' }));
+    await screen.findByRole('region', { name: '近 90 天的学习活动' });
+
+    await userEvent.click(screen.getByRole('button', { name: '保存周报' }));
+
+    expect(await screen.findByText('已保存到 D:\\笔记\\周报.md')).toBeInTheDocument();
+    expect(bridge.getLearningInsights).toHaveBeenLastCalledWith(14);
+    expect(vi.mocked(bridge.saveFileDialog).mock.calls[0][0]).toBe('鸽鸽词典周报-2026-10-05.md');
+    // the page itself still shows the range that was chosen
+    expect(screen.getByRole('region', { name: '近 90 天的学习活动' })).toBeInTheDocument();
   });
 
   it('asks for something today when only the unfinished day keeps the streak alive', async () => {

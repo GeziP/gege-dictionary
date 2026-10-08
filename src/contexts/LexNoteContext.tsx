@@ -47,6 +47,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   sessionGapMinutes: 30,
   enrichDailyTokens: DEFAULT_ENRICH_TOKENS,
   enrichPace: DEFAULT_ENRICH_PACE,
+  weeklyGoalDays: 0,
   activeDomainProfile: 'general',
   analysisStyle: 'standard',
   autoCheckUpdates: true,

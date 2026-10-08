@@ -851,6 +851,7 @@ impl Database {
             "sessionGapMinutes": 30,
             "enrichDailyTokens": enrich::DEFAULT_DAILY_TOKENS,
             "enrichPace": "normal",
+            "weeklyGoalDays": 0,
             "activeDomainProfile": "general",
             "analysisStyle": "standard",
             "autoCheckUpdates": true,
@@ -5740,6 +5741,7 @@ mod tests {
         assert_eq!(settings["sessionGapMinutes"], 30);
         assert_eq!(settings["enrichDailyTokens"], enrich::DEFAULT_DAILY_TOKENS);
         assert_eq!(settings["enrichPace"], "normal");
+        assert_eq!(settings["weeklyGoalDays"], 0);
         assert_eq!(settings["autoCheckUpdates"], true);
         assert_eq!(settings["activeDomainProfile"], "general");
         assert_eq!(settings["analysisStyle"], "standard");
