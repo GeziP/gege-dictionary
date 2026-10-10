@@ -64,7 +64,6 @@ const DEFAULT_SETTINGS: AppSettings = {
   ocr: {
     enabled: true,
     hotkey: 'Control+Shift+O',
-    language: 'en-US',
   },
 };
 

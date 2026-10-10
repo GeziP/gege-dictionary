@@ -1,17 +1,18 @@
-//! Local screenshot OCR: a GDI picture of one monitor, and the Windows OCR engine
-//! (`Windows.Media.Ocr`) reading a region of it.
+//! Local screenshot OCR: a GDI picture of one monitor, and the PP-OCR engine (`ocr_engine`)
+//! reading a region of it.
 //!
 //! The picture is taken *before* the picker is shown. The picker displays that frozen picture and
 //! the user drags a region on it, so what is read is exactly what was seen, and nothing has to be
 //! hidden, waited for or photographed a second time. The picture stays in memory (`FrameStore`);
-//! it is never written to disk or uploaded.
+//! it is never written to disk or uploaded. The engine is part of the app: it needs no language
+//! pack, no network and no setting of the system.
 
+use crate::ocr_engine::{self, SharedEngine};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-
-/// The OCR language that is asked for when the settings name none.
-pub const DEFAULT_LANGUAGE: &str = "en-US";
+use std::time::Instant;
 
 /// The shortest side, in pixels, of a region that is worth reading.
 const MIN_REGION_SIDE: u32 = 8;
@@ -202,75 +203,95 @@ impl FrameStore {
     }
 }
 
-fn primary_subtag(tag: &str) -> String {
-    tag.split('-').next().unwrap_or("").to_ascii_lowercase()
+/// The sentence the check of the engine has it read, and the share of its words that has to come
+/// back for the check to pass. Not all of them: the fonts of a PC differ, and a check that fails
+/// over a missing letter would be a false alarm.
+const CHECK_SENTENCE: &str = "The quick brown fox jumps over the lazy dog";
+const CHECK_PIXEL_HEIGHT: i32 = 30;
+const CHECK_PASS_SHARE: f32 = 0.7;
+
+/// What the check of the engine found.
+struct CheckReport {
+    words_found: usize,
+    words_asked: usize,
+    milliseconds: u128,
 }
 
-/// The installed recognizer that serves `wanted`: that very tag, or else another variant of the
-/// same language (`en-GB` reads English as well as `en-US` does). Never a different language: an
-/// engine for another language reads English as garbage ("He110", "Librany'").
-pub fn pick_recognizer(installed: &[String], wanted: &str) -> Option<String> {
-    installed
+fn words_of(text: &str) -> Vec<String> {
+    text.split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Whether `read` is the check sentence, near enough: how many of its words came back out of how
+/// many there are, or what is wrong.
+fn judge_check(read: &str) -> Result<(usize, usize), String> {
+    let asked = words_of(CHECK_SENTENCE);
+    // A word that is in the sentence twice has to be read twice.
+    let mut left: HashMap<String, usize> = HashMap::new();
+    for word in words_of(read) {
+        *left.entry(word).or_default() += 1;
+    }
+    let found = asked
         .iter()
-        .find(|tag| tag.eq_ignore_ascii_case(wanted))
-        .or_else(|| {
-            installed
-                .iter()
-                .find(|tag| primary_subtag(tag) == primary_subtag(wanted))
+        .filter(|word| match left.get_mut(*word) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                true
+            }
+            _ => false,
         })
-        .cloned()
+        .count();
+    if (found as f32) < CHECK_PASS_SHARE * asked.len() as f32 {
+        return Err(format!(
+            "内置 OCR 引擎自检没有通过：画的是「{CHECK_SENTENCE}」，读出来的是「{}」。",
+            normalize_text(read)
+        ));
+    }
+    Ok((found, asked.len()))
 }
 
-/// What is wrong and how to put it right, for a language whose recognizer is not installed.
-pub fn missing_pack_message(installed: &[String], wanted: &str) -> String {
-    let (name, add) = if primary_subtag(wanted) == "en" {
-        (
-            "英文".to_string(),
-            "添加 English (United States)".to_string(),
-        )
-    } else {
-        (wanted.to_string(), "添加这种语言".to_string())
-    };
-    let have = if installed.is_empty() {
-        "本机没有安装任何 OCR 识别包".to_string()
-    } else {
-        format!("本机只有：{}", installed.join("、"))
-    };
-    format!(
-        "没有安装{name} OCR 识别包（{have}）。请到「设置 → 时间和语言 → 语言和区域」{add}，\
-         在它的「语言选项」里勾选「光学字符识别」，装好后再试。"
-    )
+/// Has the engine read a sentence that was drawn on the spot, the way a screenshot would show
+/// it. That uses everything a real reading needs: the runtime library, both networks, the
+/// pictures' path through them. Its time includes loading the engine when it is not loaded.
+fn check_engine(engine: &SharedEngine) -> Result<CheckReport, String> {
+    let (width, height, bgra) = win::render_text(CHECK_SENTENCE, CHECK_PIXEL_HEIGHT, false)
+        .map_err(|error| format!("没能生成 OCR 自检用的图片：{error}"))?;
+    let started = Instant::now();
+    let read = engine.read_text(width, height, &bgra)?;
+    let milliseconds = started.elapsed().as_millis();
+    let (words_found, words_asked) = judge_check(&read)?;
+    Ok(CheckReport {
+        words_found,
+        words_asked,
+        milliseconds,
+    })
 }
 
-/// The answer to "can text be read in a picture": from the recognizers that are installed and the
-/// language the settings ask for.
-pub fn status_for(installed: &[String], wanted: &str) -> Value {
-    match pick_recognizer(installed, wanted) {
-        Some(tag) => json!({
+/// The answer to "can text be read in a picture": it is tried, not guessed at.
+fn status_of(engine: &SharedEngine) -> Value {
+    match check_engine(engine) {
+        Ok(report) => json!({
             "available": true,
-            "language": tag,
-            "installed": installed,
-            "message": format!("系统 OCR 可用（{tag}）"),
+            "engine": "PP-OCRv6",
+            "elapsedMs": report.milliseconds as u64,
+            "message": format!(
+                "内置 OCR 可用：自检读出了 {}/{} 个词，用时 {} 毫秒",
+                report.words_found, report.words_asked, report.milliseconds
+            ),
         }),
-        None => json!({
+        Err(message) => json!({
             "available": false,
-            "language": "",
-            "installed": installed,
-            "message": missing_pack_message(installed, wanted),
+            "engine": "PP-OCRv6",
+            "message": message,
         }),
     }
 }
 
-pub fn get_ocr_status(wanted: &str) -> Value {
-    match win::installed_languages() {
-        Ok(installed) => status_for(&installed, wanted),
-        Err(error) => json!({
-            "available": false,
-            "language": "",
-            "installed": Vec::<String>::new(),
-            "message": format!("系统 OCR 不可用：{error}"),
-        }),
-    }
+/// Whether the app's own engine can read text, and if not, why not.
+pub fn get_ocr_status() -> Value {
+    status_of(ocr_engine::shared())
 }
 
 /// Takes the picture of a rectangle of the screen (physical pixels, in virtual-screen
@@ -288,9 +309,18 @@ pub fn capture_screen(x: i32, y: i32, width: i32, height: i32) -> Result<Frame, 
     Ok(frame)
 }
 
-/// Reads the text in a region. `wanted` is the language of the text (`en-US`).
-pub fn recognize(crop: &Crop, wanted: &str) -> Result<String, String> {
-    let text = win::recognize(crop.width, crop.height, &crop.bgra, wanted)?;
+/// Starts loading the engine in the background, for a region that is about to be read.
+pub fn warm_up_engine() {
+    ocr_engine::shared().warm_up();
+}
+
+/// Reads the text in a region, whatever language it is in (Chinese and English together too).
+pub fn recognize(crop: &Crop) -> Result<String, String> {
+    recognize_with(ocr_engine::shared(), crop)
+}
+
+fn recognize_with(engine: &SharedEngine, crop: &Crop) -> Result<String, String> {
+    let text = engine.read_text(crop.width, crop.height, &crop.bgra)?;
     Ok(normalize_text(&text))
 }
 
@@ -313,19 +343,16 @@ pub fn foreground_window_title() -> String {
 
 #[cfg(windows)]
 mod win {
-    use super::*;
-    use windows::core::HSTRING;
-    use windows::Globalization::Language;
-    use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
-    use windows::Media::Ocr::OcrEngine;
-    use windows::Storage::Streams::DataWriter;
-    use windows::Win32::Foundation::HWND;
+    use windows::core::w;
+    use windows::Win32::Foundation::{COLORREF, HANDLE, HWND, SIZE};
     use windows::Win32::Graphics::Gdi::{
-        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
-        GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT,
-        DIB_RGB_COLORS, RGBQUAD, SRCCOPY,
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW,
+        DeleteDC, DeleteObject, GdiFlush, GetDC, GetDIBits, GetTextExtentPoint32W, PatBlt,
+        ReleaseDC, SelectObject, SetBkMode, SetTextColor, TextOutW, ANTIALIASED_QUALITY,
+        BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLACKNESS, CAPTUREBLT, CLIP_DEFAULT_PRECIS,
+        DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, FF_DONTCARE, FW_NORMAL, HDC,
+        OUT_DEFAULT_PRECIS, RGBQUAD, SRCCOPY, TRANSPARENT, WHITENESS,
     };
-    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
     use windows::Win32::UI::WindowsAndMessaging::{
         GetForegroundWindow, GetSystemMetrics, GetWindowTextW, SM_CXVIRTUALSCREEN,
         SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -394,70 +421,126 @@ mod win {
         }
     }
 
-    /// The tags of the languages that have an OCR recognizer installed.
-    pub fn installed_languages() -> Result<Vec<String>, String> {
-        let languages = OcrEngine::AvailableRecognizerLanguages()
-            .map_err(|e| format!("无法读取已安装的 OCR 识别包: {e}"))?;
-        let count = languages.Size().map_err(|e| e.to_string())?;
-        let mut tags = Vec::with_capacity(count as usize);
-        for index in 0..count {
-            let language = languages.GetAt(index).map_err(|e| e.to_string())?;
-            let tag = language.LanguageTag().map_err(|e| e.to_string())?;
-            tags.push(tag.to_string());
+    /// Draws `text` the way a screenshot of it would look: letters `pixel_height` tall, black on
+    /// white, or white on black with `light_on_dark`. Comes back as the width, the height and the
+    /// BGRA pixels (the alpha byte is not set). It is drawn in memory: no screen, no window.
+    pub fn render_text(
+        text: &str,
+        pixel_height: i32,
+        light_on_dark: bool,
+    ) -> Result<(u32, u32, Vec<u8>), String> {
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        if wide.is_empty() || pixel_height < 6 {
+            return Err("没有可画的文字".into());
         }
-        Ok(tags)
-    }
-
-    fn create_engine(tag: &str) -> Result<OcrEngine, String> {
-        let language = Language::CreateLanguage(&HSTRING::from(tag))
-            .map_err(|e| format!("无法创建语言 {tag}: {e}"))?;
-        OcrEngine::TryCreateFromLanguage(&language)
-            .map_err(|e| format!("无法创建 {tag} 的 OCR 引擎: {e}"))
-    }
-
-    /// Hands BGRA pixels to the engine as they are, without an image format in between.
-    pub fn software_bitmap_from_bgra(
-        width: u32,
-        height: u32,
-        bgra: &[u8],
-    ) -> Result<SoftwareBitmap, String> {
-        let writer = DataWriter::new().map_err(|e| format!("无法创建缓冲: {e}"))?;
-        writer
-            .WriteBytes(bgra)
-            .map_err(|e| format!("写入像素失败: {e}"))?;
-        let buffer = writer
-            .DetachBuffer()
-            .map_err(|e| format!("读取缓冲失败: {e}"))?;
-        SoftwareBitmap::CreateCopyFromBuffer(
-            &buffer,
-            BitmapPixelFormat::Bgra8,
-            width as i32,
-            height as i32,
-        )
-        .map_err(|e| format!("无法创建位图: {e}"))
-    }
-
-    pub fn recognize(width: u32, height: u32, bgra: &[u8], wanted: &str) -> Result<String, String> {
-        // The blocking `.get()` of a WinRT call needs a COM/WinRT apartment on this thread.
         unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let memory = CreateCompatibleDC(HDC::default());
+            if memory.is_invalid() {
+                return Err("无法创建绘图设备".into());
+            }
+            let drawn = draw_text(memory, &wide, pixel_height, light_on_dark);
+            let _ = DeleteDC(memory);
+            drawn
         }
-        let installed = installed_languages()?;
-        let tag = pick_recognizer(&installed, wanted)
-            .ok_or_else(|| missing_pack_message(&installed, wanted))?;
-        let engine = create_engine(&tag)?;
-        let largest = OcrEngine::MaxImageDimension().unwrap_or(10_000);
-        if width > largest || height > largest {
-            return Err(format!("选区太大：OCR 引擎一边最多读 {largest} 像素"));
+    }
+
+    unsafe fn draw_text(
+        memory: HDC,
+        wide: &[u16],
+        pixel_height: i32,
+        light_on_dark: bool,
+    ) -> Result<(u32, u32, Vec<u8>), String> {
+        let font = CreateFontW(
+            -pixel_height,
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            u32::from(DEFAULT_CHARSET.0),
+            u32::from(OUT_DEFAULT_PRECIS.0),
+            u32::from(CLIP_DEFAULT_PRECIS.0),
+            u32::from(ANTIALIASED_QUALITY.0),
+            u32::from(DEFAULT_PITCH.0) | u32::from(FF_DONTCARE.0),
+            w!("Segoe UI"),
+        );
+        if font.is_invalid() {
+            return Err("无法创建字体".into());
         }
-        let bitmap = software_bitmap_from_bgra(width, height, bgra)?;
-        let result = engine
-            .RecognizeAsync(&bitmap)
-            .map_err(|e| format!("RecognizeAsync: {e}"))?
-            .get()
-            .map_err(|e| format!("OCR 异步失败: {e}"))?;
-        let text = result.Text().map_err(|e| e.to_string())?;
-        Ok(text.to_string())
+        let previous_font = SelectObject(memory, font);
+        let mut extent = SIZE::default();
+        let drawn = if GetTextExtentPoint32W(memory, wide, &mut extent).as_bool()
+            && extent.cx > 0
+            && extent.cy > 0
+        {
+            draw_on_bitmap(memory, wide, extent, light_on_dark)
+        } else {
+            Err("无法测量文字".to_string())
+        };
+        SelectObject(memory, previous_font);
+        let _ = DeleteObject(font);
+        drawn
+    }
+
+    unsafe fn draw_on_bitmap(
+        memory: HDC,
+        wide: &[u16],
+        extent: SIZE,
+        light_on_dark: bool,
+    ) -> Result<(u32, u32, Vec<u8>), String> {
+        let margin = extent.cy / 2;
+        let (width, height) = (extent.cx + 2 * margin, extent.cy + 2 * margin);
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            bmiColors: [RGBQUAD::default()],
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(
+            memory,
+            &info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            HANDLE::default(),
+            0,
+        )
+        .map_err(|e| format!("无法创建位图: {e}"))?;
+        if bits.is_null() {
+            let _ = DeleteObject(bitmap);
+            return Err("位图没有像素内存".into());
+        }
+        let previous_bitmap = SelectObject(memory, bitmap);
+        let (background, ink) = if light_on_dark {
+            (BLACKNESS, COLORREF(0x00FF_FFFF))
+        } else {
+            (WHITENESS, COLORREF(0))
+        };
+        let _ = PatBlt(memory, 0, 0, width, height, background);
+        SetBkMode(memory, TRANSPARENT);
+        SetTextColor(memory, ink);
+        let written = TextOutW(memory, margin, margin, wide).as_bool();
+        // Drawing may be queued: the pixels are read only after it is done.
+        let _ = GdiFlush();
+        let pixels = if written {
+            Ok(
+                std::slice::from_raw_parts(bits as *const u8, width as usize * height as usize * 4)
+                    .to_vec(),
+            )
+        } else {
+            Err("文字没能画出来".to_string())
+        };
+        SelectObject(memory, previous_bitmap);
+        let _ = DeleteObject(bitmap);
+        pixels.map(|pixels| (width as u32, height as u32, pixels))
     }
 
     pub fn foreground_window_title() -> String {
@@ -478,7 +561,7 @@ mod win {
 
 #[cfg(not(windows))]
 mod win {
-    const UNSUPPORTED: &str = "当前平台不支持系统 OCR";
+    const UNSUPPORTED: &str = "当前平台不支持截图取词";
 
     pub fn capture_region_bgra(
         _x: i32,
@@ -489,16 +572,11 @@ mod win {
         Err(UNSUPPORTED.into())
     }
 
-    pub fn installed_languages() -> Result<Vec<String>, String> {
-        Err(UNSUPPORTED.into())
-    }
-
-    pub fn recognize(
-        _width: u32,
-        _height: u32,
-        _bgra: &[u8],
-        _wanted: &str,
-    ) -> Result<String, String> {
+    pub fn render_text(
+        _text: &str,
+        _pixel_height: i32,
+        _light_on_dark: bool,
+    ) -> Result<(u32, u32, Vec<u8>), String> {
         Err(UNSUPPORTED.into())
     }
 
@@ -520,10 +598,6 @@ mod tests {
             }
         }
         Frame::from_bgra(width, height, bgra).unwrap()
-    }
-
-    fn tags(list: &[&str]) -> Vec<String> {
-        list.iter().map(|tag| tag.to_string()).collect()
     }
 
     #[test]
@@ -699,88 +773,9 @@ mod tests {
     }
 
     #[test]
-    fn the_recognizer_of_the_language_asked_for_is_used() {
-        let installed = tags(&["zh-Hans-CN", "en-US"]);
-
-        assert_eq!(
-            pick_recognizer(&installed, "en-US").as_deref(),
-            Some("en-US")
-        );
-        assert_eq!(
-            pick_recognizer(&installed, "EN-us").as_deref(),
-            Some("en-US")
-        );
-    }
-
-    #[test]
-    fn another_variant_of_the_same_language_will_do() {
-        let installed = tags(&["zh-Hans-CN", "en-GB"]);
-
-        assert_eq!(
-            pick_recognizer(&installed, "en-US").as_deref(),
-            Some("en-GB")
-        );
-    }
-
-    #[test]
-    fn a_recognizer_of_another_language_is_never_picked() {
-        // Only the Chinese pack is installed, as on a Chinese Windows that was never given the
-        // English one: its engine reads English text as "He110 ... Librany'".
-        let installed = tags(&["zh-Hans-CN"]);
-
-        assert_eq!(pick_recognizer(&installed, "en-US"), None);
-        assert_eq!(pick_recognizer(&[], "en-US"), None);
-    }
-
-    #[test]
-    fn the_status_names_the_recognizer_that_will_be_used() {
-        let status = status_for(&tags(&["zh-Hans-CN", "en-US"]), "en-US");
-
-        assert_eq!(status["available"], true);
-        assert_eq!(status["language"], "en-US");
-        assert!(status["message"].as_str().unwrap().contains("en-US"));
-    }
-
-    #[test]
-    fn without_the_english_pack_the_status_says_so_and_how_to_get_it() {
-        let status = status_for(&tags(&["zh-Hans-CN"]), "en-US");
-
-        assert_eq!(status["available"], false);
-        assert_eq!(status["installed"], json!(["zh-Hans-CN"]));
-        let message = status["message"].as_str().unwrap();
-        assert!(message.contains("英文"), "{message}");
-        assert!(message.contains("zh-Hans-CN"), "{message}");
-        assert!(message.contains("光学字符识别"), "{message}");
-    }
-
-    #[test]
-    fn with_no_pack_at_all_the_status_says_that_too() {
-        let status = status_for(&[], "en-US");
-
-        assert_eq!(status["available"], false);
-        assert!(status["message"].as_str().unwrap().contains("没有安装任何"));
-    }
-
-    #[test]
-    fn a_language_other_than_english_is_named_by_its_tag() {
-        let message = missing_pack_message(&tags(&["en-US"]), "ja-JP");
-
-        assert!(message.contains("ja-JP"), "{message}");
-        assert!(!message.contains("English (United States)"), "{message}");
-    }
-
-    #[test]
     fn blank_space_around_recognized_text_and_its_lines_is_dropped() {
         assert_eq!(normalize_text("  Hello  \n  world \t\n"), "Hello\n  world");
         assert_eq!(normalize_text(" \n \t "), "");
-    }
-
-    #[test]
-    fn the_status_always_says_whether_and_why() {
-        let status = get_ocr_status(DEFAULT_LANGUAGE);
-
-        assert!(status.get("available").is_some());
-        assert!(status.get("message").is_some());
     }
 
     #[test]
@@ -788,16 +783,207 @@ mod tests {
         assert!(max_ocr_chars() > 0);
     }
 
-    #[cfg(windows)]
     #[test]
-    fn bgra_pixels_become_a_bitmap_of_the_same_size_for_the_engine() {
-        let width = 64u32;
-        let height = 32u32;
-        let bgra = vec![255u8; (width * height * 4) as usize];
+    fn words_are_compared_without_case_or_punctuation() {
+        assert_eq!(
+            words_of("Hello, World!  It's"),
+            ["hello", "world", "it", "s"]
+        );
+        assert!(words_of(" ,. ").is_empty());
+    }
 
-        let bitmap = win::software_bitmap_from_bgra(width, height, &bgra).unwrap();
+    #[test]
+    fn the_check_passes_when_most_of_the_sentence_comes_back() {
+        // Seven of the nine words are enough: a font that loses a letter is not a broken engine.
+        let (found, asked) = judge_check("the quick brown fox jumps over teh iazy dog.").unwrap();
 
-        assert_eq!(bitmap.PixelWidth().unwrap(), width as i32);
-        assert_eq!(bitmap.PixelHeight().unwrap(), height as i32);
+        assert_eq!((found, asked), (7, 9));
+        assert_eq!(judge_check(CHECK_SENTENCE).unwrap(), (9, 9));
+    }
+
+    #[test]
+    fn the_check_fails_on_nonsense_and_says_what_was_read() {
+        let error = judge_check("He110 wor1d  Librany'").unwrap_err();
+
+        assert!(error.contains("没有通过"), "{error}");
+        assert!(error.contains("He110 wor1d"), "{error}");
+        assert!(judge_check("").is_err());
+        assert!(judge_check("the quick brown fox").is_err());
+    }
+
+    // The tests below draw text with GDI, as a screenshot would show it, and have the real engine
+    // read it. They need the ONNX Runtime that scripts/fetch-onnxruntime.ps1 puts into the
+    // resources.
+
+    #[cfg(windows)]
+    mod reading_drawn_text {
+        use super::*;
+        use crate::ocr_engine::test_support::engine;
+        use std::collections::HashSet;
+        use std::time::Duration;
+
+        fn drawn(text: &str, pixel_height: i32, light_on_dark: bool) -> Crop {
+            let (width, height, mut bgra) =
+                win::render_text(text, pixel_height, light_on_dark).unwrap();
+            for pixel in bgra.chunks_exact_mut(4) {
+                pixel[3] = 255;
+            }
+            Crop {
+                width,
+                height,
+                bgra,
+            }
+        }
+
+        /// Copies `part` onto `page` (BGRA, `page_width` wide) with its top left corner at (left, top).
+        fn paste(page: &mut [u8], page_width: u32, part: &Crop, left: u32, top: u32) {
+            let length = part.width as usize * 4;
+            for row in 0..part.height as usize {
+                let from = row * length;
+                let to = ((top as usize + row) * page_width as usize + left as usize) * 4;
+                page[to..to + length].copy_from_slice(&part.bgra[from..from + length]);
+            }
+        }
+
+        /// Pictures one above the other on a white page as wide as the widest.
+        fn stacked(parts: &[Crop]) -> Crop {
+            let width = parts.iter().map(|part| part.width).max().unwrap();
+            let height: u32 = parts.iter().map(|part| part.height).sum();
+            let mut bgra = vec![255u8; (width * height * 4) as usize];
+            let mut top = 0;
+            for part in parts {
+                paste(&mut bgra, width, part, 0, top);
+                top += part.height;
+            }
+            Crop {
+                width,
+                height,
+                bgra,
+            }
+        }
+
+        /// The share of the words of `expected` that are in `read`.
+        fn recall(expected: &str, read: &str) -> f32 {
+            let wanted = words_of(expected);
+            let got: HashSet<String> = words_of(read).into_iter().collect();
+            wanted.iter().filter(|word| got.contains(*word)).count() as f32 / wanted.len() as f32
+        }
+
+        const SENTENCE: &str =
+            "Memory is not a recording; each time we recall a moment, we rebuild it.";
+
+        #[test]
+        fn dark_text_on_a_light_page_is_read() {
+            let read = recognize_with(engine(), &drawn(SENTENCE, 28, false)).unwrap();
+
+            assert_eq!(recall(SENTENCE, &read), 1.0, "{read}");
+        }
+
+        #[test]
+        fn light_text_on_a_dark_page_is_read() {
+            let read = recognize_with(engine(), &drawn(SENTENCE, 28, true)).unwrap();
+
+            assert_eq!(recall(SENTENCE, &read), 1.0, "{read}");
+        }
+
+        #[test]
+        fn small_text_is_read() {
+            let read = recognize_with(engine(), &drawn(SENTENCE, 14, false)).unwrap();
+
+            assert!(recall(SENTENCE, &read) >= 0.9, "{read}");
+        }
+
+        #[test]
+        fn large_text_is_read() {
+            let read = recognize_with(engine(), &drawn("Dictionary", 90, false)).unwrap();
+
+            assert_eq!(recall("Dictionary", &read), 1.0, "{read}");
+        }
+
+        #[test]
+        fn lines_come_back_one_under_the_other_in_the_order_they_are_on_the_page() {
+            let lines = [
+                "Reading the first line",
+                "and then the second one",
+                "ends with the third",
+            ];
+            let page = stacked(&lines.map(|line| drawn(line, 26, false)));
+
+            let read = recognize_with(engine(), &page).unwrap();
+
+            let rows: Vec<&str> = read.lines().collect();
+            assert_eq!(rows.len(), 3, "{read}");
+            for (row, line) in rows.iter().zip(lines) {
+                assert!(recall(line, row) >= 0.99, "{row:?} for {line:?}");
+            }
+        }
+
+        #[test]
+        fn a_region_cut_out_of_a_picture_of_the_screen_is_read() {
+            // The way a screen copy comes: pixels as GDI leaves them (alpha byte zero), text well
+            // inside the picture, and a region dragged around it with some room to spare.
+            let (text_width, text_height, text_pixels) =
+                win::render_text(SENTENCE, 24, false).unwrap();
+            let text = Crop {
+                width: text_width,
+                height: text_height,
+                bgra: text_pixels,
+            };
+            let (screen_width, screen_height) = (text_width + 500, text_height + 400);
+            let mut screen = vec![255u8; (screen_width * screen_height * 4) as usize];
+            for pixel in screen.chunks_exact_mut(4) {
+                pixel[3] = 0;
+            }
+            paste(&mut screen, screen_width, &text, 230, 170);
+            let frame = Frame::from_bgra(screen_width, screen_height, screen).unwrap();
+
+            let region = frame
+                .crop(
+                    200,
+                    140,
+                    (text_width + 60) as i32,
+                    (text_height + 60) as i32,
+                )
+                .unwrap();
+            let read = recognize_with(engine(), &region).unwrap();
+
+            assert_eq!(recall(SENTENCE, &read), 1.0, "{read}");
+        }
+
+        #[test]
+        fn a_page_without_text_reads_as_nothing() {
+            let blank = Crop {
+                width: 300,
+                height: 80,
+                bgra: vec![255; 300 * 80 * 4],
+            };
+
+            assert_eq!(recognize_with(engine(), &blank).unwrap(), "");
+        }
+
+        #[test]
+        fn the_check_of_the_engine_passes_and_says_how_long_it_took() {
+            let status = status_of(engine());
+
+            assert_eq!(status["available"], true, "{status}");
+            assert!(status["elapsedMs"].is_u64(), "{status}");
+            let message = status["message"].as_str().unwrap();
+            assert!(message.contains("内置 OCR 可用"), "{message}");
+        }
+
+        #[test]
+        fn the_check_of_an_engine_that_cannot_start_says_why() {
+            let missing = std::env::temp_dir()
+                .join("gege-dic-no-such-folder")
+                .join("onnxruntime.dll");
+            let broken = SharedEngine::new(missing, Duration::from_secs(60));
+
+            let status = status_of(&broken);
+
+            assert_eq!(status["available"], false);
+            let message = status["message"].as_str().unwrap();
+            assert!(message.contains("找不到 OCR 运行库"), "{message}");
+            assert!(message.contains("重新安装"), "{message}");
+        }
     }
 }

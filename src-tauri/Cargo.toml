@@ -29,6 +29,10 @@ dirs = "5"
 rfd = "0.15"
 sha2 = "0.10"
 csv = "1"
+# Runs the OCR models. The library itself (onnxruntime.dll, pinned in ort-runtime.json) is loaded
+# from a file when the OCR is first used, so that a PC that cannot load it loses the screenshot
+# OCR and nothing else; the crate downloads nothing and links nothing at build time.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
@@ -37,13 +41,6 @@ windows = { version = "0.58", features = [
     "Win32_Storage_FileSystem",
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
-    "Win32_System_Com",
-    "Media_Ocr",
-    "Graphics_Imaging",
-    "Globalization",
-    "Storage_Streams",
-    "Foundation",
-    "Foundation_Collections",
 ] }
 
 [features]

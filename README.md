@@ -96,7 +96,7 @@
 | **剪贴板去重** | 已查过的内容不会重复触发，除非重新复制 |
 | **IDE 友好** | 默认不屏蔽 VS Code / IDEA / 终端；复制英文文档会正常弹窗，可一键关闭 |
 | **智能过滤** | 密钥、路径、高熵串、邮箱、IP 等始终拦截；自然英语（如 `let me know`）不再被当成代码 |
-| **截图 OCR 取词** | `Ctrl+Shift+O` 先冻结当前屏幕再框选扫描件/字幕，系统本地 OCR，不上传；需要 Windows 的英文 OCR 识别包，没装时会提示怎么装 |
+| **截图 OCR 取词** | `Ctrl+Shift+O` 先冻结当前屏幕再框选扫描件/字幕，由随安装包分发的 PP-OCRv6 引擎在本机识别中英文，不上传；不依赖 Windows 的 OCR 语言包，也不用改系统语言设置。引擎用到才载入内存，闲置约 2 分钟自动释放 |
 | **Anki 同步** | 可选连接本机 AnkiConnect，一键把生词送进自己的牌组 |
 | **本地统计** | 缓存命中、过滤原因、流式耗时等仅本机可见，不上传 |
 | **隐私运行时** | WebView 最小 CSP；日志不打印选中原文；设置接口不下发明文 API Key |
@@ -107,20 +107,23 @@
 
 前往 [Releases](https://github.com/GeziP/gege-dictionary/releases/latest) 页面，下载最新的 `Gege-Dictionary_x.x.x_x64-setup.exe`，双击安装即可。应用内可在「设置 → 应用更新」立即检查新版本；自动检查默认开启，启动 30 秒后静默执行。
 
-> 系统要求：Windows 10 (1803+) / Windows 11，需要 WebView2 运行时（Win10 通常已自带，Win11 100% 自带）。
+> 系统要求：Windows 10 (1803+) / Windows 11，需要 WebView2 运行时（Win10 通常已自带，Win11 100% 自带）。安装包约 15 MB，其中约 10 MB 是截图 OCR 的引擎（识别模型与 ONNX Runtime），装好后不再需要联网下载任何东西。
 
 ### 从源码构建
 
-```bash
-# 前置条件：Node.js >=20.19 或 >=22.12、rustup、Visual Studio Build Tools
+```powershell
+# 前置条件：Node.js >=20.19 或 >=22.12、rustup、Visual Studio Build Tools（含 MSVC v143 C++ 生成工具）、PowerShell
 # Rust 版本由仓库根的 rust-toolchain.toml 固定（1.95.0），rustup 会在第一次需要时自动安装
 git clone https://github.com/GeziP/gege-dictionary.git
 cd gege-dictionary
 npm ci
+./scripts/fetch-onnxruntime.ps1   # 只需一次：取回 OCR 引擎用的 ONNX Runtime（见下）
 npx tauri build
 ```
 
 构建产物在 `src-tauri/target/release/bundle/nsis/` 目录下。
+
+**`fetch-onnxruntime.ps1` 做什么**：识别模型（PP-OCRv6 的检测与识别两个网络，共约 6 MB）直接放在仓库的 `src-tauri/models/` 里、编进程序；ONNX Runtime（`onnxruntime.dll`，约 16 MB）不进仓库，由这个脚本按 `src-tauri/ort-runtime.json` 里固定的版本下载，核对 SHA-256 后连同它依赖的 Visual C++ 运行库（从本机的 Visual Studio 取）放进 `src-tauri/resources/ort/`，安装包会把它们装到程序旁边。没运行过这个脚本时，`cargo build` 会直接停下并说明原因；`cargo test` 里的 OCR 测试也要用它。升级 ONNX Runtime 只需改 `ort-runtime.json`（版本、下载地址、两个 SHA-256）再运行脚本。
 
 ## 快速上手
 
@@ -167,6 +170,7 @@ npx tauri build
 - **数据库**：SQLite（via rusqlite，bundled，无需额外安装）
 - **HTTP**：reqwest（Rust 异步 HTTP 客户端）
 - **TTS**：Windows Speech Synthesis（PowerShell 桥接）
+- **截图 OCR**：[PP-OCRv6](https://huggingface.co/PaddlePaddle)（Apache-2.0，检测 + 识别，随程序分发）由 [ONNX Runtime](https://onnxruntime.ai)（MIT）在本机 CPU 上运行，经 Rust 的 [`ort`](https://github.com/pykeio/ort) 调用；前后处理是自己写的，没有 Python、没有联网。许可见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 - **安装包**：NSIS
 
 ## 项目结构
@@ -198,10 +202,16 @@ gege-dictionary/
 │   │   ├── glossary.rs     # 个人术语表匹配
 │   │   ├── word_import.rs  # CSV / TSV 导入解析
 │   │   ├── anki.rs         # AnkiConnect
-│   │   ├── ocr.rs          # 截图 OCR（系统 OCR）
+│   │   ├── ocr.rs          # 截图 OCR：截屏、内存里的冻结画面、裁剪、自检
+│   │   ├── ocr_engine.rs   # OCR 引擎的载入、预热、闲置释放、出错后重置
+│   │   ├── ppocr/          # PP-OCRv6 管线：检测后处理、文本框几何、裁剪重采样、CTC 解码、排版
 │   │   ├── dpapi.rs        # API Key 的 DPAPI 加密
 │   │   └── tts.rs          # 语音朗读
+│   ├── models/pp-ocrv6/    # OCR 模型（检测、识别、字典）与出处、校验和
+│   ├── resources/          # 随安装包分发的文件：licenses/；ort/ 由 scripts/fetch-onnxruntime.ps1 生成，不进仓库
 │   └── icons/              # 应用图标
+├── scripts/                # fetch-onnxruntime.ps1：取回固定版本的 ONNX Runtime
+├── THIRD-PARTY-NOTICES.md  # OCR 模型与运行库的来源与许可
 └── package.json            # 前端依赖
 ```
 
@@ -226,6 +236,7 @@ gege-dictionary/
 | [v1.6 实机验收清单](docs/QA-machine-checklist-v1.6.md) | 原生 OCR / Anki / 多屏 / 更新通道真机步骤 | 发布与 QA |
 | [v1.10 实机验收清单](docs/QA-machine-checklist-v1.10.md) | 备用模型接手、批量补全、长列表手感、复习三档、周报导出、升级的真机步骤 | 发布与 QA |
 | [v1.11 实机验收清单](docs/QA-machine-checklist-v1.11.md) | 系统标题栏与主题、窗口间导航、删除撤销、本地网关免 Key、设置保存状态、查词窗口字号、升级的真机步骤 | 发布与 QA |
+| [v1.12 实机验收清单](docs/QA-machine-checklist-v1.12.md) | 内置 OCR 引擎：安装包里的文件、没装语言包的机器上截图取词、速度与内存、运行库缺失时的提示 | 发布与 QA |
 | [v1.4.3 发布说明](docs/RELEASE-NOTES-v1.4.3.md) | 数据安全、迁移/恢复、导入、剪贴板与发布门禁 | 维护者与升级用户 |
 | [v1.4.4 发布说明](docs/RELEASE-NOTES-v1.4.4.md) | 可靠性回归、真实 API 验证、首屏性能与依赖安全 | 维护者与升级用户 |
 | [v1.5.0 发布说明](docs/RELEASE-NOTES-v1.5.0.md) | 主场景可用、隐私运行时、本地统计、PR CI | 维护者与升级用户 |
@@ -236,6 +247,7 @@ gege-dictionary/
 | [v1.10.0 发布说明](docs/RELEASE-NOTES-v1.10.0.md) | 备用模型、批量补全、长列表、复习「有点难」、每周回顾与周报 | 维护者与升级用户 |
 | [v1.11.0 发布说明](docs/RELEASE-NOTES-v1.11.0.md) | 体验打磨：单一标题栏、删除可撤销、本地模型免 Key、设置保存状态、复习不再死胡同 | 维护者与升级用户 |
 | [v1.11.1 发布说明](docs/RELEASE-NOTES-v1.11.1.md) | 修复截图 OCR 取词黑屏：先截屏再显示冻结画面；缺英文识别包时给出明确提示 | 维护者与升级用户 |
+| [v1.12.0 发布说明](docs/RELEASE-NOTES-v1.12.0.md) | 截图取词改用内置的 PP-OCRv6 引擎：不再依赖 Windows 的 OCR 语言包，也不用改系统语言设置 | 维护者与升级用户 |
 | [发布说明](docs/RELEASE.md) | updater 私钥保管、GitHub Secrets 与签名发布流程 | 版本维护者 |
 
 开发任务已拆解为 [Issues](https://github.com/GeziP/gege-dictionary/issues)，每个都附带验收清单，欢迎认领。
@@ -257,6 +269,11 @@ gege-dictionary/
 - 启用 WebView 最小 CSP（禁止远程脚本）
 - 日志只记录长度、类型与摘要哈希，**不打印选中原文或译文正文**
 - 设置接口不向界面下发明文 API Key；Key 以 DPAPI 密文存本机，测试连接由后端解密
+
+### 截图取词（v1.6 / v1.12）
+
+- 截图只存在内存里，框选窗一关就丢弃，不写磁盘、不上传
+- 识别由随安装包分发的 OCR 引擎在本机完成（v1.12 起不再调用 Windows 的 OCR 组件，也不需要语言包），识别这一步不联网；识别出的文字之后和复制的文字走同一条查词流程，所以同样受内容过滤约束
 
 ### 查词历史（v1.9）
 

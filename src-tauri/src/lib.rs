@@ -11,6 +11,8 @@ mod llm;
 mod lookup;
 mod migrations;
 mod ocr;
+mod ocr_engine;
+mod ppocr;
 mod review;
 mod tts;
 mod watch_switch;
@@ -130,26 +132,6 @@ fn ocr_settings(settings: &serde_json::Value) -> (bool, String) {
         .unwrap_or("Control+Shift+O")
         .to_string();
     (enabled, hotkey)
-}
-
-/// The language of the text the screenshot OCR reads: English, unless the settings say otherwise.
-fn ocr_language(settings: &serde_json::Value) -> String {
-    settings
-        .get("ocr")
-        .and_then(|o| o.get("language"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(ocr::DEFAULT_LANGUAGE)
-        .to_string()
-}
-
-/// The OCR language from the stored settings, or the default when they cannot be read.
-fn stored_ocr_language(state: &AppState) -> String {
-    let settings = state.db.lock().ok().and_then(|db| db.get_settings().ok());
-    settings
-        .map(|settings| ocr_language(&settings))
-        .unwrap_or_else(|| ocr::DEFAULT_LANGUAGE.to_string())
 }
 
 /// Whether the settings let the hotkey and the tray start a screenshot capture. (The button in the
@@ -1206,11 +1188,11 @@ async fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
     Err("主窗口不存在".into())
 }
 
-/// Whether text can be read in a picture, and if not, why not.
+/// Whether text can be read in a picture, and if not, why not. The engine is tried on a sentence
+/// that is drawn for the purpose, so "available" means that a reading has just worked.
 #[tauri::command]
-async fn get_ocr_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let language = stored_ocr_language(&state);
-    tokio::task::spawn_blocking(move || ocr::get_ocr_status(&language))
+async fn get_ocr_status() -> Result<serde_json::Value, String> {
+    tokio::task::spawn_blocking(ocr::get_ocr_status)
         .await
         .map_err(|e| format!("OCR 检测任务失败: {e}"))
 }
@@ -1226,7 +1208,6 @@ async fn ocr_recognize_frame(
     width: i32,
     height: i32,
 ) -> Result<serde_json::Value, String> {
-    let language = stored_ocr_language(&state);
     let crop = frames.crop(x, y, width, height)?;
     if crop.is_uniform() {
         // One colour all over has no text in it. If it is black, the screen did not give the
@@ -1243,7 +1224,7 @@ async fn ocr_recognize_frame(
             "blank": true,
         }));
     }
-    let text = tokio::task::spawn_blocking(move || ocr::recognize(&crop, &language))
+    let text = tokio::task::spawn_blocking(move || ocr::recognize(&crop))
         .await
         .map_err(|e| format!("OCR 任务失败: {e}"))??;
 
@@ -1349,6 +1330,10 @@ async fn open_ocr_picker(app: &AppHandle, settle: Duration) -> Result<(), String
     let Some(_opening) = frames.begin_opening() else {
         return Ok(());
     };
+    // Loading the engine takes a fraction of a second. It is started now, while the menu goes
+    // away, the screen is photographed and the picker is built, so that the first region that is
+    // read does not wait for it.
+    ocr::warm_up_engine();
     if !settle.is_zero() {
         tokio::time::sleep(settle).await;
     }
@@ -1466,19 +1451,6 @@ async fn ocr_close_picker(
     frames.clear();
     if let Some(win) = app.get_webview_window(OCR_PICKER) {
         win.destroy().map_err(|e| format!("关闭框选窗失败: {e}"))?;
-    }
-    Ok(())
-}
-
-/// Opens the page of the system settings where a language and its OCR pack are added.
-#[tauri::command]
-async fn open_language_settings() -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        std::process::Command::new("explorer")
-            .arg("ms-settings:regionlanguage")
-            .spawn()
-            .map_err(|e| format!("打开系统设置失败: {e}"))?;
     }
     Ok(())
 }
@@ -2173,7 +2145,6 @@ pub fn run() {
             ocr_picker_ready,
             ocr_recognize_frame,
             ocr_close_picker,
-            open_language_settings,
             start_ocr_capture,
             set_ocr_capture_and_lookup,
             show_main_window,

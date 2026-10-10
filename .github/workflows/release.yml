@@ -29,6 +29,11 @@ jobs:
         with:
           workspaces: "./src-tauri -> target"
       - run: npm ci
+      # The same as in ci.yml: the OCR runtime that the installer carries and that the Rust build
+      # and its tests need.
+      - name: Fetch ONNX Runtime
+        shell: pwsh
+        run: ./scripts/fetch-onnxruntime.ps1
       - run: npm run typecheck
       - run: npm test -- --run
       - run: npm run lint
