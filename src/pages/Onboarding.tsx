@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useId, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import {
@@ -11,7 +11,7 @@ import {
   ZapIcon } from
 'lucide-react';
 import { useLexNote } from '../contexts/LexNoteContext';
-import { PROVIDER_PRESETS } from '../data/providers';
+import { NO_KEY_NOTE, PROVIDER_PRESETS, presetChanges, presetOf } from '../data/providers';
 import { Button } from '../components/ui/Button';
 import { TextInput } from '../components/ui/TextInput';
 import { Toggle } from '../components/ui/Toggle';
@@ -25,11 +25,14 @@ const STEPS = ['配置模型', '划词即查', '数据与隐私'];
 
 export function Onboarding() {
   const navigate = useNavigate();
+  const keyId = useId();
   const { settings, updateSettings, setOnboarded } = useLexNote();
   const [step, setStep] = useState(0);
   const [autostartError, setAutostartError] = useState<string | null>(null);
   const [autostartEnabled, setAutostartEnabled] = useState(settings.launchAtLogin);
   const provider = settings.provider;
+  // The preset that the Base URL is one of: it knows where the key of that service is made.
+  const activePreset = presetOf(provider.baseUrl);
   const { state: connection, test: runConnectionTest } = useConnectionTest(provider);
   const patch = (changes: Partial<typeof provider>) =>
   updateSettings({ provider: changes });
@@ -94,12 +97,10 @@ export function Onboarding() {
               <button
                 key={preset.id}
                 type="button"
-                onClick={() => {
-                  patch({ name: preset.name, protocol: preset.protocol, baseUrl: preset.baseUrl, model: preset.model });
-                }}
+                onClick={() => patch(presetChanges(preset, provider))}
                 className={classNames(
                   'rounded-full border px-2.5 py-1 text-[11px] transition-colors',
-                  provider.baseUrl === preset.baseUrl ?
+                  activePreset?.id === preset.id ?
                   'border-accent bg-accent-soft text-accent' :
                   'border-line text-ink-muted hover:border-line-strong'
                 )}>
@@ -113,25 +114,29 @@ export function Onboarding() {
                   <span className="mb-1 block text-[11px] text-ink-muted">Base URL</span>
                   <TextInput value={provider.baseUrl} onChange={(event) => patch({ baseUrl: event.target.value })} />
                 </label>
-                <label className="block">
-                  <span className="mb-1 flex items-center gap-2 text-[11px] text-ink-muted">
-                    API Key
-                    <a
-                    href="https://platform.deepseek.com"
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-0.5 text-accent hover:underline">
-                    
-                      如何获取 <ExternalLinkIcon size={10} />
-                    </a>
-                  </span>
+                <div>
+                  <div className="mb-1 flex items-center gap-2 text-[11px] text-ink-muted">
+                    <label htmlFor={keyId}>API Key</label>
+                    {activePreset?.keyUrl ? (
+                      <a
+                        href={activePreset.keyUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-0.5 text-accent hover:underline">
+                        如何获取 <ExternalLinkIcon size={10} aria-hidden="true" />
+                      </a>
+                    ) : null}
+                    {activePreset && activePreset.keyUrl === null ? (
+                      <span className="text-ink-subtle">{NO_KEY_NOTE}</span>
+                    ) : null}
+                  </div>
                   <TextInput
+                  id={keyId}
                   type="password"
                   value={provider.apiKey}
                   onChange={(event) => patch({ apiKey: event.target.value })}
                   placeholder="sk-…" />
-                
-                </label>
+                </div>
                 <label className="block">
                   <span className="mb-1 block text-[11px] text-ink-muted">模型</span>
                   <TextInput value={provider.model} onChange={(event) => patch({ model: event.target.value })} />

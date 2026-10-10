@@ -129,6 +129,8 @@ npx tauri build
 首次启动会进入设置向导，选择一个 LLM 提供商（推荐 GLM / DeepSeek），填入你的 API Key，点击「测试连接」确认连通后即可开始使用。
 
 > 鸽鸽词典不内置任何 API Key，你需要自行在对应平台申请。Key 只保存在本机（DPAPI 加密），不会出现在界面明文里。
+>
+> 用本机的 Ollama / LM Studio 时不需要 Key：选「本地网关」预设后，应用会自动填入占位符 `ollama`（这类服务不校验 Key），保持原样即可。
 
 ### 2. 查词
 
@@ -156,7 +158,7 @@ npx tauri build
 | [Kimi](https://platform.moonshot.cn) | OpenAI 兼容 | moonshot-v1-8k | 国内直连 |
 | [Anthropic](https://console.anthropic.com) | Anthropic | claude-sonnet-4 | 高质量 |
 | [OpenRouter](https://openrouter.ai) | OpenAI 兼容 | 多模型 | 一个 Key 调多家 |
-| Ollama / LM Studio | OpenAI 兼容 | qwen2.5:14b 等 | 完全离线本地部署 |
+| Ollama / LM Studio | OpenAI 兼容 | qwen2.5:14b 等 | 完全离线本地部署，不需要 Key |
 
 ## 技术栈
 
@@ -220,9 +222,10 @@ gege-dictionary/
 | [v1.7 开发规格](docs/PRD-v1.7-spec.md) | lookup 双路径合并、Anki 批量/映射/noteId、上下文三档与空态 | 想参与 v1.7 开发 |
 | [v1.9 开发规格](docs/PRD-v1.9-spec.md) | 信任债偿还（安全、数据完整性、错误码、托盘与朗读）、查词历史、学习洞察 | 想参与 v1.9+ 开发 |
 | [v1.10 开发规格](docs/PRD-v1.10-spec.md) | 备用模型、长列表窗口化、复习「有点难」与 schema v7、批量补全、重新解析的词形处理、每周回顾与周报 | 想参与 v1.10+ 开发 |
-| [v1.9–v2.0 路线](docs/ROADMAP-v1.9-v2.0.md) | 这一轮发现的问题清单、v1.9 / v1.10 交付内容，以及 v2.0 规划 | 想了解产品方向 |
+| [v1.9–v2.0 路线](docs/ROADMAP-v1.9-v2.0.md) | 这一轮发现的问题清单、v1.9 / v1.10 / v1.11 交付内容，以及 v2.0 规划 | 想了解产品方向 |
 | [v1.6 实机验收清单](docs/QA-machine-checklist-v1.6.md) | 原生 OCR / Anki / 多屏 / 更新通道真机步骤 | 发布与 QA |
 | [v1.10 实机验收清单](docs/QA-machine-checklist-v1.10.md) | 备用模型接手、批量补全、长列表手感、复习三档、周报导出、升级的真机步骤 | 发布与 QA |
+| [v1.11 实机验收清单](docs/QA-machine-checklist-v1.11.md) | 系统标题栏与主题、窗口间导航、删除撤销、本地网关免 Key、设置保存状态、查词窗口字号、升级的真机步骤 | 发布与 QA |
 | [v1.4.3 发布说明](docs/RELEASE-NOTES-v1.4.3.md) | 数据安全、迁移/恢复、导入、剪贴板与发布门禁 | 维护者与升级用户 |
 | [v1.4.4 发布说明](docs/RELEASE-NOTES-v1.4.4.md) | 可靠性回归、真实 API 验证、首屏性能与依赖安全 | 维护者与升级用户 |
 | [v1.5.0 发布说明](docs/RELEASE-NOTES-v1.5.0.md) | 主场景可用、隐私运行时、本地统计、PR CI | 维护者与升级用户 |
@@ -231,6 +234,7 @@ gege-dictionary/
 | [v1.8.0 发布说明](docs/RELEASE-NOTES-v1.8.0.md) | 生词库排序与批量掌握度、`lookup.rs` 拆分 | 维护者与升级用户 |
 | [v1.9.0 发布说明](docs/RELEASE-NOTES-v1.9.0.md) | 安全与数据修复、查词历史、学习洞察、托盘与朗读 | 维护者与升级用户 |
 | [v1.10.0 发布说明](docs/RELEASE-NOTES-v1.10.0.md) | 备用模型、批量补全、长列表、复习「有点难」、每周回顾与周报 | 维护者与升级用户 |
+| [v1.11.0 发布说明](docs/RELEASE-NOTES-v1.11.0.md) | 体验打磨：单一标题栏、删除可撤销、本地模型免 Key、设置保存状态、复习不再死胡同 | 维护者与升级用户 |
 | [发布说明](docs/RELEASE.md) | updater 私钥保管、GitHub Secrets 与签名发布流程 | 版本维护者 |
 
 开发任务已拆解为 [Issues](https://github.com/GeziP/gege-dictionary/issues)，每个都附带验收清单，欢迎认领。

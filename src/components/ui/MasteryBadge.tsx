@@ -1,7 +1,7 @@
 /* eslint-disable react-refresh/only-export-components */
 import React from 'react';
 import { CheckCircle2Icon, CircleDashedIcon, CircleDotIcon } from 'lucide-react';
-import { MASTERY_LABELS } from '../../lib/insights';
+import { MASTERY_LABELS, MASTERY_LEVELS } from '../../lib/insights';
 import { classNames } from '../../utils/format';
 import type { Mastery } from '../../types/lexnote';
 
@@ -13,7 +13,8 @@ export const MASTERY_META: Record<Mastery, { label: string; icon: typeof CircleD
   mastered: { label: MASTERY_LABELS.mastered, icon: CheckCircle2Icon, tone: 'text-positive' },
 };
 
-export const MASTERY_ORDER: Mastery[] = ['new', 'learning', 'mastered'];
+/** All four levels, so that a word can be put at, and found by, each of them. */
+export const MASTERY_ORDER: Mastery[] = MASTERY_LEVELS;
 
 interface MasteryBadgeProps {
   mastery: Mastery;

@@ -114,3 +114,59 @@ describe('onboarding connection test', () => {
     expect(screen.getByRole('button', { name: '请先测试连接' })).toBeDisabled();
   });
 });
+
+describe('onboarding model presets', () => {
+  const keyLink = () => screen.queryByRole('link', { name: /如何获取/ });
+  const keyBox = () => screen.getByPlaceholderText('sk-…');
+
+  it('leads to the page where the key of the chosen service is made, and to no page before one is chosen', async () => {
+    renderOnboarding();
+    expect(keyLink()).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'DeepSeek' }));
+    expect(keyLink()).toHaveAttribute('href', 'https://platform.deepseek.com');
+    expect(keyLink()).toHaveAttribute('target', '_blank');
+
+    await userEvent.click(screen.getByRole('button', { name: 'OpenAI' }));
+    expect(keyLink()).toHaveAttribute('href', 'https://platform.openai.com/api-keys');
+  });
+
+  it('lets the local gateway be used at once: it has no page for a key, and a placeholder in its place', async () => {
+    renderOnboarding();
+
+    await userEvent.click(screen.getByRole('button', { name: '本地网关' }));
+
+    expect(keyLink()).not.toBeInTheDocument();
+    expect(screen.getByText('这个服务不校验 Key，已填入占位符，保持原样即可')).toBeInTheDocument();
+    expect(keyBox()).toHaveValue('ollama');
+
+    await clickConnectionTest();
+    expect(vi.mocked(bridge.testConnection).mock.calls[0].slice(0, 4)).toEqual([
+      'http://127.0.0.1:11434/v1',
+      'ollama',
+      'qwen2.5:14b',
+      'openai',
+    ]);
+    expect(await screen.findByRole('button', { name: '下一步' })).toBeEnabled();
+  });
+
+  it('does not put the placeholder over a key that was typed', async () => {
+    renderOnboarding();
+    await userEvent.type(keyBox(), 'sk-mine');
+
+    await userEvent.click(screen.getByRole('button', { name: '本地网关' }));
+
+    expect(keyBox()).toHaveValue('sk-mine');
+  });
+
+  it('takes the placeholder out again when a service that needs a real key is chosen next', async () => {
+    renderOnboarding();
+    await userEvent.click(screen.getByRole('button', { name: '本地网关' }));
+    expect(keyBox()).toHaveValue('ollama');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Kimi' }));
+
+    expect(keyBox()).toHaveValue('');
+    expect(keyLink()).toHaveAttribute('href', 'https://platform.moonshot.cn');
+  });
+});

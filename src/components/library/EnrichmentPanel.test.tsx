@@ -1,7 +1,7 @@
 import { cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { EnrichmentControl } from '../../hooks/useEnrichment';
 import type { EnrichmentProgress, EnrichmentStatus } from '../../types/lexnote';
 import { EnrichmentPanel } from './EnrichmentPanel';
@@ -333,5 +333,93 @@ describe('the batch enrichment in the library', () => {
 
       expect(screen.queryByText(/没补成功的词/)).not.toBeInTheDocument();
     });
+  });
+});
+
+describe('putting the prompt away', () => {
+  const HIDDEN_AT = 'gege.enrichment.prompt-hidden-at';
+  const again = (view: ReturnType<typeof show>, control: EnrichmentControl) =>
+    view.rerender(
+      <MemoryRouter>
+        <EnrichmentPanel enrichment={control} />
+      </MemoryRouter>,
+    );
+
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  afterEach(() => {
+    window.localStorage.clear();
+  });
+
+  it('is done with the button, which keeps the prompt away for as many words as wait now', async () => {
+    const control = controlOf();
+    const view = show(control);
+
+    await userEvent.click(button('暂时不再提示'));
+
+    expect(view.container).toBeEmptyDOMElement();
+    expect(window.localStorage.getItem(HIDDEN_AT)).toBe('12');
+    expect(control.start).not.toHaveBeenCalled();
+  });
+
+  it('keeps the prompt away when the window is opened again with no more words waiting', () => {
+    window.localStorage.setItem(HIDDEN_AT, '12');
+
+    const view = show(controlOf());
+
+    expect(view.container).toBeEmptyDOMElement();
+  });
+
+  it('brings the prompt back when more words wait than when it was put away, as after an import', () => {
+    window.localStorage.setItem(HIDDEN_AT, '12');
+
+    show(controlOf({ status: status({ pending: 15 }) }));
+
+    expect(panel()).toHaveTextContent('15 个词还没有义项和例句');
+  });
+
+  it('counts from the new number once fewer words wait, so that what comes after that is new', () => {
+    window.localStorage.setItem(HIDDEN_AT, '12');
+    const view = show(controlOf({ status: status({ pending: 5 }) }));
+    expect(view.container).toBeEmptyDOMElement();
+    expect(window.localStorage.getItem(HIDDEN_AT)).toBe('5');
+
+    again(view, controlOf({ status: status({ pending: 8 }) }));
+
+    expect(panel()).toHaveTextContent('8 个词还没有义项和例句');
+  });
+
+  it('does not hide a run that is going on, whatever was put away before', () => {
+    window.localStorage.setItem(HIDDEN_AT, '50');
+
+    show(controlOf({ status: status({ progress: progress({ state: 'running', total: 12, current: 'alpha' }) }) }));
+
+    expect(panel()).toHaveTextContent('正在补全生词');
+  });
+
+  it('still says why a command did not work, with the prompt away', () => {
+    window.localStorage.setItem(HIDDEN_AT, '12');
+
+    show(controlOf({ error: '补全服务暂时不可用' }));
+
+    expect(screen.getByRole('alert')).toHaveTextContent('补全服务暂时不可用');
+    expect(screen.queryByRole('button', { name: '开始补全' })).not.toBeInTheDocument();
+  });
+
+  it('still works when the browser keeps nothing, and then the prompt is simply there again next time', async () => {
+    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new Error('storage is full');
+    });
+    try {
+      const view = show(controlOf());
+
+      await userEvent.click(button('暂时不再提示'));
+
+      expect(view.container).toBeEmptyDOMElement();
+    } finally {
+      setItem.mockRestore();
+    }
   });
 });

@@ -51,9 +51,9 @@ const MASTERY_BAR: Record<Mastery, string> = {
 
 /** The review boxes and when a card in each comes back (see `submit_review`). */
 const BOXES = [
-  { label: 'Box 1', hint: '1 天后再见' },
-  { label: 'Box 2', hint: '3 天后再见' },
-  { label: 'Box 3', hint: '7 天后再见' },
+  { label: '第 1 档', hint: '1 天后再见' },
+  { label: '第 2 档', hint: '3 天后再见' },
+  { label: '第 3 档', hint: '7 天后再见' },
 ];
 
 /** From no cards answered to the busiest day, so that the calendar reads as more from left to right. */

@@ -12,6 +12,7 @@ import { UpdateSection } from '../components/settings/UpdateSection';
 import { GlossarySection } from '../components/settings/GlossarySection';
 import { LocalStatsSection } from '../components/settings/LocalStatsSection';
 import { AnkiSection } from '../components/settings/AnkiSection';
+import { SettingsSaveBadge, SettingsSaveError } from '../components/settings/SettingsSaveStatus';
 import { classNames } from '../utils/format';
 
 const TABS = [
@@ -32,27 +33,37 @@ export function Settings() {
 
   return (
     <WindowFrame title="设置">
-      <div className="thin-scroll flex h-10 shrink-0 items-center gap-1 overflow-x-auto border-b border-line bg-surface px-3">
-        {TABS.map((item) => (
-          <button
-            key={item.id}
-            type="button"
-            onClick={() => setTab(item.id)}
-            className={classNames(
-              'relative h-full shrink-0 whitespace-nowrap px-3 text-[12px] transition-colors',
-              tab === item.id ? 'text-accent' : 'text-ink-muted hover:text-ink'
-            )}
-          >
-            {item.label}
-            <span
+      <div className="flex h-10 shrink-0 items-center border-b border-line bg-surface">
+        <div
+          role="tablist"
+          aria-label="设置分类"
+          className="thin-scroll flex h-full min-w-0 flex-1 items-center gap-1 overflow-x-auto px-3"
+        >
+          {TABS.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              role="tab"
+              aria-selected={tab === item.id}
+              onClick={() => setTab(item.id)}
               className={classNames(
-                'absolute inset-x-2 bottom-0 h-0.5 rounded-t',
-                tab === item.id ? 'bg-accent' : 'bg-transparent'
+                'relative h-full shrink-0 whitespace-nowrap px-3 text-[12px] transition-colors',
+                tab === item.id ? 'text-accent' : 'text-ink-muted hover:text-ink'
               )}
-            />
-          </button>
-        ))}
+            >
+              {item.label}
+              <span
+                className={classNames(
+                  'absolute inset-x-2 bottom-0 h-0.5 rounded-t',
+                  tab === item.id ? 'bg-accent' : 'bg-transparent'
+                )}
+              />
+            </button>
+          ))}
+        </div>
+        <SettingsSaveBadge />
       </div>
+      <SettingsSaveError />
 
       <div className="thin-scroll min-h-0 flex-1 overflow-y-auto p-4">
         <div className="mx-auto max-w-3xl">

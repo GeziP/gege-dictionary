@@ -47,9 +47,10 @@ export function SelectionBar({
       animate={{ y: 0 }}
       exit={{ y: 48 }}
       transition={{ duration: 0.16, ease: 'easeOut' }}
-      className="flex h-toolbar shrink-0 items-center gap-2 border-t border-line bg-raised px-3"
+      // The buttons go on a second line in a narrow window, rather than being squeezed out of shape.
+      className="flex min-h-toolbar shrink-0 flex-wrap items-center gap-x-2 gap-y-1.5 border-t border-line bg-raised px-3 py-1.5"
     >
-      <p className="text-xs font-medium text-ink">已选 {count} 条</p>
+      <p className="shrink-0 whitespace-nowrap text-xs font-medium text-ink">已选 {count} 条</p>
 
       <form
         className="flex items-center"
@@ -63,7 +64,7 @@ export function SelectionBar({
           onChange={(event) => onBatchTagChange(event.target.value)}
           placeholder="输入标签后回车"
           leading={<TagIcon size={13} aria-hidden="true" />}
-          className="w-44"
+          className="w-40"
         />
       </form>
 

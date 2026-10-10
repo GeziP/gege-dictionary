@@ -3,10 +3,12 @@ import { FileUpIcon, UploadIcon } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { Modal } from '../ui/Modal';
 import { Select } from '../ui/Select';
+import { guessMapping } from '../../lib/import-columns';
 import * as bridge from '../../lib/tauri-bridge';
+import { errorText } from '../../utils/format';
 
 const TARGETS = [
-  { value: 'lemma', label: 'lemma（必需）' },
+  { value: 'lemma', label: '单词（必需）' },
   { value: 'translation', label: '翻译' },
   { value: 'pos', label: '词性' },
   { value: 'contextMeaning', label: '上下文释义' },
@@ -44,22 +46,15 @@ export function ImportDialog({ onClose, onImported }: ImportDialogProps) {
         reader.readAsText(file);
       });
       const nextPreview = await bridge.previewWordImport(nextContent, nextFormat);
-      const nextMapping: Record<string, string> = {};
-      for (const target of TARGETS) {
-        const matching = nextPreview.columns.find((column) =>
-          target.value === 'lemma'
-            ? column.toLowerCase() === 'lemma'
-            : column.toLowerCase() === target.value.toLowerCase()
-        );
-        if (matching) nextMapping[target.value] = matching;
-      }
       setFileName(file.name);
       setContent(nextContent);
       setFormat(nextFormat);
       setPreview(nextPreview);
-      setMapping(nextMapping);
+      // The columns are matched with the fields by the names they carry; what is not found is
+      // left to the user, who sees the first rows of the file to choose by.
+      setMapping(guessMapping(nextPreview.columns, TARGETS.map((target) => target.value)));
     } catch (reason) {
-      setError(String(reason));
+      setError(errorText(reason));
       setPreview(null);
     } finally {
       setBusy(false);
@@ -76,7 +71,7 @@ export function ImportDialog({ onClose, onImported }: ImportDialogProps) {
       onImported(`新增 ${result.inserted} 条，合并 ${result.merged} 条，跳过 ${result.skipped} 条${errorSuffix}`);
       onClose();
     } catch (reason) {
-      setError(String(reason));
+      setError(errorText(reason));
     } finally {
       setBusy(false);
     }
@@ -85,7 +80,7 @@ export function ImportDialog({ onClose, onImported }: ImportDialogProps) {
   return (
     <Modal
       title="导入词表"
-      description="支持 CSV / TSV、UTF-8 BOM、引号和换行；确认真实预览后才会写入数据库"
+      description="选一个 CSV / TSV 文件，先预览并确认每一列对应什么，点「开始导入」后才会写入词库。"
       onClose={onClose}
       width={720}
       footer={(
@@ -102,15 +97,18 @@ export function ImportDialog({ onClose, onImported }: ImportDialogProps) {
         </>
       )}
     >
-      <label className="flex cursor-pointer flex-col items-center gap-1.5 rounded-lg border border-dashed border-line-strong bg-raised px-4 py-6 text-center">
-        <FileUpIcon size={18} className="text-ink-subtle" />
-        <span className="text-xs text-ink">{fileName ?? '选择或拖入 CSV / TSV 文件'}</span>
-        <span className="text-[11px] text-ink-subtle">文件只会先读取到本地预览，不会自动提交</span>
+      {/* The input is hidden by being clipped, not by display: none, so that the keyboard can reach it. */}
+      <label className="flex cursor-pointer flex-col items-center gap-1.5 rounded-lg border border-dashed border-line-strong bg-raised px-4 py-6 text-center transition-colors hover:border-accent focus-within:border-accent focus-within:ring-2 focus-within:ring-accent-line">
+        <FileUpIcon size={18} className="text-ink-subtle" aria-hidden="true" />
+        <span className="text-xs text-ink">{fileName ?? '点这里选择 CSV / TSV 文件'}</span>
+        <span className="text-[11px] text-ink-subtle">
+          {fileName ? '点这里可以换一个文件' : '文件只会先读到本地做预览，不会自动写入'}
+        </span>
         <input
           aria-label="选择 CSV/TSV 文件"
           type="file"
           accept=".csv,.tsv,.txt"
-          className="hidden"
+          className="sr-only"
           onChange={(event) => void handleFile(event.target.files?.[0])}
         />
       </label>
@@ -118,8 +116,11 @@ export function ImportDialog({ onClose, onImported }: ImportDialogProps) {
       {preview && (
         <>
           <div className="mt-4 flex items-center justify-between">
-            <p className="text-[11px] font-medium text-ink-muted">字段映射</p>
-            <span className="text-[11px] text-ink-subtle">总行数：{preview.totalRows}</span>
+            <p className="text-[11px] font-medium text-ink-muted">每一列对应什么</p>
+            <span className="text-[11px] text-ink-subtle">
+              总行数：{preview.totalRows}
+              {preview.rows.length < preview.totalRows ? `（下面是前 ${preview.rows.length} 行）` : ''}
+            </span>
           </div>
           <div className="mt-1.5 grid grid-cols-2 gap-2">
             {TARGETS.map((target) => (
@@ -137,7 +138,11 @@ export function ImportDialog({ onClose, onImported }: ImportDialogProps) {
               </label>
             ))}
           </div>
-          {!mapping.lemma && <p className="mt-2 text-[11px] text-danger">必须映射 lemma 列才能提交。</p>}
+          {!mapping.lemma && (
+            <p role="alert" className="mt-2 text-[11px] text-danger">
+              还没有选出哪一列是「单词」，选好之后才能导入。
+            </p>
+          )}
 
           <div className="mt-4 overflow-auto rounded-md border border-line">
             <table className="min-w-full text-left text-[11px]">
@@ -163,7 +168,11 @@ export function ImportDialog({ onClose, onImported }: ImportDialogProps) {
           )}
         </>
       )}
-      {error && <p className="mt-3 rounded-md border border-danger/30 bg-danger/5 px-2.5 py-2 text-[11px] text-danger">{error}</p>}
+      {error && (
+        <p role="alert" className="mt-3 rounded-md border border-danger/30 bg-danger/5 px-2.5 py-2 text-[11px] text-danger">
+          {error}
+        </p>
+      )}
     </Modal>
   );
 }

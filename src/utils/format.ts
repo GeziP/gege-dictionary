@@ -1,8 +1,27 @@
-import { formatDistanceToNowStrict, format } from 'date-fns';
+import { differenceInCalendarDays, formatDistanceToNowStrict, format, parseISO } from 'date-fns';
 import { zhCN } from 'date-fns/locale';
 
 export function relativeTime(iso: string): string {
   return formatDistanceToNowStrict(new Date(iso), { addSuffix: true, locale: zhCN });
+}
+
+/**
+ * When something is next due, as a person would say it: "今天", "明天", "3 天后". The date is the
+ * `yyyy-MM-dd` of the user's own day, as the backend keeps the review dates; anything else is
+ * shown as it came.
+ */
+export function dueText(date: string, now: Date = new Date()): string {
+  const days = differenceInCalendarDays(parseISO(date), now);
+  if (Number.isNaN(days)) return date;
+  if (days <= 0) return '今天';
+  if (days === 1) return '明天';
+  return `${days} 天后`;
+}
+
+/** What a failed call says: the backend sends its reason as a plain string, anything else as an `Error`. */
+export function errorText(reason: unknown): string {
+  if (reason instanceof Error) return reason.message;
+  return typeof reason === 'string' ? reason : String(reason);
 }
 
 export function absoluteTime(iso: string): string {

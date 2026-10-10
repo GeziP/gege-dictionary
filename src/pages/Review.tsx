@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { CheckIcon, ClockIcon, RotateCcwIcon, XIcon } from 'lucide-react';
 import { WindowFrame } from '../components/shell/WindowFrame';
 import { Button } from '../components/ui/Button';
@@ -6,7 +7,8 @@ import { CardDetails } from '../components/card/CardDetails';
 import { SpeakButton } from '../components/card/SpeakButton';
 import { useLexNote } from '../contexts/LexNoteContext';
 import * as bridge from '../lib/tauri-bridge';
-import type { ReviewAnswer, ReviewState, SavedWord } from '../types/lexnote';
+import type { ReviewAnswer, ReviewState, ReviewStats, SavedWord } from '../types/lexnote';
+import { dueText } from '../utils/format';
 
 /**
  * The ways to answer a card, left to right and by the keys 1, 2 and 3. "认识" is still 1, where
@@ -16,7 +18,7 @@ import type { ReviewAnswer, ReviewState, SavedWord } from '../types/lexnote';
 const ANSWERS: Array<{ answer: ReviewAnswer; key: string; label: string; icon: React.ReactNode; hint: string }> = [
   { answer: 'correct', key: '1', label: '认识', icon: <CheckIcon size={15} />, hint: '升一档，隔更久再见' },
   { answer: 'hard', key: '2', label: '有点难', icon: <ClockIcon size={15} />, hint: '留在原档，明天再见' },
-  { answer: 'wrong', key: '3', label: '不认识', icon: <XIcon size={15} />, hint: '回到 Box 1，明天再见' },
+  { answer: 'wrong', key: '3', label: '不认识', icon: <XIcon size={15} />, hint: '回到第 1 档，明天再见' },
 ];
 
 export function Review() {
@@ -27,6 +29,9 @@ export function Review() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [answers, setAnswers] = useState<ReviewState[]>([]);
+  // What is left to review, asked for once the queue is through: whether more words are due than
+  // the queue held, and if not, when the next one is.
+  const [stats, setStats] = useState<ReviewStats | null>(null);
 
   const load = useCallback(async (unlimited = false) => {
     setLoading(true);
@@ -47,6 +52,22 @@ export function Review() {
   useEffect(() => { load(); }, [load]);
 
   const current = queue[index];
+  const queueDone = !loading && !current;
+  const answered = answers.length;
+  useEffect(() => {
+    if (!queueDone) return undefined;
+    let alive = true;
+    setStats(null);
+    bridge
+      .getReviewStats()
+      .then((next) => {
+        if (alive) setStats(next);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [queueDone, answered]);
   const saving = useRef(false);
   const answer = useCallback(async (result: ReviewAnswer) => {
     // One answer at a time: a key held down or a double click would otherwise record the card
@@ -75,6 +96,10 @@ export function Review() {
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.code === 'Space') {
+        // On a button or a link the space bar presses it (the speaker, an answer, the way back);
+        // it turns the card over only when it is not pointed at anything.
+        const target = event.target;
+        if (target instanceof HTMLElement && target.closest('button, a, input, textarea, select')) return;
         event.preventDefault();
         if (current) setFlipped(true);
       } else if (flipped) {
@@ -119,7 +144,7 @@ export function Review() {
                   aria-label={flipped ? '卡片背面' : '翻面'}
                 />
                 <div className="pointer-events-none relative">
-                  <p className="text-xs text-ink-subtle">{index + 1} / {queue.length} · Box {current.reviewState?.box ?? 1}</p>
+                  <p className="text-xs text-ink-subtle">{index + 1} / {queue.length} · 第 {current.reviewState?.box ?? 1} 档</p>
                   <div className="mt-8 flex items-center justify-center gap-3">
                     <h2 className="font-serif text-4xl font-bold text-ink">{current.lemma}</h2>
                     <SpeakButton className="pointer-events-auto" text={current.lemma} label={`朗读 ${current.lemma}`} />
@@ -146,13 +171,13 @@ export function Review() {
                     ))}
                   </div>
                   <p className="mt-2 text-center text-2xs text-ink-subtle">
-                    认识会升档；有点难留在原档，明天再见；不认识回到 Box 1。
+                    认识会升档；有点难留在原档，明天再见；不认识回到第 1 档。
                   </p>
                 </div>
               ) : null}
             </article>
           ) : null}
-          {!loading && !current ? (
+          {queueDone ? (
             <div className="rounded-xl border border-line bg-surface px-8 py-14 text-center">
               <h2 className="text-xl font-semibold text-ink">{answers.length ? '本次回顾完成' : '今天没有到期词'}</h2>
               {answers.length ? (
@@ -160,7 +185,22 @@ export function Review() {
                   共 {answers.length} 词，答对 {correct}，{hard > 0 ? `有点难 ${hard}，` : ''}升档 {promoted}，回落 {reset}
                 </p>
               ) : <p className="mt-3 text-sm text-ink-muted">可以安心阅读，新收藏会从明天开始出现。</p>}
-              <Button className="mt-6" icon={<RotateCcwIcon size={15} />} onClick={() => load(true)}>继续复习全部到期词</Button>
+              {stats?.dueCount ? (
+                <p className="mt-2 text-sm text-ink-muted">还有 {stats.dueCount} 个词已经到期。</p>
+              ) : stats?.nextDueAt ? (
+                <p className="mt-2 text-sm text-ink-muted">下次复习：{dueText(stats.nextDueAt)}</p>
+              ) : null}
+              <div className="mt-6 flex flex-wrap items-center justify-center gap-2">
+                {stats?.dueCount ? (
+                  <Button variant="primary" icon={<RotateCcwIcon size={15} />} onClick={() => load(true)}>继续复习全部到期词</Button>
+                ) : null}
+                <Link
+                  to="/library"
+                  className="inline-flex h-control-lg items-center rounded-md border border-line bg-surface px-3.5 text-sm font-medium text-ink hover:border-line-strong hover:bg-raised"
+                >
+                  回到生词库
+                </Link>
+              </div>
             </div>
           ) : null}
         </div>

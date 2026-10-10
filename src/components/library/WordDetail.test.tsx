@@ -1,9 +1,10 @@
-import { useState } from 'react';
+import { useState, type ComponentProps } from 'react';
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { LexNoteProvider, useLexNote } from '../../contexts/LexNoteContext';
+import { READER_MAX, READER_MIN } from '../../lib/reader-size';
 import * as bridge from '../../lib/tauri-bridge';
 import type { Entry, SavedWord } from '../../types/lexnote';
 import { WordDetail } from './WordDetail';
@@ -123,30 +124,33 @@ async function shown(lemma: string) {
   await screen.findByRole('heading', { name: lemma });
 }
 
+/** What the backend answers, for the tests of this file. */
+function mockBridge() {
+  vi.mocked(bridge.getSettings).mockResolvedValue({
+    provider: { model: 'qwen-test', apiKey: 'sk-test' },
+  } as never);
+  vi.mocked(bridge.getTemplates).mockResolvedValue([]);
+  vi.mocked(bridge.getUsage).mockResolvedValue({ today: 0, month: 0, tokens: 0 });
+  vi.mocked(bridge.getStartupWarnings).mockResolvedValue([]);
+  vi.mocked(bridge.saveSettings).mockResolvedValue(undefined);
+  vi.mocked(bridge.listenLookupDone).mockResolvedValue(() => undefined);
+  vi.mocked(bridge.listenLookupError).mockResolvedValue(() => undefined);
+  vi.mocked(bridge.listenLookupDelta).mockResolvedValue(() => undefined);
+  vi.mocked(bridge.lookupWord).mockResolvedValue(NEW_ANSWER);
+  // The backend answers with the merged document and counts the lookup.
+  vi.mocked(bridge.saveWord).mockImplementation(async (word) => ({
+    ...word,
+    lookups: word.lookups + 1,
+  }));
+  vi.mocked(bridge.restoreWord).mockResolvedValue(undefined);
+  vi.mocked(bridge.updateWord).mockResolvedValue(undefined);
+  vi.mocked(bridge.deleteWords).mockResolvedValue(undefined);
+  vi.mocked(bridge.findWordByLemma).mockResolvedValue(null);
+  vi.mocked(bridge.emitWordSaved).mockResolvedValue(undefined);
+}
+
 describe('re-analysing a saved word', () => {
-  beforeEach(() => {
-    vi.mocked(bridge.getSettings).mockResolvedValue({
-      provider: { model: 'qwen-test', apiKey: 'sk-test' },
-    } as never);
-    vi.mocked(bridge.getTemplates).mockResolvedValue([]);
-    vi.mocked(bridge.getUsage).mockResolvedValue({ today: 0, month: 0, tokens: 0 });
-    vi.mocked(bridge.getStartupWarnings).mockResolvedValue([]);
-    vi.mocked(bridge.saveSettings).mockResolvedValue(undefined);
-    vi.mocked(bridge.listenLookupDone).mockResolvedValue(() => undefined);
-    vi.mocked(bridge.listenLookupError).mockResolvedValue(() => undefined);
-    vi.mocked(bridge.listenLookupDelta).mockResolvedValue(() => undefined);
-    vi.mocked(bridge.lookupWord).mockResolvedValue(NEW_ANSWER);
-    // The backend answers with the merged document and counts the lookup.
-    vi.mocked(bridge.saveWord).mockImplementation(async (word) => ({
-      ...word,
-      lookups: word.lookups + 1,
-    }));
-    vi.mocked(bridge.restoreWord).mockResolvedValue(undefined);
-    vi.mocked(bridge.updateWord).mockResolvedValue(undefined);
-    vi.mocked(bridge.deleteWords).mockResolvedValue(undefined);
-    vi.mocked(bridge.findWordByLemma).mockResolvedValue(null);
-    vi.mocked(bridge.emitWordSaved).mockResolvedValue(undefined);
-  });
+  beforeEach(mockBridge);
 
   afterEach(() => {
     cleanup();
@@ -704,5 +708,264 @@ describe('re-analysing a saved word', () => {
     expect(screen.queryByText(/已用 .* 重新解析/)).not.toBeInTheDocument();
     expect(screen.getByText('走')).toBeInTheDocument();
     expect(reanalyzeButton()).toBeEnabled();
+  });
+});
+
+type PanelProps = Partial<ComponentProps<typeof WordDetail>>;
+
+/** The panel of the word `w1`, as the library page shows it, with the buttons the page gives it. */
+function renderPanel(words: SavedWord[] = [saved()], props: PanelProps = {}) {
+  vi.mocked(bridge.getAllWords).mockResolvedValue(words);
+  function Panel() {
+    const { words: library } = useLexNote();
+    return <WordDetail word={library.find((word) => word.id === 'w1') ?? null} inline {...props} />;
+  }
+  return render(
+    <MemoryRouter initialEntries={['/library']}>
+      <Routes>
+        <Route
+          path="/library"
+          element={
+            <LexNoteProvider>
+              <Panel />
+            </LexNoteProvider>
+          }
+        />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+describe('the panel of a saved word', () => {
+  beforeEach(mockBridge);
+
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  describe('the level of mastery', () => {
+    it('offers every level, in the order a word goes through them, and marks the one it is at', async () => {
+      renderPanel([saved({ mastery: 'familiar' })]);
+      await shown('run');
+
+      const group = screen.getByRole('group', { name: '掌握度' });
+      expect(within(group).getAllByRole('button').map((button) => button.textContent)).toEqual([
+        '新词',
+        '巩固中',
+        '熟悉',
+        '已掌握',
+      ]);
+      expect(within(group).getByRole('button', { name: '熟悉' })).toHaveAttribute('aria-pressed', 'true');
+      expect(within(group).getByRole('button', { name: '新词' })).toHaveAttribute('aria-pressed', 'false');
+    });
+
+    it('sets the level that is pressed, and says it was kept', async () => {
+      const user = userEvent.setup();
+      renderPanel([saved({ mastery: 'familiar' })]);
+      await shown('run');
+      const group = screen.getByRole('group', { name: '掌握度' });
+
+      await user.click(within(group).getByRole('button', { name: '巩固中' }));
+
+      expect(bridge.updateWord).toHaveBeenCalledWith('w1', { mastery: 'learning' });
+      expect(within(group).getByRole('button', { name: '巩固中' })).toHaveAttribute('aria-pressed', 'true');
+      expect(within(group).getByRole('button', { name: '熟悉' })).toHaveAttribute('aria-pressed', 'false');
+      expect(await screen.findByText('已保存')).toBeInTheDocument();
+    });
+  });
+
+  describe('the tags', () => {
+    // A box that offers suggestions (it has a `list`) is a combobox, not a plain text box.
+    const tagBox = () => screen.getByLabelText('添加标签');
+
+    it('can be added to a word that has none, which is lowercased and put in with Enter', async () => {
+      const user = userEvent.setup();
+      renderPanel([saved({ tags: [] })]);
+      await shown('run');
+      expect(tagBox()).toHaveAttribute('placeholder', '添加标签，回车确认');
+
+      await user.type(tagBox(), '  Travel {Enter}');
+
+      expect(bridge.updateWord).toHaveBeenCalledWith('w1', { tags: ['travel'] });
+      expect(await screen.findByRole('button', { name: '移除标签 travel' })).toBeInTheDocument();
+      expect(tagBox()).toHaveValue('');
+    });
+
+    it('is not added twice, and an empty box adds nothing', async () => {
+      const user = userEvent.setup();
+      renderPanel([saved({ tags: ['travel'] })]);
+      await shown('run');
+
+      await user.type(tagBox(), 'travel{Enter}');
+      await user.type(tagBox(), '   {Enter}');
+
+      expect(bridge.updateWord).not.toHaveBeenCalled();
+      expect(tagBox()).toHaveValue('');
+    });
+
+    it('is exactly the text that was typed, not a suggestion that happens to start with it', async () => {
+      const user = userEvent.setup();
+      renderPanel([saved({ tags: [] }), saved({ id: 'w2', lemma: 'walk', selection: 'walk', tags: ['travel'] })]);
+      await shown('run');
+
+      await user.type(tagBox(), 'tra{Enter}');
+
+      expect(bridge.updateWord).toHaveBeenCalledWith('w1', { tags: ['tra'] });
+    });
+
+    it('is offered from the tags the library has, except those the word has already', async () => {
+      renderPanel([
+        saved({ tags: ['travel'] }),
+        saved({ id: 'w2', lemma: 'walk', selection: 'walk', tags: ['travel', 'verbs', 'daily'] }),
+      ]);
+      await shown('run');
+      await waitFor(() => expect(document.querySelectorAll('#word-detail-tags option').length).toBeGreaterThan(0));
+
+      const offered = Array.from(document.querySelectorAll('#word-detail-tags option')).map((option) =>
+        option.getAttribute('value'),
+      );
+      expect([...offered].sort()).toEqual(['daily', 'verbs']);
+      expect(tagBox()).toHaveAttribute('list', 'word-detail-tags');
+    });
+
+    it('can be taken off again', async () => {
+      const user = userEvent.setup();
+      renderPanel([saved({ tags: ['travel', 'verbs'] })]);
+      await shown('run');
+
+      await user.click(screen.getByRole('button', { name: '移除标签 travel' }));
+
+      expect(bridge.updateWord).toHaveBeenCalledWith('w1', { tags: ['verbs'] });
+    });
+
+    it('is given up with Escape, which then does not reach the page behind that closes the panel with it', async () => {
+      const user = userEvent.setup();
+      const seen = vi.fn();
+      window.addEventListener('keydown', seen);
+      try {
+        renderPanel();
+        await shown('run');
+
+        await user.type(tagBox(), 'ab{Escape}');
+        expect(tagBox()).toHaveValue('');
+        expect(seen.mock.calls.filter(([event]) => (event as KeyboardEvent).key === 'Escape')).toHaveLength(0);
+
+        // With nothing typed there is nothing to give up: the key goes on, to close the panel.
+        await user.keyboard('{Escape}');
+        expect(seen.mock.calls.filter(([event]) => (event as KeyboardEvent).key === 'Escape')).toHaveLength(1);
+      } finally {
+        window.removeEventListener('keydown', seen);
+      }
+    });
+  });
+
+  describe('the buttons the page gives it', () => {
+    it('leaves the deleting to the page, which can say what happened and offer to take it back', async () => {
+      const user = userEvent.setup();
+      const onDelete = vi.fn();
+      renderPanel([saved()], { onDelete });
+      await shown('run');
+
+      await user.click(screen.getByRole('button', { name: '删除该生词' }));
+
+      expect(onDelete).toHaveBeenCalledTimes(1);
+      expect(onDelete).toHaveBeenCalledWith(expect.objectContaining({ id: 'w1', lemma: 'run' }));
+      expect(bridge.deleteWords).not.toHaveBeenCalled();
+    });
+
+    it('has no delete button where the page gives it no way to delete', async () => {
+      renderPanel();
+      await shown('run');
+
+      expect(screen.queryByRole('button', { name: '删除该生词' })).not.toBeInTheDocument();
+    });
+
+    it('can be closed', async () => {
+      const user = userEvent.setup();
+      const onClose = vi.fn();
+      renderPanel([saved()], { onClose });
+      await shown('run');
+
+      await user.click(screen.getByRole('button', { name: '关闭详情' }));
+
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('the size of the text', () => {
+    const sizeBox = () => screen.getByRole('group', { name: '阅读字号' });
+
+    it('is set by the buttons, one pixel at a time, when the page gives it the way to', async () => {
+      const user = userEvent.setup();
+      const onFontSizeChange = vi.fn();
+      renderPanel([saved()], { fontSize: 15, onFontSizeChange });
+      await shown('run');
+      expect(within(sizeBox()).getByText('15')).toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: '放大字体' }));
+      await user.click(screen.getByRole('button', { name: '缩小字体' }));
+
+      expect(onFontSizeChange).toHaveBeenNthCalledWith(1, 16);
+      expect(onFontSizeChange).toHaveBeenNthCalledWith(2, 14);
+    });
+
+    it('is shown to the text of the word', async () => {
+      renderPanel([saved()], { fontSize: 17, onFontSizeChange: vi.fn() });
+      await shown('run');
+
+      expect(screen.getByText('旧释义').closest('[style]')).toHaveStyle({ fontSize: '17px' });
+    });
+
+    it('cannot be made smaller than the smallest or larger than the largest size', async () => {
+      const { unmount } = renderPanel([saved()], { fontSize: READER_MIN, onFontSizeChange: vi.fn() });
+      await shown('run');
+      expect(screen.getByRole('button', { name: '缩小字体' })).toBeDisabled();
+      expect(screen.getByRole('button', { name: '放大字体' })).toBeEnabled();
+      unmount();
+
+      renderPanel([saved()], { fontSize: READER_MAX, onFontSizeChange: vi.fn() });
+      await shown('run');
+      expect(screen.getByRole('button', { name: '放大字体' })).toBeDisabled();
+      expect(screen.getByRole('button', { name: '缩小字体' })).toBeEnabled();
+    });
+
+    it('has no buttons where the page gives it no way to keep the size', async () => {
+      renderPanel();
+      await shown('run');
+
+      expect(screen.queryByRole('group', { name: '阅读字号' })).not.toBeInTheDocument();
+    });
+  });
+
+  describe('what it says about the word', () => {
+    it('tells a word that has only a meaning that it can be filled in, and a word that has more nothing', async () => {
+      const { unmount } = renderPanel([saved()]);
+      await shown('run');
+      expect(screen.getByText(/这个词目前只有释义，还没有义项和例句/)).toBeInTheDocument();
+      unmount();
+
+      renderPanel([saved({ examples: [{ en: 'Run fast.', zh: '跑快点。' }] })]);
+      await shown('run');
+      expect(screen.queryByText(/这个词目前只有释义/)).not.toBeInTheDocument();
+    });
+
+    it('shows where the word was found, in what sentence', async () => {
+      renderPanel([saved()]);
+      await shown('run');
+
+      expect(screen.getByRole('heading', { name: '原始上下文' })).toBeInTheDocument();
+      expect(screen.getByText('“He was running late.”')).toBeInTheDocument();
+      expect(screen.getByText(/Reader · /)).toBeInTheDocument();
+    });
+
+    it('says where a word came from also when it has no sentence, as one imported from a list', async () => {
+      renderPanel([saved({ context: '', sourceApp: '导入' })]);
+      await shown('run');
+
+      expect(screen.getByRole('heading', { name: '来源' })).toBeInTheDocument();
+      expect(screen.queryByRole('heading', { name: '原始上下文' })).not.toBeInTheDocument();
+      expect(screen.getByText(/导入 · /)).toBeInTheDocument();
+    });
   });
 });

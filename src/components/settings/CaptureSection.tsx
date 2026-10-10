@@ -6,6 +6,7 @@ import { SegmentedControl } from '../ui/SegmentedControl';
 import { TextInput } from '../ui/TextInput';
 import { SettingsSection } from './SettingsSection';
 import * as bridge from '../../lib/tauri-bridge';
+import { classNames, errorText } from '../../utils/format';
 
 const CLIPBOARD_MODES = [
   { value: 'smart' as const, label: '智能', icon: <ShieldIcon size={12} /> },
@@ -18,6 +19,7 @@ export function CaptureSection() {
   const [watchEnabled, setWatchEnabled] = useState(true);
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [autostartError, setAutostartError] = useState<string | null>(null);
+  const [ocrCheck, setOcrCheck] = useState<{ ok: boolean; text: string } | null>(null);
   const [blacklistInput, setBlacklistInput] = useState(
     (settings.clipboardBlacklist || []).join(', ')
   );
@@ -101,7 +103,7 @@ export function CaptureSection() {
           description="复制英文文本时自动弹出查词窗口。也可在系统托盘右键菜单中开关。" />
 
         <div className="mt-3">
-          <label className="mb-1.5 block text-[11px] font-medium text-ink-muted">触发模式</label>
+          <p className="mb-1.5 text-[11px] font-medium text-ink-muted">触发模式</p>
           <SegmentedControl
             label="剪贴板触发模式"
             options={CLIPBOARD_MODES}
@@ -116,7 +118,7 @@ export function CaptureSection() {
         </div>
 
         <div className="mt-3">
-          <label className="mb-1.5 block text-[11px] font-medium text-ink-muted">应用黑名单</label>
+          <p className="mb-1.5 text-[11px] font-medium text-ink-muted">应用黑名单</p>
           <TextInput
             label="黑名单"
             hideLabel
@@ -137,9 +139,9 @@ export function CaptureSection() {
           />
           {!lookupInIde && (
             <div className="mt-3">
-              <label className="mb-1.5 block text-[11px] font-medium text-ink-muted">
+              <p className="mb-1.5 text-[11px] font-medium text-ink-muted">
                 IDE / 终端进程
-              </label>
+              </p>
               <TextInput
                 label="IDE 黑名单"
                 hideLabel
@@ -186,8 +188,9 @@ export function CaptureSection() {
           description="关闭后注销热键并隐藏托盘入口；可在下方立即框选做单次测试。"
         />
         <div className="mt-2">
-          <label className="mb-1 block text-[11px] text-ink-muted">热键</label>
+          <label htmlFor="ocr-hotkey" className="mb-1 block text-[11px] text-ink-muted">热键</label>
           <input
+            id="ocr-hotkey"
             className="w-full rounded-md border border-line bg-raised px-2 py-1.5 text-[12px] text-ink"
             value={settings.ocr?.hotkey || 'Control+Shift+O'}
             onChange={(e) => {
@@ -218,16 +221,24 @@ export function CaptureSection() {
             className="rounded-md border border-line px-2 py-1 text-[11px] text-ink-muted hover:text-ink"
             onClick={async () => {
               try {
-                const st = await bridge.getOcrStatus();
-                window.alert(st.message);
-              } catch (e) {
-                window.alert(String(e));
+                const status = await bridge.getOcrStatus();
+                setOcrCheck({ ok: status.available, text: status.message });
+              } catch (error) {
+                setOcrCheck({ ok: false, text: `检测失败：${errorText(error)}` });
               }
             }}
           >
             检测 OCR 可用性
           </button>
         </div>
+        {ocrCheck ? (
+          <p
+            role={ocrCheck.ok ? 'status' : 'alert'}
+            className={classNames('mt-2 text-[11px]', ocrCheck.ok ? 'text-positive' : 'text-danger')}
+          >
+            {ocrCheck.text}
+          </p>
+        ) : null}
         <p className="mt-2 text-[10px] text-ink-subtle">
           识别仅在本机进行，截图位图不会写入磁盘或上传。
         </p>
