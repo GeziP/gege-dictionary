@@ -6,6 +6,9 @@ dist/
 src-tauri/target/
 .verify-target/
 
+# Fetched by scripts/fetch-onnxruntime.ps1 (pinned in src-tauri/ort-runtime.json)
+src-tauri/resources/ort/
+
 # IDE
 .vscode/
 .idea/

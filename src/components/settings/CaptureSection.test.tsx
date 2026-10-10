@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react';
+import { act, cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
 import * as bridge from '../../lib/tauri-bridge';
@@ -21,10 +21,16 @@ vi.mock('../../lib/tauri-bridge', () => ({
   registerOcrHotkey: vi.fn(),
   startOcrCapture: vi.fn(),
   getOcrStatus: vi.fn(),
-  openLanguageSettings: vi.fn(),
 }));
 
-const ocrStatus = (available: boolean, message: string) => ({ available, language: 'en', message });
+const WORKS = '内置 OCR 可用：自检读出了 9/9 个词，用时 120 毫秒';
+const BROKEN = '内置 OCR 引擎没能启动：找不到 OCR 运行库 C:\\gege\\onnxruntime.dll。请重新安装鸽鸽词典';
+
+const ocrStatus = (available: boolean, message: string) => ({
+  available,
+  engine: 'PP-OCRv6',
+  message,
+});
 
 describe('the settings of capturing text', () => {
   let nativeDialog: MockInstance<typeof window.alert>;
@@ -46,27 +52,38 @@ describe('the settings of capturing text', () => {
     const check = () => userEvent.click(screen.getByRole('button', { name: '检测 OCR 可用性' }));
 
     it('says that it can, beside the button, and not in a dialog of the system', async () => {
-      vi.mocked(bridge.getOcrStatus).mockResolvedValue(ocrStatus(true, 'OCR 可用（语言：英文）'));
+      vi.mocked(bridge.getOcrStatus).mockResolvedValue(ocrStatus(true, WORKS));
       render(<CaptureSection />);
 
       await check();
 
       const result = await screen.findByRole('status');
-      expect(result).toHaveTextContent('OCR 可用（语言：英文）');
+      expect(result).toHaveTextContent(WORKS);
       expect(result).toHaveClass('text-positive');
       expect(nativeDialog).not.toHaveBeenCalled();
     });
 
     it('says that it cannot, and why, as a problem', async () => {
-      vi.mocked(bridge.getOcrStatus).mockResolvedValue(ocrStatus(false, '没有安装英文 OCR 语言包'));
+      vi.mocked(bridge.getOcrStatus).mockResolvedValue(ocrStatus(false, BROKEN));
       render(<CaptureSection />);
 
       await check();
 
       const result = await screen.findByRole('alert');
-      expect(result).toHaveTextContent('没有安装英文 OCR 语言包');
+      expect(result).toHaveTextContent(BROKEN);
       expect(result).toHaveClass('text-danger');
       expect(nativeDialog).not.toHaveBeenCalled();
+    });
+
+    it('sends nobody to the settings of the system: the engine needs no language pack', async () => {
+      vi.mocked(bridge.getOcrStatus).mockResolvedValue(ocrStatus(false, BROKEN));
+      render(<CaptureSection />);
+
+      await check();
+      await screen.findByRole('alert');
+
+      expect(screen.queryByRole('button', { name: /语言/ })).not.toBeInTheDocument();
+      expect(screen.getByText(/不依赖系统语言包/)).toBeInTheDocument();
     });
 
     it('says that the check itself failed, with the reason', async () => {
@@ -89,68 +106,48 @@ describe('the settings of capturing text', () => {
 
     it('gives way to the answer of the next time it is asked', async () => {
       vi.mocked(bridge.getOcrStatus)
-        .mockResolvedValueOnce(ocrStatus(false, '没有安装英文 OCR 语言包'))
-        .mockResolvedValueOnce(ocrStatus(true, 'OCR 可用（语言：英文）'));
+        .mockResolvedValueOnce(ocrStatus(false, BROKEN))
+        .mockResolvedValueOnce(ocrStatus(true, WORKS));
       render(<CaptureSection />);
 
       await check();
       await screen.findByRole('alert');
       await check();
 
-      expect(await screen.findByRole('status')).toHaveTextContent('OCR 可用（语言：英文）');
+      expect(await screen.findByRole('status')).toHaveTextContent(WORKS);
       expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     });
 
-    describe('when text cannot be recognized for want of the language pack', () => {
-      const openSettings = () =>
-        userEvent.click(screen.getByRole('button', { name: '打开系统语言设置' }));
+    it('shows that it is working, and cannot be started again meanwhile', async () => {
+      let answer: (status: ReturnType<typeof ocrStatus>) => void = () => undefined;
+      vi.mocked(bridge.getOcrStatus).mockReturnValue(
+        new Promise((resolve) => {
+          answer = resolve;
+        }),
+      );
+      render(<CaptureSection />);
 
-      it('offers the page of the system settings where the pack is added', async () => {
-        vi.mocked(bridge.getOcrStatus).mockResolvedValue(ocrStatus(false, '没有安装英文 OCR 识别包'));
-        vi.mocked(bridge.openLanguageSettings).mockResolvedValue(undefined);
-        render(<CaptureSection />);
+      await check();
 
-        await check();
-        await screen.findByRole('alert');
-        await openSettings();
+      const working = screen.getByRole('button', { name: '检测中…' });
+      expect(working).toBeDisabled();
+      await userEvent.click(working);
+      expect(bridge.getOcrStatus).toHaveBeenCalledTimes(1);
 
-        expect(bridge.openLanguageSettings).toHaveBeenCalledTimes(1);
-        // What was said stays: the user is reading it while the settings open.
-        expect(screen.getByRole('alert')).toHaveTextContent('没有安装英文 OCR 识别包');
-      });
+      await act(async () => answer(ocrStatus(true, WORKS)));
 
-      it('says why when those settings cannot be opened', async () => {
-        vi.mocked(bridge.getOcrStatus).mockResolvedValue(ocrStatus(false, '没有安装英文 OCR 识别包'));
-        vi.mocked(bridge.openLanguageSettings).mockRejectedValue(new Error('explorer 不可用'));
-        render(<CaptureSection />);
+      expect(await screen.findByRole('status')).toHaveTextContent(WORKS);
+      expect(screen.getByRole('button', { name: '检测 OCR 可用性' })).toBeEnabled();
+    });
 
-        await check();
-        await screen.findByRole('alert');
-        await openSettings();
+    it('can be asked again after it failed', async () => {
+      vi.mocked(bridge.getOcrStatus).mockRejectedValue(new Error('命令执行失败'));
+      render(<CaptureSection />);
 
-        expect(await screen.findByRole('alert')).toHaveTextContent('没能打开系统设置：explorer 不可用');
-      });
+      await check();
+      await screen.findByRole('alert');
 
-      it('does not offer them when text can be recognized, or before it is known', async () => {
-        vi.mocked(bridge.getOcrStatus).mockResolvedValue(ocrStatus(true, 'OCR 可用（语言：英文）'));
-        render(<CaptureSection />);
-
-        expect(screen.queryByRole('button', { name: '打开系统语言设置' })).not.toBeInTheDocument();
-        await check();
-        await screen.findByRole('status');
-
-        expect(screen.queryByRole('button', { name: '打开系统语言设置' })).not.toBeInTheDocument();
-      });
-
-      it('does not offer them when the check itself failed: that is no matter of a language', async () => {
-        vi.mocked(bridge.getOcrStatus).mockRejectedValue(new Error('命令执行失败'));
-        render(<CaptureSection />);
-
-        await check();
-        await screen.findByRole('alert');
-
-        expect(screen.queryByRole('button', { name: '打开系统语言设置' })).not.toBeInTheDocument();
-      });
+      expect(screen.getByRole('button', { name: '检测 OCR 可用性' })).toBeEnabled();
     });
   });
 

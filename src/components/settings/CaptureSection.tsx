@@ -19,11 +19,8 @@ export function CaptureSection() {
   const [watchEnabled, setWatchEnabled] = useState(true);
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [autostartError, setAutostartError] = useState<string | null>(null);
-  const [ocrCheck, setOcrCheck] = useState<{
-    ok: boolean;
-    text: string;
-    languageSettings?: boolean;
-  } | null>(null);
+  const [ocrCheck, setOcrCheck] = useState<{ ok: boolean; text: string } | null>(null);
+  const [ocrChecking, setOcrChecking] = useState(false);
   const [blacklistInput, setBlacklistInput] = useState(
     (settings.clipboardBlacklist || []).join(', ')
   );
@@ -176,7 +173,7 @@ export function CaptureSection() {
 
       <SettingsSection
         title="截图 OCR 取词"
-        description="系统本地 OCR，覆盖扫描 PDF / 视频字幕等无法复制的场景。默认热键 Ctrl+Shift+O。"
+        description="内置 OCR 引擎（PP-OCRv6），在本机识别中英文，不依赖系统语言包，覆盖扫描 PDF / 视频字幕等无法复制的场景。默认热键 Ctrl+Shift+O。"
       >
         <Toggle
           checked={(settings.ocr?.enabled ?? true) !== false}
@@ -230,22 +227,22 @@ export function CaptureSection() {
           <button
             type="button"
             className="rounded-md border border-line px-2 py-1 text-[11px] text-ink-muted hover:text-ink"
+            disabled={ocrChecking}
             onClick={async () => {
+              // The engine is tried on a sentence of its own, which takes a moment the first time.
+              setOcrChecking(true);
+              setOcrCheck(null);
               try {
                 const status = await bridge.getOcrStatus();
-                setOcrCheck({
-                  ok: status.available,
-                  text: status.message,
-                  // Not being able to read text is put right in the system settings, where the
-                  // language and its OCR pack are added.
-                  languageSettings: !status.available,
-                });
+                setOcrCheck({ ok: status.available, text: status.message });
               } catch (error) {
                 setOcrCheck({ ok: false, text: `检测失败：${errorText(error)}` });
+              } finally {
+                setOcrChecking(false);
               }
             }}
           >
-            检测 OCR 可用性
+            {ocrChecking ? '检测中…' : '检测 OCR 可用性'}
           </button>
         </div>
         {ocrCheck ? (
@@ -256,23 +253,8 @@ export function CaptureSection() {
             {ocrCheck.text}
           </p>
         ) : null}
-        {ocrCheck?.languageSettings ? (
-          <button
-            type="button"
-            className="mt-2 rounded-md border border-line px-2 py-1 text-[11px] text-ink-muted hover:text-ink"
-            onClick={async () => {
-              try {
-                await bridge.openLanguageSettings();
-              } catch (error) {
-                setOcrCheck({ ok: false, text: `没能打开系统设置：${errorText(error)}` });
-              }
-            }}
-          >
-            打开系统语言设置
-          </button>
-        ) : null}
         <p className="mt-2 text-[10px] text-ink-subtle">
-          识别仅在本机进行，截图位图不会写入磁盘或上传。
+          识别仅在本机进行，截图位图不会写入磁盘或上传。引擎在用到时才载入内存，闲置约 2 分钟后自动释放。
         </p>
       </SettingsSection>
 

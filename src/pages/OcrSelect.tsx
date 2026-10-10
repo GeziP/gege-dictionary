@@ -27,13 +27,7 @@ interface Notice {
   text: string;
 }
 
-interface Blocked {
-  message: string;
-  /** The way out is in the system settings (a missing OCR pack), not in this app. */
-  canOpenLanguageSettings: boolean;
-}
-
-const SELECT_HINT = '拖拽框选要识别的英文，Esc 或右键取消';
+const SELECT_HINT = '拖拽框选要识别的文字（中英文都行），Esc 或右键取消';
 const TOO_SMALL = '选区太小，请重新框选';
 const NO_TEXT = '没识别到文字，换一块更清晰的区域再试';
 const BLANK_REGION =
@@ -50,7 +44,8 @@ export function OcrSelect() {
   const [phase, setPhase] = useState<Phase>('loading');
   const [rect, setRect] = useState<Rect | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
-  const [blocked, setBlocked] = useState<Blocked | null>(null);
+  /** Why nothing can be read, when that is the case: shown in place of the picker's controls. */
+  const [blocked, setBlocked] = useState<string | null>(null);
 
   const close = useCallback(async () => {
     try {
@@ -79,17 +74,14 @@ export function OcrSelect() {
         context.putImageData(new ImageData(frame.pixels, frame.width, frame.height), 0, 0);
         frameSize.current = { width: frame.width, height: frame.height };
         if (status && !status.available) {
-          setBlocked({ message: status.message, canOpenLanguageSettings: true });
+          setBlocked(status.message);
           setPhase('blocked');
         } else {
           setPhase('select');
         }
       } catch (reason) {
         if (cancelled) return;
-        setBlocked({
-          message: `没能取得屏幕截图：${errorText(reason)}`,
-          canOpenLanguageSettings: false,
-        });
+        setBlocked(`没能取得屏幕截图：${errorText(reason)}`);
         setPhase('blocked');
       }
       // Whatever happened, the window is shown: a problem has to be seen, not hidden.
@@ -154,21 +146,6 @@ export function OcrSelect() {
     },
     [close],
   );
-
-  const openLanguageSettings = useCallback(async () => {
-    try {
-      await bridge.openLanguageSettings();
-    } catch (reason) {
-      setBlocked((current) =>
-        current
-          ? { ...current, message: `${current.message}\n（没能打开系统设置：${errorText(reason)}）` }
-          : current,
-      );
-      return;
-    }
-    // The picker covers the screen and stays on top, so the settings would open behind it.
-    await close();
-  }, [close]);
 
   const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
     if (phase !== 'select' || event.button !== 0) return;
@@ -248,18 +225,9 @@ export function OcrSelect() {
           >
             <p className="text-[15px] font-semibold">现在还不能截图取词</p>
             <p className="mt-2 whitespace-pre-line text-[12.5px] leading-relaxed text-white/85">
-              {blocked.message}
+              {blocked}
             </p>
             <div className="mt-5 flex justify-end gap-2">
-              {blocked.canOpenLanguageSettings ? (
-                <button
-                  type="button"
-                  className="rounded-md bg-[#4fc0ae] px-3 py-1.5 text-[12px] font-medium text-black hover:bg-[#63d0be]"
-                  onClick={() => void openLanguageSettings()}
-                >
-                  打开系统语言设置
-                </button>
-              ) : null}
               <button
                 type="button"
                 className="rounded-md bg-white/20 px-3 py-1.5 text-[12px] hover:bg-white/30"

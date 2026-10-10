@@ -27,6 +27,12 @@ jobs:
         with:
           workspaces: "./src-tauri -> target"
       - run: npm ci
+      # ONNX Runtime, which runs the OCR networks, is not in the repository: the Rust build stops
+      # without it (build.rs), and the installer carries it. This downloads the version that
+      # src-tauri/ort-runtime.json pins and checks it against its SHA-256.
+      - name: Fetch ONNX Runtime
+        shell: pwsh
+        run: ./scripts/fetch-onnxruntime.ps1
       - run: npx tsc --noEmit
       - run: npm run lint
       - run: npm test

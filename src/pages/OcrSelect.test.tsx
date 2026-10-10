@@ -11,7 +11,6 @@ vi.mock('../lib/tauri-bridge', () => ({
   ocrRecognizeFrame: vi.fn(),
   setOcrCaptureAndLookup: vi.fn(),
   closeOcrPicker: vi.fn(),
-  openLanguageSettings: vi.fn(),
 }));
 
 /** The picture is 200x100 and the page 100x50 CSS pixels: a screen at 200%. */
@@ -88,14 +87,14 @@ beforeEach(() => {
   vi.mocked(bridge.getOcrFrame).mockResolvedValue(payload());
   vi.mocked(bridge.getOcrStatus).mockResolvedValue({
     available: true,
-    language: 'en-US',
-    message: '系统 OCR 可用（en-US）',
+    engine: 'PP-OCRv6',
+    elapsedMs: 120,
+    message: '内置 OCR 可用：自检读出了 9/9 个词，用时 120 毫秒',
   });
   vi.mocked(bridge.ocrPickerReady).mockResolvedValue(undefined);
   vi.mocked(bridge.ocrRecognizeFrame).mockResolvedValue(recognition('hello world'));
   vi.mocked(bridge.setOcrCaptureAndLookup).mockResolvedValue(undefined);
   vi.mocked(bridge.closeOcrPicker).mockResolvedValue(undefined);
-  vi.mocked(bridge.openLanguageSettings).mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -122,10 +121,10 @@ describe('the picture of the screen', () => {
     );
   });
 
-  it('asks the user to drag over the text', async () => {
+  it('asks the user to drag over the text, whether it is English or Chinese', async () => {
     await showPicker();
 
-    expect(screen.getByText(/拖拽框选要识别的英文/)).toBeInTheDocument();
+    expect(screen.getByText(/拖拽框选要识别的文字（中英文都行）/)).toBeInTheDocument();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
@@ -146,7 +145,7 @@ describe('the picture of the screen', () => {
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('没能取得屏幕截图：没有可用的截图，请重新截图取词');
     // Nothing to be done in the system settings about a picture that was not taken.
-    expect(screen.queryByRole('button', { name: '打开系统语言设置' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /语言/ })).not.toBeInTheDocument();
     expect(bridge.ocrRecognizeFrame).not.toHaveBeenCalled();
   });
 });
@@ -254,7 +253,7 @@ describe('when nothing comes of a region', () => {
     drag(picker, { x: 10, y: 10 }, { x: 40, y: 30 });
 
     expect(await screen.findByRole('alert')).toHaveTextContent('OCR 异步失败: 0x88982F50');
-    expect(screen.getByText(/拖拽框选要识别的英文/)).toBeInTheDocument();
+    expect(screen.getByText(/拖拽框选要识别的文字/)).toBeInTheDocument();
     expect(bridge.closeOcrPicker).not.toHaveBeenCalled();
   });
 
@@ -324,54 +323,40 @@ describe('leaving the picker', () => {
   });
 });
 
-describe('when text cannot be read for want of the language pack', () => {
-  const missing = {
+describe('when the engine cannot read text', () => {
+  const broken = {
     available: false,
-    language: '',
-    installed: ['zh-Hans-CN'],
-    message: '没有安装英文 OCR 识别包（本机只有：zh-Hans-CN）。请到「设置 → 时间和语言 → 语言和区域」添加 English (United States)。',
+    engine: 'PP-OCRv6',
+    message:
+      '内置 OCR 引擎没能启动：找不到 OCR 运行库 C:\\gege\\onnxruntime.dll。请重新安装鸽鸽词典；如果仍然无法使用，请把这段话反馈给开发者。',
   };
 
   it('says so, in the window that is shown, and does not let the user drag', async () => {
-    vi.mocked(bridge.getOcrStatus).mockResolvedValue(missing);
+    vi.mocked(bridge.getOcrStatus).mockResolvedValue(broken);
 
     const picker = await showPicker();
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('现在还不能截图取词');
-    expect(alert).toHaveTextContent('没有安装英文 OCR 识别包（本机只有：zh-Hans-CN）');
+    expect(alert).toHaveTextContent('内置 OCR 引擎没能启动：找不到 OCR 运行库');
+    expect(alert).toHaveTextContent('请重新安装鸽鸽词典');
     drag(picker, { x: 10, y: 10 }, { x: 40, y: 30 });
     expect(bridge.ocrRecognizeFrame).not.toHaveBeenCalled();
     expect(screen.queryByTestId('ocr-selection')).not.toBeInTheDocument();
   });
 
-  it('opens the language settings, and gets out of their way', async () => {
-    vi.mocked(bridge.getOcrStatus).mockResolvedValue(missing);
+  it('sends nobody to the settings of the system: no language pack is involved', async () => {
+    vi.mocked(bridge.getOcrStatus).mockResolvedValue(broken);
     await showPicker();
 
-    await userEvent.click(await screen.findByRole('button', { name: '打开系统语言设置' }));
+    await screen.findByRole('alert');
 
-    await waitFor(() => expect(bridge.openLanguageSettings).toHaveBeenCalledTimes(1));
-    // The picker covers the screen and stays on top: the settings would open behind it.
-    await waitFor(() => expect(bridge.closeOcrPicker).toHaveBeenCalledTimes(1));
-    expect(vi.mocked(bridge.openLanguageSettings).mock.invocationCallOrder[0]).toBeLessThan(
-      vi.mocked(bridge.closeOcrPicker).mock.invocationCallOrder[0],
-    );
-  });
-
-  it('stays, with the reason, when the settings cannot be opened', async () => {
-    vi.mocked(bridge.getOcrStatus).mockResolvedValue(missing);
-    vi.mocked(bridge.openLanguageSettings).mockRejectedValue(new Error('explorer 不可用'));
-    await showPicker();
-
-    await userEvent.click(await screen.findByRole('button', { name: '打开系统语言设置' }));
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('没能打开系统设置：explorer 不可用');
-    expect(bridge.closeOcrPicker).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: /语言/ })).not.toBeInTheDocument();
+    expect(screen.getAllByRole('button').map((button) => button.textContent)).toEqual(['关闭']);
   });
 
   it('can be closed with its button', async () => {
-    vi.mocked(bridge.getOcrStatus).mockResolvedValue(missing);
+    vi.mocked(bridge.getOcrStatus).mockResolvedValue(broken);
     await showPicker();
 
     await userEvent.click(await screen.findByRole('button', { name: '关闭' }));
@@ -385,6 +370,6 @@ describe('when text cannot be read for want of the language pack', () => {
     await showPicker();
 
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
-    expect(screen.getByText(/拖拽框选要识别的英文/)).toBeInTheDocument();
+    expect(screen.getByText(/拖拽框选要识别的文字/)).toBeInTheDocument();
   });
 });

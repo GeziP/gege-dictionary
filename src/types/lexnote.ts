@@ -430,7 +430,6 @@ export type CaptureContextMode = 'off' | 'selection_only' | 'surrounding';
 export interface OcrSettings {
   enabled?: boolean;
   hotkey?: string;
-  language?: string;
 }
 
 export interface AppSettings {

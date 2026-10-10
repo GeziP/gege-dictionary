@@ -1,0 +1,7 @@
+{
+  "_comment": "The ONNX Runtime the screenshot OCR loads at run time. scripts/fetch-onnxruntime.ps1 downloads this wheel, checks both digests and unpacks the library into src-tauri/resources/ort; a test of the OCR engine checks the library against dllSha256 too. To move to another version: take the win_amd64 wheel from https://pypi.org/pypi/onnxruntime/<version>/json and update all four fields.",
+  "version": "1.24.4",
+  "wheelUrl": "https://files.pythonhosted.org/packages/05/fb/a592736d968c2f58e12de4d52088dda8e0e724b26ad5c0487263adb45875/onnxruntime-1.24.4-cp313-cp313-win_amd64.whl",
+  "wheelSha256": "3b6ba8b0181a3aa88edab00eb01424ffc06f42e71095a91186c2249415fcff93",
+  "dllSha256": "78b078a8b8230701a9de873b5108713d83a2c142d10222b7fa10e1d55b231096"
+}

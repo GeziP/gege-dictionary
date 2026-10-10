@@ -361,15 +361,17 @@ export async function copyText(text: string): Promise<void> {
 }
 
 export interface OcrStatus {
+  /** A sentence that was drawn for the purpose has just been read: the engine of the app works. */
   available: boolean;
-  /** The recognizer that will be used (`en-US`), empty when there is none. */
-  language: string;
-  /** The recognizers that are installed. */
-  installed?: string[];
-  /** What is the case and, when text cannot be read, how to put that right. */
+  /** The engine that reads the text (`PP-OCRv6`). */
+  engine?: string;
+  /** How long that reading took, in milliseconds. Only there when the engine works. */
+  elapsedMs?: number;
+  /** What is the case and, when text cannot be read, what is wrong. */
   message: string;
 }
 
+/** Tries the engine on a sentence of its own, so the answer is a result and not a guess. */
 export async function getOcrStatus(): Promise<OcrStatus> {
   return invoke<OcrStatus>('get_ocr_status');
 }
@@ -408,11 +410,6 @@ export async function ocrRecognizeFrame(
 /** Closes the picker and lets the picture of the screen go. */
 export async function closeOcrPicker(): Promise<void> {
   return invoke('ocr_close_picker');
-}
-
-/** Opens the page of the system settings where a language, and its OCR pack, are added. */
-export async function openLanguageSettings(): Promise<void> {
-  return invoke('open_language_settings');
 }
 
 export async function startOcrCapture(): Promise<void> {

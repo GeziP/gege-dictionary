@@ -1,0 +1,4 @@
+# The OCR models and their dictionary are embedded into the program byte for byte (a test checks
+# their SHA-256): a checkout must not touch their line endings.
+src-tauri/models/** -text
+*.onnx binary
