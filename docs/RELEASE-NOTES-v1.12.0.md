@@ -53,6 +53,7 @@ Windows 引擎读出来的是 `lnformal`、`ThiS`、`beCaUSe`、`exa ple` 这类
 - 运行库的取得：`src-tauri/ort-runtime.json` 固定 PyPI 官方 wheel 的下载地址、整个 wheel 和 DLL 的 SHA-256；`scripts/fetch-onnxruntime.ps1` 下载、逐项核对，并把构建机上 Visual Studio 里最新的那份四个 VC++ 运行库一起放进 `src-tauri/resources/ort/`（git 忽略）；运行库不能比链接这个 DLL 的工具集（读自 DLL 头，这一版是 14.44）更旧，更旧时脚本直接停下。`ci.yml` 和 `release.yml` 在 `npm ci` 之后新增一步运行它。`build.rs` 在缺 `onnxruntime.dll` 时直接停下，并提示运行这个脚本，不会悄悄打出一个没有引擎的包。
 - 模型文件 `det.onnx`、`rec.onnx`、`dict.txt` 在 `src-tauri/models/pp-ocrv6/`，用 `include_bytes!` 编进程序；字节与 PaddleX 官方发布的 ONNX 推理包一致，有测试逐个核对 SHA-256；`.gitattributes` 把它们标为二进制，不会被换行转换改动。
 - 许可：新增 `THIRD-PARTY-NOTICES.md`；`licenses\` 文件夹随安装包放在程序旁边（Apache-2.0 全文、模型的署名说明、ONNX Runtime 的 MIT 与第三方声明、运行库来源说明）。
+- 版本三处同步 1.12.0（`package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json`，两个锁文件随之更新）。
 - 前端测试 47 个文件 740 项（比 v1.11.1 少 2 项：删掉的是语言包相关的用例）；Rust 单元测试 383 项（比 v1.11.1 多 60 项：识别管线 45、引擎生命周期 12、OCR 本身净增 3，包含真实画一句话再读出来、从整屏画面里切一块再读、安装包资源清单与 `tauri.conf.json` 一致等）。
 
 ## 升级说明
