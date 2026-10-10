@@ -84,8 +84,34 @@ function Save-Wheel([string]$url, [string]$expectedSha256, [string]$path) {
     }
 }
 
-# The newest Visual C++ runtime that Visual Studio (or its Build Tools) carries for redistribution.
-function Find-CrtDirectory {
+# FileVersion is a string that can carry text after the numbers ("14.29.30157.0 built by:
+# cloudtest" on a GitHub runner), so the version is put together from its numeric parts.
+function Get-FileVersionOf([string]$path) {
+    $info = (Get-Item -LiteralPath $path).VersionInfo
+    [version]::new($info.FileMajorPart, $info.FileMinorPart, $info.FileBuildPart, $info.FilePrivatePart)
+}
+
+# The version of the linker that built a library is in its PE header (14.44 for Visual Studio 2022
+# 17.14). The Visual C++ runtime that goes with the library has to be at least that new.
+function Get-LinkerVersion([string]$path) {
+    $stream = [IO.File]::OpenRead($path)
+    try {
+        $header = New-Object byte[] 1024
+        $count = $stream.Read($header, 0, $header.Length)
+    } finally {
+        $stream.Dispose()
+    }
+    $optional = if ($count -ge 0x40) { [BitConverter]::ToInt32($header, 0x3C) + 24 } else { -1 }
+    if ($optional -lt 0 -or ($optional + 4) -gt $count -or $header[0] -ne 0x4D -or $header[1] -ne 0x5A) {
+        throw "Cannot read the linker version of $path"
+    }
+    [version]::new($header[$optional + 2], $header[$optional + 3])
+}
+
+# The newest Visual C++ runtime that Visual Studio (or its Build Tools) carries for redistribution,
+# as long as it is at least $atLeast (major.minor). A GitHub runner has several: 14.29 from the
+# Visual Studio 2019 tools next to the 14.4x of Visual Studio 2022.
+function Find-CrtDirectory([version]$atLeast) {
     $vswhere = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Microsoft Visual Studio\Installer\vswhere.exe'
     $found = @()
     if (Test-Path -LiteralPath $vswhere) {
@@ -106,8 +132,19 @@ function Find-CrtDirectory {
         throw ('No Visual C++ runtime to redistribute was found. Install the "MSVC v143 - VS 2022 C++ x64/x86 build tools" ' +
             'component of Visual Studio or its Build Tools (the Rust MSVC toolchain needs them anyway).')
     }
-    $found | Sort-Object { [version](Get-Item -LiteralPath (Join-Path $_ 'vcruntime140.dll')).VersionInfo.FileVersion } -Descending |
-        Select-Object -First 1
+    $candidates = @($found | ForEach-Object {
+        [pscustomobject]@{ Directory = $_; Version = Get-FileVersionOf (Join-Path $_ 'vcruntime140.dll') }
+    })
+    Write-Host "onnxruntime.dll was linked with Visual C++ $atLeast; the runtime next to it has to be at least that new."
+    foreach ($candidate in $candidates) {
+        Write-Host ("  Visual C++ runtime {0} in {1}" -f $candidate.Version, $candidate.Directory)
+    }
+    $best = $candidates | Sort-Object -Property Version -Descending | Select-Object -First 1
+    if ([version]::new($best.Version.Major, $best.Version.Minor) -lt $atLeast) {
+        throw ("The newest Visual C++ runtime found is $($best.Version), but onnxruntime.dll was linked with " +
+            "$atLeast and needs a runtime at least that new. Update Visual Studio (or its Build Tools).")
+    }
+    $best
 }
 
 if (-not $Force -and (Test-UpToDate)) {
@@ -146,11 +183,11 @@ try {
         throw "onnxruntime.dll in the wheel has SHA-256 $dllSha256, but ort-runtime.json pins $($pin.dllSha256)"
     }
 
-    $crtDirectory = Find-CrtDirectory
+    $crt = Find-CrtDirectory (Get-LinkerVersion (Join-Path $staging 'onnxruntime.dll'))
     foreach ($name in $crtNames) {
-        Copy-Item -LiteralPath (Join-Path $crtDirectory $name) -Destination (Join-Path $staging $name)
+        Copy-Item -LiteralPath (Join-Path $crt.Directory $name) -Destination (Join-Path $staging $name)
     }
-    $crtVersion = (Get-Item -LiteralPath (Join-Path $staging 'vcruntime140.dll')).VersionInfo.FileVersion
+    $crtVersion = $crt.Version
 
     $readme = @(
         'Files that the screenshot OCR of Gege Dictionary loads at run time:',
