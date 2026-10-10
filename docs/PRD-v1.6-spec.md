@@ -63,10 +63,12 @@
 
 框选 UI：无边框置顶窗，半透明遮罩，矩形角标；不抢焦点策略与查词窗一致（参考 `clipboard_watcher::position_lookup_window`）。
 
+> **修订（黑屏修复）**：最初实现把窗口建成 `transparent` 但页面是不透明的（主题底色 + 40% 黑遮罩），暗色主题下整屏近黑、亮色下是一块灰板，桌面从未透出过。现改为「先截屏、后开窗」：按下热键时 Rust 先把光标所在屏幕截下来（GDI `BitBlt`，`SRCCOPY | CAPTUREBLT`，只存在内存里），再显示一个**不透明**全屏置顶窗，页面把这张冻结画面画在画布上并用 CSS 压暗，用户在上面拖拽；窗口在页面画好之前保持隐藏。因此不再依赖系统窗口透明，也与应用主题无关；框选时不再隐藏窗口、不再 `sleep` 后重截（旧流程的竞态与 R/B 通道颠倒也随之消失）。截下来整屏纯黑被当作错误，而不是显示出来。
+
 ### 2.4 管道接入
 
 ```text
-截图 → CroppedBitmap → OcrEngine.RecognizeAsync
+冻结画面（BGRA，内存）→ 按框选区域裁剪 → SoftwareBitmap(Bgra8) → OcrEngine.RecognizeAsync
      → lines[].Text 拼接（保留换行）
      → content_filter::reject_reason（与剪贴板相同）
      → last_capture + trigger lookup（复用现有命令）
@@ -199,8 +201,13 @@ WHERE anki_note_id IS NOT NULL;
 ### 7.2 新增 Commands（示意）
 
 ```text
-ocr_recognize_region(rect) -> OcrResult
-get_ocr_status() -> { available, languages, message }
+start_ocr_capture() -> ()                                    # 先截屏，再开框选窗；失败时返回原因
+ocr_frame() -> bytes                                         # 冻结画面：8 字节小端宽高 + RGBA
+ocr_picker_ready() -> ()                                     # 页面画好后才显示窗口
+ocr_recognize_frame(x, y, width, height) -> { text, truncated, length, kind, blank }   # 坐标为画面像素
+ocr_close_picker() -> ()
+get_ocr_status() -> { available, language, installed, message }   # 只认所需语言，不用别的语言引擎顶替
+open_language_settings() -> ()                               # 打开系统「语言和区域」
 test_anki_connection(config) -> { ok, version, error? }
 list_anki_decks() -> string[]
 list_anki_models() -> string[]

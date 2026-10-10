@@ -1477,14 +1477,13 @@ dependencies = [
 
 [[package]]
 name = "gege-dic"
-version = "1.11.0"
+version = "1.11.1"
 dependencies = [
  "arboard",
  "chrono",
  "csv",
  "dirs 5.0.1",
  "futures-util",
- "image",
  "reqwest 0.12.28",
  "rfd",
  "rusqlite",

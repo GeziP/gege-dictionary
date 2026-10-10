@@ -175,24 +175,48 @@ describe('the main window', () => {
   });
 });
 
-describe.each([
-  ['lookup', '/lookup', 'lookup-page'],
-  ['text selection', '/ocr-select', 'ocr-page'],
-])('the %s window', (_name, path, page) => {
+describe('the lookup window', () => {
   beforeEach(() => {
-    window.history.pushState({}, '', path);
+    window.history.pushState({}, '', '/lookup');
   });
 
   it('shows its page alone: no notices, no library, and no one to ask for another page', async () => {
     state.lexnote.startupWarnings = ['数据库已从备份恢复'];
     render(<App />);
 
-    expect(await screen.findByText(page)).toBeInTheDocument();
+    expect(await screen.findByText('lookup-page')).toBeInTheDocument();
     expect(screen.queryByText('update-banner')).not.toBeInTheDocument();
     expect(screen.queryByText('启动时发现问题')).not.toBeInTheDocument();
     expect(state.loadWords.length).toBeGreaterThan(0);
     expect(state.loadWords.some(Boolean)).toBe(false);
     expect(state.listen).not.toHaveBeenCalled();
+  });
+});
+
+describe('the window in which text is picked off the screen', () => {
+  beforeEach(() => {
+    window.history.pushState({}, '', '/ocr-select');
+  });
+
+  it('shows its page alone: no notices, no library, and no one to ask for another page', async () => {
+    state.lexnote.startupWarnings = ['数据库已从备份恢复'];
+    render(<App />);
+
+    expect(await screen.findByText('ocr-page')).toBeInTheDocument();
+    expect(screen.queryByText('update-banner')).not.toBeInTheDocument();
+    expect(screen.queryByText('启动时发现问题')).not.toBeInTheDocument();
+    expect(state.listen).not.toHaveBeenCalled();
+  });
+
+  it('takes nothing from the app: no settings to load, and no page colour of the app behind it', async () => {
+    render(<App />);
+
+    const page = await screen.findByText('ocr-page');
+
+    // The page used to sit in the app's `bg-canvas` wrapper, which is opaque (near black in the
+    // dark theme) and is what made the whole screen look black.
+    expect(state.loadWords).toEqual([]);
+    expect(page.closest('.bg-canvas')).toBeNull();
   });
 });
 

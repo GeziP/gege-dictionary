@@ -19,7 +19,11 @@ export function CaptureSection() {
   const [watchEnabled, setWatchEnabled] = useState(true);
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [autostartError, setAutostartError] = useState<string | null>(null);
-  const [ocrCheck, setOcrCheck] = useState<{ ok: boolean; text: string } | null>(null);
+  const [ocrCheck, setOcrCheck] = useState<{
+    ok: boolean;
+    text: string;
+    languageSettings?: boolean;
+  } | null>(null);
   const [blacklistInput, setBlacklistInput] = useState(
     (settings.clipboardBlacklist || []).join(', ')
   );
@@ -212,7 +216,14 @@ export function CaptureSection() {
           <button
             type="button"
             className="rounded-md border border-line px-2 py-1 text-[11px] text-ink-muted hover:text-ink"
-            onClick={() => void bridge.startOcrCapture()}
+            onClick={async () => {
+              // The picker is the answer when it opens. When it cannot, nothing else would say why.
+              try {
+                await bridge.startOcrCapture();
+              } catch (error) {
+                setOcrCheck({ ok: false, text: `截图取词没能开始：${errorText(error)}` });
+              }
+            }}
           >
             立即框选取词
           </button>
@@ -222,7 +233,13 @@ export function CaptureSection() {
             onClick={async () => {
               try {
                 const status = await bridge.getOcrStatus();
-                setOcrCheck({ ok: status.available, text: status.message });
+                setOcrCheck({
+                  ok: status.available,
+                  text: status.message,
+                  // Not being able to read text is put right in the system settings, where the
+                  // language and its OCR pack are added.
+                  languageSettings: !status.available,
+                });
               } catch (error) {
                 setOcrCheck({ ok: false, text: `检测失败：${errorText(error)}` });
               }
@@ -238,6 +255,21 @@ export function CaptureSection() {
           >
             {ocrCheck.text}
           </p>
+        ) : null}
+        {ocrCheck?.languageSettings ? (
+          <button
+            type="button"
+            className="mt-2 rounded-md border border-line px-2 py-1 text-[11px] text-ink-muted hover:text-ink"
+            onClick={async () => {
+              try {
+                await bridge.openLanguageSettings();
+              } catch (error) {
+                setOcrCheck({ ok: false, text: `没能打开系统设置：${errorText(error)}` });
+              }
+            }}
+          >
+            打开系统语言设置
+          </button>
         ) : null}
         <p className="mt-2 text-[10px] text-ink-subtle">
           识别仅在本机进行，截图位图不会写入磁盘或上传。

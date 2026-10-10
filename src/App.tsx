@@ -37,10 +37,9 @@ function MainRouter() {
     navigateRef.current = navigate;
   }, [navigate]);
   const isLookup = window.location.pathname === '/lookup';
-  const isOcrSelect = window.location.pathname === '/ocr-select';
 
   React.useEffect(() => {
-    if (isLookup || isOcrSelect) return;
+    if (isLookup) return;
     let active = true;
     let unlisten: (() => void) | undefined;
     void (async () => {
@@ -60,11 +59,7 @@ function MainRouter() {
       active = false;
       unlisten?.();
     };
-  }, [isLookup, isOcrSelect]);
-
-  if (isOcrSelect) {
-    return <React.Suspense fallback={<RouteLoading />}><OcrSelect /></React.Suspense>;
-  }
+  }, [isLookup]);
 
   if (isLookup) {
     return <React.Suspense fallback={<RouteLoading />}><Lookup /></React.Suspense>;
@@ -138,10 +133,22 @@ export function StartupWarningsBanner() {
 }
 
 export function App() {
-  // The lookup and OCR windows are small separate webviews that never show the
-  // library, so they must not pay for loading all of it on every cold start, nor
-  // carry the main window's banners (an update notice is no use in a 420 px popup).
-  const lightweightWindow = ['/lookup', '/ocr-select'].includes(window.location.pathname);
+  // The picker of the screenshot OCR is a window of its own that shows the picture of the screen
+  // and nothing else. It takes nothing from the app (no settings, no theme, no router), so it is
+  // not wrapped in any of it: the page colour of the app must not be able to show on it (it was
+  // the black screen of dark mode), and it appears sooner for not loading any of it.
+  if (window.location.pathname === '/ocr-select') {
+    return (
+      <React.Suspense fallback={null}>
+        <OcrSelect />
+      </React.Suspense>
+    );
+  }
+
+  // The lookup window is a small separate webview that never shows the library, so it must
+  // not pay for loading all of it on every cold start, nor carry the main window's banners
+  // (an update notice is no use in a 420 px popup).
+  const lightweightWindow = window.location.pathname === '/lookup';
   return (
     <LexNoteProvider loadWords={!lightweightWindow}>
       <BrowserRouter>

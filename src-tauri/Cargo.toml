@@ -1,6 +1,6 @@
 [package]
 name = "gege-dic"
-version = "1.11.0"
+version = "1.11.1"
 edition = "2021"
 
 [lib]
@@ -29,7 +29,6 @@ dirs = "5"
 rfd = "0.15"
 sha2 = "0.10"
 csv = "1"
-image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

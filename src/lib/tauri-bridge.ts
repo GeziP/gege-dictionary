@@ -362,7 +362,11 @@ export async function copyText(text: string): Promise<void> {
 
 export interface OcrStatus {
   available: boolean;
+  /** The recognizer that will be used (`en-US`), empty when there is none. */
   language: string;
+  /** The recognizers that are installed. */
+  installed?: string[];
+  /** What is the case and, when text cannot be read, how to put that right. */
   message: string;
 }
 
@@ -370,14 +374,45 @@ export async function getOcrStatus(): Promise<OcrStatus> {
   return invoke<OcrStatus>('get_ocr_status');
 }
 
-export async function ocrRecognizeRegion(
+export interface OcrRecognition {
+  text: string;
+  truncated: boolean;
+  length: number;
+  /** The region was one colour all over, so there was nothing to read in it. */
+  blank: boolean;
+}
+
+/** The picture of the screen that the picker shows (read it with `decodeFrame`). */
+export async function getOcrFrame(): Promise<ArrayBuffer> {
+  return invoke<ArrayBuffer>('ocr_frame');
+}
+
+/**
+ * Shows the picker window. It is hidden until its page has the picture on screen, or a problem to
+ * show in its place, so that what the user first sees is never a blank window.
+ */
+export async function ocrPickerReady(): Promise<void> {
+  return invoke('ocr_picker_ready');
+}
+
+/** Reads the text in a region of that picture; the region is in the picture's own pixels. */
+export async function ocrRecognizeFrame(
   x: number,
   y: number,
   width: number,
-  height: number,
-  language?: string
-): Promise<{ text: string; truncated: boolean; length: number }> {
-  return invoke('ocr_recognize_region', { x, y, width, height, language: language || null });
+  height: number
+): Promise<OcrRecognition> {
+  return invoke<OcrRecognition>('ocr_recognize_frame', { x, y, width, height });
+}
+
+/** Closes the picker and lets the picture of the screen go. */
+export async function closeOcrPicker(): Promise<void> {
+  return invoke('ocr_close_picker');
+}
+
+/** Opens the page of the system settings where a language, and its OCR pack, are added. */
+export async function openLanguageSettings(): Promise<void> {
+  return invoke('open_language_settings');
 }
 
 export async function startOcrCapture(): Promise<void> {
