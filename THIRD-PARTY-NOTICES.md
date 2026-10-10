@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | PP-OCRv6 tiny 文本检测与识别模型（PaddleOCR） | PP-OCRv6_tiny_det、PP-OCRv6_tiny_rec | Apache License 2.0，© PaddlePaddle Authors | 编进程序；出处与校验和见 `src-tauri/models/pp-ocrv6/README.md` |
 | ONNX Runtime | 1.24.4 | MIT License，© Microsoft Corporation | `onnxruntime.dll`，装在程序旁边；版本与校验和固定在 `src-tauri/ort-runtime.json` |
-| Microsoft Visual C++ 运行库 | 14.44.35211.0 | 按 Microsoft 对 Visual Studio 可再分发文件的条款随应用分发 | `vcruntime140.dll`、`vcruntime140_1.dll`、`msvcp140.dll`、`msvcp140_1.dll`，装在程序旁边，ONNX Runtime 需要它们 |
+| Microsoft Visual C++ 运行库 | 构建机上 Visual Studio 里最新的一份，不低于 ONNX Runtime 链接时用的 14.44；实际版本写在 `licenses\README-runtime.txt` | 按 Microsoft 对 Visual Studio 可再分发文件的条款随应用分发 | `vcruntime140.dll`、`vcruntime140_1.dll`、`msvcp140.dll`、`msvcp140_1.dll`，装在程序旁边，ONNX Runtime 需要它们 |
 | `ort`（ONNX Runtime 的 Rust 绑定）与 `ort-sys` | 2.0.0-rc.13 | MIT OR Apache-2.0 | 编进程序 |
 | `libloading` | 0.9.0 | ISC | 编进程序，用来按路径载入 `onnxruntime.dll` |
 | `ndarray`、`matrixmultiply`、`num-complex`、`num-integer`、`rawpointer` | 见 `src-tauri/Cargo.lock` | MIT OR Apache-2.0 | 编进程序（`ort` 的依赖） |
