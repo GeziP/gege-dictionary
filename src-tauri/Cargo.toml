@@ -29,7 +29,6 @@ dirs = "5"
 rfd = "0.15"
 sha2 = "0.10"
 csv = "1"
-image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

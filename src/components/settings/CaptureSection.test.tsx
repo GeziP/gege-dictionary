@@ -21,6 +21,7 @@ vi.mock('../../lib/tauri-bridge', () => ({
   registerOcrHotkey: vi.fn(),
   startOcrCapture: vi.fn(),
   getOcrStatus: vi.fn(),
+  openLanguageSettings: vi.fn(),
 }));
 
 const ocrStatus = (available: boolean, message: string) => ({ available, language: 'en', message });
@@ -98,6 +99,83 @@ describe('the settings of capturing text', () => {
 
       expect(await screen.findByRole('status')).toHaveTextContent('OCR 可用（语言：英文）');
       expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+
+    describe('when text cannot be recognized for want of the language pack', () => {
+      const openSettings = () =>
+        userEvent.click(screen.getByRole('button', { name: '打开系统语言设置' }));
+
+      it('offers the page of the system settings where the pack is added', async () => {
+        vi.mocked(bridge.getOcrStatus).mockResolvedValue(ocrStatus(false, '没有安装英文 OCR 识别包'));
+        vi.mocked(bridge.openLanguageSettings).mockResolvedValue(undefined);
+        render(<CaptureSection />);
+
+        await check();
+        await screen.findByRole('alert');
+        await openSettings();
+
+        expect(bridge.openLanguageSettings).toHaveBeenCalledTimes(1);
+        // What was said stays: the user is reading it while the settings open.
+        expect(screen.getByRole('alert')).toHaveTextContent('没有安装英文 OCR 识别包');
+      });
+
+      it('says why when those settings cannot be opened', async () => {
+        vi.mocked(bridge.getOcrStatus).mockResolvedValue(ocrStatus(false, '没有安装英文 OCR 识别包'));
+        vi.mocked(bridge.openLanguageSettings).mockRejectedValue(new Error('explorer 不可用'));
+        render(<CaptureSection />);
+
+        await check();
+        await screen.findByRole('alert');
+        await openSettings();
+
+        expect(await screen.findByRole('alert')).toHaveTextContent('没能打开系统设置：explorer 不可用');
+      });
+
+      it('does not offer them when text can be recognized, or before it is known', async () => {
+        vi.mocked(bridge.getOcrStatus).mockResolvedValue(ocrStatus(true, 'OCR 可用（语言：英文）'));
+        render(<CaptureSection />);
+
+        expect(screen.queryByRole('button', { name: '打开系统语言设置' })).not.toBeInTheDocument();
+        await check();
+        await screen.findByRole('status');
+
+        expect(screen.queryByRole('button', { name: '打开系统语言设置' })).not.toBeInTheDocument();
+      });
+
+      it('does not offer them when the check itself failed: that is no matter of a language', async () => {
+        vi.mocked(bridge.getOcrStatus).mockRejectedValue(new Error('命令执行失败'));
+        render(<CaptureSection />);
+
+        await check();
+        await screen.findByRole('alert');
+
+        expect(screen.queryByRole('button', { name: '打开系统语言设置' })).not.toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('starting a capture by hand', () => {
+    const start = () => userEvent.click(screen.getByRole('button', { name: '立即框选取词' }));
+
+    it('opens the picker, and says nothing when it opens', async () => {
+      vi.mocked(bridge.startOcrCapture).mockResolvedValue(undefined);
+      render(<CaptureSection />);
+
+      await start();
+
+      expect(bridge.startOcrCapture).toHaveBeenCalledTimes(1);
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+
+    it('says why the picker could not be opened, where the button is, not nowhere', async () => {
+      vi.mocked(bridge.startOcrCapture).mockRejectedValue('屏幕截下来是一片纯黑');
+      render(<CaptureSection />);
+
+      await start();
+
+      const result = await screen.findByRole('alert');
+      expect(result).toHaveTextContent('截图取词没能开始：屏幕截下来是一片纯黑');
+      expect(nativeDialog).not.toHaveBeenCalled();
     });
   });
 

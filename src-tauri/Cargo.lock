@@ -1484,7 +1484,6 @@ dependencies = [
  "csv",
  "dirs 5.0.1",
  "futures-util",
- "image",
  "reqwest 0.12.28",
  "rfd",
  "rusqlite",

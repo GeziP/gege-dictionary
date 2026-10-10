@@ -132,6 +132,36 @@ fn ocr_settings(settings: &serde_json::Value) -> (bool, String) {
     (enabled, hotkey)
 }
 
+/// The language of the text the screenshot OCR reads: English, unless the settings say otherwise.
+fn ocr_language(settings: &serde_json::Value) -> String {
+    settings
+        .get("ocr")
+        .and_then(|o| o.get("language"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(ocr::DEFAULT_LANGUAGE)
+        .to_string()
+}
+
+/// The OCR language from the stored settings, or the default when they cannot be read.
+fn stored_ocr_language(state: &AppState) -> String {
+    let settings = state.db.lock().ok().and_then(|db| db.get_settings().ok());
+    settings
+        .map(|settings| ocr_language(&settings))
+        .unwrap_or_else(|| ocr::DEFAULT_LANGUAGE.to_string())
+}
+
+/// Whether the settings let the hotkey and the tray start a screenshot capture. (The button in the
+/// settings is a test run and asks nothing of this.)
+fn ocr_enabled(app: &AppHandle) -> bool {
+    let state = app.state::<AppState>();
+    let settings = state.db.lock().ok().and_then(|db| db.get_settings().ok());
+    settings
+        .map(|settings| ocr_settings(&settings).0)
+        .unwrap_or(true)
+}
+
 fn apply_ocr_hotkey(app: &AppHandle) -> Result<(), String> {
     use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
     let (enabled, hotkey) = {
@@ -156,7 +186,7 @@ fn apply_ocr_hotkey(app: &AppHandle) -> Result<(), String> {
     app.global_shortcut()
         .on_shortcut(sc, move |_app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
-                let _ = open_ocr_select_window(&app_handle);
+                begin_ocr_capture(&app_handle, Duration::ZERO);
             }
         })
         .map_err(|e| format!("注册 OCR 热键失败: {e}"))
@@ -1176,31 +1206,46 @@ async fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
     Err("主窗口不存在".into())
 }
 
+/// Whether text can be read in a picture, and if not, why not.
 #[tauri::command]
-fn get_ocr_status() -> serde_json::Value {
-    ocr::get_ocr_status()
+async fn get_ocr_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let language = stored_ocr_language(&state);
+    tokio::task::spawn_blocking(move || ocr::get_ocr_status(&language))
+        .await
+        .map_err(|e| format!("OCR 检测任务失败: {e}"))
 }
 
-/// Recognize a screen region (physical pixels) and return text.
-/// Caller then feeds text into the shared lookup pipeline.
+/// Reads the text in a region of the picture the picker is showing. The region is in the pixels
+/// of that picture. The caller then feeds the text into the shared lookup pipeline.
 #[tauri::command]
-async fn ocr_recognize_region(
+async fn ocr_recognize_frame(
     state: tauri::State<'_, AppState>,
+    frames: tauri::State<'_, ocr::FrameStore>,
     x: i32,
     y: i32,
     width: i32,
     height: i32,
-    language: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let lang = language
-        .as_deref()
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty());
-    let text = tokio::task::spawn_blocking(move || {
-        ocr::recognize_screen_region(x, y, width, height, lang.as_deref())
-    })
-    .await
-    .map_err(|e| format!("OCR 任务失败: {e}"))??;
+    let language = stored_ocr_language(&state);
+    let crop = frames.crop(x, y, width, height)?;
+    if crop.is_uniform() {
+        // One colour all over has no text in it. If it is black, the screen did not give the
+        // picture up (protected or hardware-accelerated video), which "nothing found" would hide.
+        if let Ok(db) = state.db.lock() {
+            let _ =
+                db.record_local_event("ocr_filtered", &serde_json::json!({ "reason": "blank" }));
+        }
+        return Ok(serde_json::json!({
+            "text": "",
+            "truncated": false,
+            "length": 0,
+            "kind": "",
+            "blank": true,
+        }));
+    }
+    let text = tokio::task::spawn_blocking(move || ocr::recognize(&crop, &language))
+        .await
+        .map_err(|e| format!("OCR 任务失败: {e}"))??;
 
     if let Ok(db) = state.db.lock() {
         if text.trim().is_empty() {
@@ -1220,61 +1265,222 @@ async fn ocr_recognize_region(
         "truncated": was_truncated,
         "length": truncated.chars().count(),
         "kind": kind,
+        "blank": false,
     }))
 }
 
-fn open_ocr_select_window(app: &AppHandle) -> Result<(), String> {
-    {
-        let state = app.state::<AppState>();
-        let settings = {
-            let db = state.db.lock().map_err(|e| e.to_string())?;
-            db.get_settings()?
-        };
-        let (enabled, _) = ocr_settings(&settings);
-        if !enabled {
-            return Err("截图取词已关闭，请在设置中启用".into());
-        }
-    }
-    if let Some(win) = app.get_webview_window("ocr-select") {
-        let _ = win.show();
-        let _ = win.set_focus();
-        return Ok(());
-    }
-    let app_h = app.clone();
-    app.run_on_main_thread(move || {
-        let built = tauri::WebviewWindowBuilder::new(
-            &app_h,
-            "ocr-select",
-            tauri::WebviewUrl::App("ocr-select".into()),
-        )
-        .title("截图取词")
-        .decorations(false)
-        .always_on_top(true)
-        .transparent(true)
-        .skip_taskbar(true)
-        .focused(true)
-        .build();
-        if let Ok(win) = built {
-            // Fullscreen the monitor under the cursor so multi-display capture
-            // and client→physical mapping stay on the same screen.
-            if let Ok(cursor) = app_h.cursor_position() {
-                if let Ok(Some(monitor)) = app_h.monitor_from_point(cursor.x, cursor.y) {
-                    let origin = monitor.position();
-                    let size = monitor.size();
-                    let _ = win.set_position(tauri::PhysicalPosition::new(origin.x, origin.y));
-                    let _ = win.set_size(tauri::PhysicalSize::new(size.width, size.height));
-                }
-            }
-            let _ = win.set_fullscreen(true);
-        }
-    })
-    .map_err(|e| format!("打开框选窗失败: {e}"))
+/// The label of the window in which the user picks the region to read.
+const OCR_PICKER: &str = "ocr-select";
+
+/// How long the picker's page gets to put the picture on screen before it is given up on.
+const OCR_PICKER_PATIENCE: Duration = Duration::from_secs(10);
+
+/// How long a capture started from the tray menu waits, so that the menu is gone from the screen
+/// before the screen is photographed.
+const OCR_MENU_SETTLE: Duration = Duration::from_millis(300);
+
+/// Where the monitor under the mouse pointer is (the primary one when that cannot be told).
+fn monitor_under_cursor(
+    app: &AppHandle,
+) -> Result<(tauri::PhysicalPosition<i32>, tauri::PhysicalSize<u32>), String> {
+    let under_cursor = app
+        .cursor_position()
+        .ok()
+        .and_then(|cursor| app.monitor_from_point(cursor.x, cursor.y).ok().flatten());
+    let monitor = match under_cursor {
+        Some(monitor) => monitor,
+        None => app
+            .primary_monitor()
+            .map_err(|e| format!("找不到显示器: {e}"))?
+            .ok_or("找不到显示器")?,
+    };
+    Ok((*monitor.position(), *monitor.size()))
 }
 
-/// Open the fullscreen region picker overlay.
+/// Makes the picker window: a borderless one over the whole monitor, which stays hidden until its
+/// page has put the picture on screen (`ocr_picker_ready`). It is opaque on purpose. The picture
+/// it shows is the picture of the screen, so nothing of the desktop has to show through it, and a
+/// window that is transparent only in the hope that the page is too is a black screen when the
+/// page is not.
+fn build_ocr_picker(
+    app: &AppHandle,
+    origin: tauri::PhysicalPosition<i32>,
+    size: tauri::PhysicalSize<u32>,
+) -> Result<(), String> {
+    let win = tauri::WebviewWindowBuilder::new(
+        app,
+        OCR_PICKER,
+        tauri::WebviewUrl::App("ocr-select".into()),
+    )
+    .title("截图取词")
+    .decorations(false)
+    .shadow(false)
+    .resizable(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .visible(false)
+    .focused(true)
+    .build()
+    .map_err(|e| format!("打开框选窗失败: {e}"))?;
+    let placed = win
+        .set_position(tauri::PhysicalPosition::new(origin.x, origin.y))
+        .and_then(|()| win.set_size(tauri::PhysicalSize::new(size.width, size.height)))
+        .and_then(|()| win.set_fullscreen(true));
+    if let Err(error) = placed {
+        let _ = win.destroy();
+        return Err(format!("摆放框选窗失败: {error}"));
+    }
+    Ok(())
+}
+
+/// Takes the picture of the screen under the mouse pointer, then opens the picker on it. A picker
+/// that is already open is brought forward instead.
+async fn open_ocr_picker(app: &AppHandle, settle: Duration) -> Result<(), String> {
+    let frames = app.state::<ocr::FrameStore>();
+    if let Some(win) = app.get_webview_window(OCR_PICKER) {
+        // A picker that is still waiting for its picture shows itself when it has it.
+        if frames.picker_was_shown() {
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+        return Ok(());
+    }
+    // A key that is held down repeats its hotkey: the one that is opening the picker is enough.
+    let Some(_opening) = frames.begin_opening() else {
+        return Ok(());
+    };
+    if !settle.is_zero() {
+        tokio::time::sleep(settle).await;
+    }
+    let (origin, size) = monitor_under_cursor(app)?;
+    let frame = tokio::task::spawn_blocking(move || {
+        ocr::capture_screen(origin.x, origin.y, size.width as i32, size.height as i32)
+    })
+    .await
+    .map_err(|e| format!("截屏任务失败: {e}"))??;
+    let picture = frames.put(frame);
+
+    let (built_sender, built) = tokio::sync::oneshot::channel();
+    let main_thread_app = app.clone();
+    let queued = app.run_on_main_thread(move || {
+        let _ = built_sender.send(build_ocr_picker(&main_thread_app, origin, size));
+    });
+    let opened = match queued {
+        Ok(()) => built
+            .await
+            .unwrap_or_else(|_| Err("打开框选窗失败: 主线程没有回应".into())),
+        Err(e) => Err(format!("打开框选窗失败: {e}")),
+    };
+    if let Err(error) = opened {
+        frames.clear();
+        return Err(error);
+    }
+    watch_ocr_picker(app.clone(), picture);
+    Ok(())
+}
+
+/// A picker page that never reports the picture on screen has failed. Its window is closed and the
+/// user told so, instead of being left with a hidden window and no answer to the hotkey. `picture`
+/// is the number of the picture the picker was opened for: a picker that was closed and opened
+/// again in the meantime is a different one, and not this timer's to judge.
+fn watch_ocr_picker(app: AppHandle, picture: u64) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(OCR_PICKER_PATIENCE).await;
+        let frames = app.state::<ocr::FrameStore>();
+        if frames.generation() != picture || frames.picker_was_shown() {
+            return;
+        }
+        if let Some(win) = app.get_webview_window(OCR_PICKER) {
+            let _ = win.destroy();
+            frames.clear();
+            report_ocr_failure(
+                "框选窗没有在 10 秒内显示出截图，已关闭。请再试一次；\
+                 如果反复出现，请把这个现象反馈给开发者。",
+            );
+        }
+    });
+}
+
+/// Says that a capture could not start, in a message box of the system: the hotkey and the tray
+/// have nobody to hand an error to, and a hotkey that silently does nothing is the worst answer.
+fn report_ocr_failure(error: &str) {
+    eprintln!("[ocr] {error}");
+    let description = error.to_string();
+    std::thread::spawn(move || {
+        rfd::MessageDialog::new()
+            .set_title("截图取词没能开始")
+            .set_description(description)
+            .set_level(rfd::MessageLevel::Error)
+            .show();
+    });
+}
+
+/// Starts a capture from the hotkey or the tray menu, if the settings allow it.
+fn begin_ocr_capture(app: &AppHandle, settle: Duration) {
+    if !ocr_enabled(app) {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = open_ocr_picker(&app, settle).await {
+            report_ocr_failure(&error);
+        }
+    });
+}
+
+/// Opens the picker for a capture that the user asked for in the settings (a test run: it works
+/// whether or not the hotkey is on).
 #[tauri::command]
 async fn start_ocr_capture(app: tauri::AppHandle) -> Result<(), String> {
-    open_ocr_select_window(&app)
+    open_ocr_picker(&app, Duration::ZERO).await
+}
+
+/// The picture of the screen that the picker shows: its size, then its pixels as RGBA.
+#[tauri::command]
+async fn ocr_frame(
+    frames: tauri::State<'_, ocr::FrameStore>,
+) -> Result<tauri::ipc::Response, String> {
+    frames.picker_payload().map(tauri::ipc::Response::new)
+}
+
+/// The picker's page has put the picture on screen, or has a problem to show instead: the window,
+/// which has been hidden until now, is shown.
+#[tauri::command]
+async fn ocr_picker_ready(
+    app: tauri::AppHandle,
+    frames: tauri::State<'_, ocr::FrameStore>,
+) -> Result<(), String> {
+    let win = app.get_webview_window(OCR_PICKER).ok_or("框选窗已经关闭")?;
+    frames.mark_picker_shown();
+    win.show().map_err(|e| format!("显示框选窗失败: {e}"))?;
+    let _ = win.set_focus();
+    Ok(())
+}
+
+/// Closes the picker and lets the picture of the screen go.
+#[tauri::command]
+async fn ocr_close_picker(
+    app: tauri::AppHandle,
+    frames: tauri::State<'_, ocr::FrameStore>,
+) -> Result<(), String> {
+    frames.clear();
+    if let Some(win) = app.get_webview_window(OCR_PICKER) {
+        win.destroy().map_err(|e| format!("关闭框选窗失败: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Opens the page of the system settings where a language and its OCR pack are added.
+#[tauri::command]
+async fn open_language_settings() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer")
+            .arg("ms-settings:regionlanguage")
+            .spawn()
+            .map_err(|e| format!("打开系统设置失败: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Store OCR text as last_capture and open/reuse the lookup window.
@@ -1545,12 +1751,7 @@ fn setup_tray(app: &tauri::App, ocr_enabled: bool) -> Result<(), Box<dyn std::er
                 let state = app.state::<AppState>();
                 clipboard_watcher::lookup_clipboard(app, &state.last_capture);
             }
-            "ocr_capture" => match open_ocr_select_window(app) {
-                Ok(()) => {}
-                Err(e) => {
-                    eprintln!("ocr_capture: {e}");
-                }
-            },
+            "ocr_capture" => begin_ocr_capture(app, OCR_MENU_SETTLE),
             "show" => {
                 if let Some(win) = app.get_webview_window("main") {
                     let _ = win.show();
@@ -1899,6 +2100,7 @@ pub fn run() {
             startup_warnings: Mutex::new(startup_warnings),
         })
         .manage(enrich::Enrichment::default())
+        .manage(ocr::FrameStore::default())
         .invoke_handler(tauri::generate_handler![
             get_all_words,
             search_words,
@@ -1967,7 +2169,11 @@ pub fn run() {
             get_clipboard_watch_status,
             copy_text,
             get_ocr_status,
-            ocr_recognize_region,
+            ocr_frame,
+            ocr_picker_ready,
+            ocr_recognize_frame,
+            ocr_close_picker,
+            open_language_settings,
             start_ocr_capture,
             set_ocr_capture_and_lookup,
             show_main_window,
@@ -2039,13 +2245,16 @@ pub fn run() {
             );
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "main" {
-                    api.prevent_close();
-                    let _ = window.hide();
-                }
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } if window.label() == "main" => {
+                api.prevent_close();
+                let _ = window.hide();
             }
+            // However the picker goes away, the picture of the screen goes with it.
+            tauri::WindowEvent::Destroyed if window.label() == OCR_PICKER => {
+                window.state::<ocr::FrameStore>().clear();
+            }
+            _ => {}
         })
         .run(tauri::generate_context!())
         .expect("Error while running GegeDic");
