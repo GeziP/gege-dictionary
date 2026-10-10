@@ -52,8 +52,10 @@ function Test-UpToDate {
 # fallback: behind some proxies it connects and then receives nothing. A transfer that stalls
 # (less than 20 KB/s for 20 s: the connection is up and no data comes) is given up on and tried
 # again, instead of being waited for until the time limit.
+# There can be more than one curl.exe on the PATH (a GitHub runner has the one of Windows and the
+# one of Git): the first is the one a shell would run, and the only one that can be called.
+$curl = @(Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue) | Select-Object -First 1
 function Save-Download([string]$url, [string]$path) {
-    $curl = Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue
     if ($null -ne $curl) {
         & $curl.Source --location --fail --silent --show-error --connect-timeout 30 --max-time 600 `
             --speed-limit 20000 --speed-time 20 --output $path $url
